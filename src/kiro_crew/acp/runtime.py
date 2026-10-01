@@ -6158,6 +6158,19 @@ class AcpRuntime:
                             self._note_unadopted_skill_projection(generation)
                     projection_now = self._native_skill_projection
                     used_generation = self._adopted_skill_projection_generation()
+            elif skip_projection_refresh and previous is not None:
+                # A joiner does not rebuild the founder's projection, but it must
+                # still translate its set_mode alias through that projection and run
+                # the supersession checks around the send. Capture the adopted view
+                # and its generation under the lock so a concurrent start adopting a
+                # newer view bumps the generation this capture records: the re-check
+                # loop below then re-derives the alias, and _refuse_if_view_superseded
+                # fails the start if the alias it sent was revoked. Reading them
+                # unlocked could pair a view with a stale generation and silently
+                # accept a pre-revocation alias.
+                async with self._skill_projection_lock():
+                    projection_now = self._native_skill_projection
+                    used_generation = self._adopted_skill_projection_generation()
             # set_mode is a handshake request: switching to an agent boots THAT
             # agent's MCP servers, the same server (re-)initialization that gives
             # session/new and session/load their 90s budget. A switched-to server

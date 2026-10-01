@@ -77,6 +77,7 @@ from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
 from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
 from kiro_crew.metrics.events import CHILD_PERMISSION_DENIED
 from kiro_crew.start_priority import StartPriority
+from kiro_crew.testing.wait import async_wait_until
 
 # ── Harness ──
 
@@ -1236,10 +1237,23 @@ async def test_the_chat_turn_gate_serializes_on_the_real_runtime():
 
     ta = asyncio.create_task(hold_a())
     tb = asyncio.create_task(hold_b())
-    await asyncio.sleep(0.02)
+    # Wait on the STATE, not a fixed sleep (D1): a is inside the gate (order
+    # shows "a-in") and the lock is held, which is what b is parked on. Both are
+    # loop-confined asyncio state, so evaluate on-loop.
+    await async_wait_until(
+        lambda: order == ["a-in"] and rt._chat_turn_lock.locked(),
+        timeout=5,
+        describe=lambda: f"order={order} locked={rt._chat_turn_lock.locked()}",
+    )
     assert order == ["a-in"], order
     release_a.set()
-    await asyncio.gather(ta, tb)
+    try:
+        await asyncio.wait_for(asyncio.gather(ta, tb), timeout=5)
+    except (asyncio.TimeoutError, TimeoutError):
+        for t in (ta, tb):
+            t.cancel()
+        await asyncio.gather(ta, tb, return_exceptions=True)
+        raise AssertionError("chat-turn-gate turns did not drain within 5s")
     assert order == ["a-in", "a-out", "b-in"], order
     assert peak == 1, "two chat turns held the real runtime's gate at once"
 

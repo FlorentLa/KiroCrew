@@ -2431,6 +2431,13 @@ class SessionAllocationService:
             cast(Any, provider).memory_mode = memory_mode
             if self._deps.is_acp_provider(provider):
                 cast(Any, provider).member_context = member_context
+                # WHICH member, beside WHETHER this is a member session. The
+                # chat-runtime key needs the id so two members never share one
+                # process, and this is the only layer that has read the execution
+                # record. Empty for a session that is not a member's.
+                cast(Any, provider).member_id = (
+                    "" if execution is None or execution.member_id is None else execution.member_id
+                )
             try:
                 if self._deps.is_acp_provider(provider):
                     claim_kwarg = extra_factory_kwargs.get("crew_agent")
@@ -2581,6 +2588,13 @@ class SessionAllocationService:
             cast(Any, provider).memory_mode = memory_mode
             if self._deps.is_acp_provider(provider):
                 cast(Any, provider).member_context = member_context
+                # WHICH member, beside WHETHER this is a member session. The
+                # chat-runtime key needs the id so two members never share one
+                # process, and this is the only layer that has read the execution
+                # record. Empty for a session that is not a member's.
+                cast(Any, provider).member_id = (
+                    "" if execution is None or execution.member_id is None else execution.member_id
+                )
             if memory_mode != "persistent":
                 resume_sid = None
             provider_switched = False
