@@ -217,7 +217,22 @@ def _url_payload_command(n: int) -> str:
 #: subcommand. It is a security-deciding predicate, so it cannot leave the package,
 #: and no dead code remains to offset it. Its first word is split on space and tab
 #: only, the way bash splits, so a Unicode space cannot pose as a word break.
-_PACKAGE_LINE_BUDGET = 28_665
+#:
+#: Raised again, from 28,665, for ``is_sensitive_prevalidated_bounded_path`` in
+#: ``paths.py`` and the ``anchors_inline`` seam that backs it. A path validated on the
+#: event loop must match its already-resolved candidate tail LEXICALLY (never re-resolve
+#: an unheld tail that could sit on a stalled share) yet still resolve its ``$HOME``
+#: anchors through the BOUNDED resolver pool, so one stuck anchor costs the pool's time
+#: limit rather than freezing the whole loop. The two concerns were tied to a single
+#: ``pre_resolved`` flag; the seam splits them so the candidate stays lexical while the
+#: anchors go bounded. The cost is the new entry point, the seam parameter threaded
+#: through ``_path_in_home_dirs`` and the keystone helper, and the facade machinery for
+#: one more exported name -- an owner-table row, a manifest row and a ``TYPE_CHECKING``
+#: line. No new matching pass and no threshold moved; the fence's lexical-tail property
+#: is unchanged.
+#: +4 for ``_may_be_keystone_artifact``: the folded keystone-artifact precheck factored
+#: into one helper so both pre-resolved gates see ``x.tmp::$DATA`` alike (review B1).
+_PACKAGE_LINE_BUDGET = 28_686
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second
