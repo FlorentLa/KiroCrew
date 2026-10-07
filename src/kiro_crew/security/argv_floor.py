@@ -93,6 +93,7 @@ from .inline_payload import (
 )
 from .shell_normalizer import (
     _AMBIGUOUS_EXPANSION_RE,
+    _GIT_ARG_FLAGS,
     _PROCESS_SUBSTITUTION_OPENERS,
     _PYTHON_INLINE_PROGRAM_FLAGS,
     _PYTHON_OPERAND_FLAGS,
@@ -102,12 +103,14 @@ from .shell_normalizer import (
     _argv_programs,
     _backtick_closer,
     _cut_at_operator,
+    _CONTROL_OPERATOR_SPLIT_RE,
     _data_consumer_exempt,
     _debracket,
     _decode_printf_escapes,
     _decode_shell_quoted_literals,
     _dequote_token,
     _ends_argv,
+    _STRICT_PLAIN_SUBCOMMAND_RE,
     _glob_could_expand_to,
     _is_mint_verb,
     _is_self_program,
@@ -3459,9 +3462,14 @@ def _is_git_publish(text_lower: str) -> bool:
        command-substitution glue-evasion (e.g. ``git$(echo ' ')push``);
        ``_GIT_PUBLISH_SUBST_PROGRAM_RE`` catches expansion-produced program
        names (``$(echo git) push``, ``${GIT} push``, ``$GIT push``).
-    2. **Normalizer second-pass:** ``normalize_shell_command`` strips quotes
-       and empty-string concatenation so evasions like ``"git" push``,
-       ``g""it push``, or ``'g'it push`` are resolved to their true tokens.
+    2. **Normalizer pass:** ``normalize_shell_command`` strips quotes and
+       empty-string concatenation so evasions like ``"git" push``,
+       ``g""it push``, or ``'g'it push`` are resolved to their true tokens; the
+       walker then reads the subcommand position. If the subcommand token is a
+       publish it matches, and -- fail-closed -- if it is a word the shell can
+       rewrite (not a strict literal: ``git ${UNSET} push``, ``git -C . $@
+       push``), the command is treated as a possible publish for the floor to
+       judge. See :func:`_is_git_push_via_normalizer`.
 
     Does NOT match ``git stash push``, ``git commit -m '...push...'``,
     ``git log --grep push``, etc.
@@ -3477,17 +3485,19 @@ def _is_git_publish(text_lower: str) -> bool:
         return True
 
     # Pass 2: normalizer-based detection (catches quote evasions like
-    # "git" push, g""it push, 'g'it push)
-    return _is_git_push_via_normalizer(text_lower)
+    # "git" push, g""it push, 'g'it push) AND, fail-closed, a subcommand
+    # position the shell can rewrite (``git ${x} push``, ``git -C . $@ push``,
+    # ``git '-C' . $@ push``, ``>$x git $@``): the walker denies a non-plain
+    # subcommand token so the floor judges the target. This is the single place
+    # the rule lives -- there is no separate pre-verb pass.
+    if _is_git_push_via_normalizer(text_lower):
+        return True
 
-
-# Git global flags that consume a separate argument token (appear between
-# `git` and the subcommand).
-_GIT_ARG_FLAGS = frozenset({"-c", "-C", "--git-dir", "--work-tree", "--namespace"})
+    return False
 
 
 def _is_git_push_via_normalizer(text_lower: str) -> bool:
-    """Normalizer-based git push detection (second pass).
+    """Normalizer-based git push detection.
 
     Tokenizes the command via ``normalize_shell_command``, then checks if
     any token sequence resolves to ``git`` followed by ``push`` as the
@@ -3497,6 +3507,15 @@ def _is_git_push_via_normalizer(text_lower: str) -> bool:
 
     Avoids false positives on ``git stash push`` by requiring ``push`` to
     be the FIRST non-flag token after ``git`` (the subcommand position).
+
+    Fail-closed (lead rule): if that subcommand token is not a strict literal
+    (``_STRICT_PLAIN_SUBCOMMAND_RE`` -- letters, digits and ``_ . / = : -``),
+    the shell can rewrite it into any subcommand, so the command is treated as a
+    possible publish and the floor judges the target. Because the tokens are
+    already normalized/dequoted, this one check covers a quoted option name
+    (``git '-C' . $@ push``), a leading redirection (``>$x git $@``) and an
+    expansion in the subcommand slot (``git -C . $@ push``), with no separate
+    pre-verb pass.
     """
     try:
         tokens = _shell_normalizer.normalize_shell_command(text_lower)
@@ -3525,6 +3544,20 @@ def _is_git_push_via_normalizer(text_lower: str) -> bool:
             if candidate == word or os.path.basename(candidate) == word:
                 return True
         return False
+
+    # A control operator (``;``/``&``/``|``/newline) glued into a normalized
+    # token joins two commands into one word (``ok;git`` hides a git program;
+    # ``git fetch;git status`` glues one command's subcommand to the next
+    # program). Split ONLY such tokens so every command word sits at its own
+    # position; a token WITHOUT an operator (including a genuine empty-string
+    # argv element the seek must still skip) is left untouched.
+    expanded: list[str] = []
+    for token in tokens:
+        if _CONTROL_OPERATOR_SPLIT_RE.search(token):
+            expanded.extend(p for p in _CONTROL_OPERATOR_SPLIT_RE.split(token) if p)
+        else:
+            expanded.append(token)
+    tokens = expanded
 
     i = 0
     while i < len(tokens):
@@ -3565,8 +3598,20 @@ def _is_git_push_via_normalizer(text_lower: str) -> bool:
                     j += 1  # skip simple flag
                 else:
                     break
-            if j < len(tokens) and _resolves_to(tokens[j], "push"):
-                return True
+            if j < len(tokens):
+                subcommand = tokens[j]
+                if _resolves_to(subcommand, "push"):
+                    return True
+                # Fail-closed (lead rule): a subcommand token the shell can
+                # rewrite -- not a strict literal -- is treated as a possible
+                # publish for the floor to judge. Tokens are already
+                # normalized/dequoted, so a quoted option name, a leading
+                # redirection and an expansion in the subcommand slot are all
+                # covered here. Cut a trailing glued operator first, so
+                # ``git stash; git pull`` is not over-refused.
+                subcommand_word = _cut_at_operator(subcommand)
+                if not _STRICT_PLAIN_SUBCOMMAND_RE.fullmatch(subcommand_word):
+                    return True
         i += 1
     return False
 

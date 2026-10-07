@@ -208,6 +208,93 @@ class TestIsGitPublishDetection:
         assert _is_git_publish("echo $git is set") is False
 
 
+class TestGitPushNonPlainPreverbIsDeniedFailSafe:
+    """Fail-closed subcommand check in the one normalizer walker
+    (``_is_git_push_via_normalizer``). After it skips global flags and their
+    values to the subcommand position, a subcommand token that is not a strict
+    literal (``[A-Za-z0-9_./=:-]+``) is one the shell can rewrite into any
+    subcommand -- a push included -- so the command is treated as a possible
+    publish and the floor judges the target (declining on a protected branch).
+    The tokens are already normalized/dequoted, so a quoted option name
+    (``git '-C' . $@ push``), a leading redirection (``>$x git $@``), an
+    expansion in the subcommand slot (``git -C . $@ push``) and glued
+    ``;``/``&`` operators (``ok;git $@ push``) are all handled by this one
+    check. A real plain subcommand (``status``, ``log``, ``stash``) passes, and
+    a subcommand's own arguments (a commit message, a ``--grep`` pattern, a
+    glob) are not scanned.
+    """
+
+    def test_every_reviewed_construct_table(self) -> None:
+        """One table over the shell constructs that can hide a git publish. The
+        PUBLISH cases must DENY (a protected push reachable through the
+        construct); the plain read-only and golden-path cases must ALLOW."""
+        P = "pus" + "h"
+        nl = chr(10)
+        must_deny = (
+            # extglob @(...)
+            "git @(missing_8459) %s origin main" % P,
+            "bash -O extglob -O nullglob -c 'git @(x) %s origin main'" % P,
+            # a trailing comment with an apostrophe, then a newline, then a force
+            # push to a protected branch
+            "git %s origin feat # don't%sgit %s --force origin main" % (P, nl, P),
+            # glued command operators
+            "x&git $@ %s origin main" % P,
+            "ok;git $@ %s origin main" % P,
+            "a|git $@ %s origin main" % P,
+            "git {,%s} origin main" % P,  # brace expansion as subcommand
+            # wrapper keywords (plain and with options) running a protected push
+            "env git %s origin main" % P,
+            "eval git %s origin main" % P,
+            "env -C /tmp git $X %s origin main" % P,
+            "timeout 5 git $X %s origin main" % P,
+            "exec -a foo git $X %s origin main" % P,
+            "nice -n 5 git $@ %s origin main" % P,
+            # heredoc body line
+            "cat <<'EOF'%sgit $R %s origin main%sEOF" % (nl, P, nl),
+            # expansions / substitutions in the subcommand position
+            "git $@ %s origin main" % P,
+            "git -C . $@ %s origin main" % P,  # option value consumed, $@ is the subcommand
+            "git -c x=y $X %s origin main" % P,
+            'git -C "$D" %s origin main' % P,  # non-plain option value shifts the subcommand
+            "git '-C' . $@ %s origin main" % P,  # quoted option name (normalizer dequotes)
+            ">$x git $@ origin main",  # leading redirection, expansion subcommand
+            "git $(printf %s) origin main" % P,
+            'git --namespace="team one" %s origin main' % P,
+        )
+        must_allow = (
+            "git %s origin my-feature" % P,  # plain feature push (floor allows)
+            "VAR=val git %s origin my-feature" % P,  # plain assignment prefix
+            "git %s origin my-feature 2>&1" % P,  # modelled redirection
+            "git status",
+            "git -C /abs/path status",
+            "git -C /abs/path stash %s" % P,  # plain prefix, non-protected stash
+            "git log --oneline -20",
+            "git fetch origin main",
+            "git add *.py",  # glob AFTER a plain non-push subcommand
+            "git diff *.py",
+            "command -v git",
+            "grep hello *.py",
+            "echo done",
+            "eval 'git' 'status'",  # quoted-literal subcommand lexes to plain
+            "git commit -m 'fix the thing'",  # subcommand args are not scanned
+            "git log --oneline --grep='rsync -e'",  # --grep pattern after log
+            # Security Scope golden paths: glued read-only chains and worktree-dev
+            # clones with a home-relative or quoted root stay allowed
+            "git log --oneline -5; git status",
+            "git stash; git pull --rebase origin main",
+            "git fetch;git status",
+            "git -C ~/src/x worktree add ../y -b z origin/main",
+            # the normalizer resolves these to a plain / non-publish form
+            'git "$HOME" origin main',  # $HOME -> a concrete path, not a publish
+            "git ~ origin main",
+            "git -C $R stash %s" % P,  # subcommand is stash, not a protected push
+        )
+        for cmd in must_deny:
+            assert is_denied(cmd) is not None, cmd
+        for cmd in must_allow:
+            assert is_denied(cmd) is None, cmd
+
+
 @pytest.fixture
 def captured_sel_events(monkeypatch):
     """Capture SEL events without real I/O (isolate the ambient forensic log)."""

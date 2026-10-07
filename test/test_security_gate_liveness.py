@@ -217,7 +217,25 @@ def _url_payload_command(n: int) -> str:
 #: subcommand. It is a security-deciding predicate, so it cannot leave the package,
 #: and no dead code remains to offset it. Its first word is split on space and tab
 #: only, the way bash splits, so a Unicode space cannot pose as a word break.
-_PACKAGE_LINE_BUDGET = 28_665
+#:
+#: Set for the git-publish floor's subcommand-position non-plain fail-safe, which
+#: lives in the ONE existing normalizer walker (``_is_git_push_via_normalizer``),
+#: not a separate pass. After it skips global flags and their values to the
+#: subcommand, a subcommand token that is not a strict literal
+#: (``_STRICT_PLAIN_SUBCOMMAND_RE``: ``[A-Za-z0-9_./=:-]``) is one the shell can
+#: rewrite into any subcommand -- a push included -- so the command is treated as
+#: a possible publish and the floor judges the target (decline on a protected
+#: branch). Because the tokens are already normalized/dequoted, this one check
+#: covers a quoted option name (``git '-C' . $@ push``), a leading redirection
+#: (``>$x git $@``), an expansion in the subcommand slot (``git -C . $@ push``);
+#: a token with a glued control operator is split first (``ok;git``,
+#: ``git fetch;git status``) so each command word sits at its own position, and
+#: the subcommand is cut at a trailing operator so ``git stash; git pull`` is not
+#: over-refused. The accepted cost is over-refusal of a read-only command whose
+#: subcommand position is an expansion -- a loud, recoverable denial. No separate
+#: pre-verb pass and no new lexer; it reuses ``normalize_shell_command``,
+#: ``_cut_at_operator`` and ``_GIT_ARG_FLAGS``.
+_PACKAGE_LINE_BUDGET = 28740
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second

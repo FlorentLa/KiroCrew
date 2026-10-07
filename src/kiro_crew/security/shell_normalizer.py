@@ -2918,8 +2918,34 @@ def _split_shell_words(segment: str) -> list[str]:
     return words
 
 
-# The product name as a WHOLE program name (bare or the tail of a path), which is
-# what distinguishes ``bin/kirocrew token`` from ``cd kirocrew-wt-x``.
+# Git global flags that consume a separate argument token (they appear between
+# ``git`` and the subcommand). Read by ``argv_floor._is_git_push_via_normalizer``'s
+# subcommand seek. These are the git global options that take a SEPARATE value
+# word; a value given with ``=`` (``--git-dir=/x``) is self-contained and is
+# matched by the ``=`` check in the seek, not by membership here, so an option's
+# value word is never mistaken for the subcommand.
+_GIT_ARG_FLAGS = frozenset(
+    {
+        "-c",
+        "-C",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+    }
+)
+
+#: A normalized git subcommand token is a verifiable plain word only if it fully
+#: matches this strict literal pattern: ASCII letters, digits and ``_ . / = :
+#: -``. Anything else -- a surviving ``$`` expansion, backtick, glob, brace or
+#: other metacharacter -- means the shell can rewrite the subcommand, so the git
+#: command cannot be verified as a non-publish. Used by the argv-floor walker.
+_STRICT_PLAIN_SUBCOMMAND_RE = re.compile(r"[A-Za-z0-9_./=:-]+")
+
+#: Control operators that separate commands. A normalized token with one glued
+#: in (``ok;git``, ``fetch;git``, ``x&git``) is really two command words; the
+#: argv-floor walker splits on these so each command's program and subcommand
+#: sit at their own positions.
+_CONTROL_OPERATOR_SPLIT_RE = re.compile(r"[;&|\n]+")
 
 
 def _is_self_program(token: str) -> bool:
