@@ -81,7 +81,7 @@ export function useChatStream({ dispatch, buffers, voice, reconnectingRef }: Cha
         const slots = store.getState().dashboard.slots
         const marks = isMemberThreadSlot(slot, slots)
           ? memberThreadRowMarksUnread(data.role)
-          : chatMessageMarksUnread(data.role)
+          : chatMessageMarksUnread(data.role, data.meta?.notice)
         // Criterion 7: a session muted by its creator never becomes
         // unread from its own activity. This is the chat_message half of the
         // two automatic markSlotUnread sites; turnCompletion.ts has the other.
