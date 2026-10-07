@@ -82,6 +82,7 @@ import re
 import secrets
 import shutil
 import stat
+import sys
 import threading
 import time
 from collections.abc import Iterable
@@ -202,11 +203,13 @@ def scratch_root() -> Path:
 
     The override is used AS the managed root, so the subdirectory the sweep and
     allocator operate on is the overridden path itself. :func:`valid_scratch_root_override`
-    resolves the override to a real path (as ``KIROCREW_HOME`` does), so a symlink or
-    junction AT the override name is followed to its target like any operator-chosen
-    directory; the link/junction refusal in :func:`allocate_scratch` still fires on a link
-    planted at an allocation BELOW that resolved root, exactly as it does under the default
-    location. The sandbox masks the resolved root as a hidden tree
+    resolves and validates the override ONCE and pins it for the process lifetime, and it
+    REJECTS a symlinked override name (one whose ``realpath`` differs from its lexical
+    path), falling back to the default ``config_dir()/scratch``: a writable alias at the
+    override name could otherwise be repointed to another session's root, so only a real
+    directory is accepted. The link/junction refusal in :func:`allocate_scratch` still
+    fires on a link planted at an allocation BELOW that resolved root, exactly as it does
+    under the default location. The sandbox masks the resolved root as a hidden tree
     (``sandbox._relocated_scratch_root_target``), so relocating scratch does not weaken the
     per-session isolation the default location has.
     """
@@ -221,7 +224,12 @@ def scratch_root() -> Path:
         # repointed-and-still-unsafe value warns again, which is what an operator
         # fixing it needs to see.
         _WARNED_UNSAFE_SCRATCH_ROOTS.add(raw)
-        logger.warning("%s=%s is a system directory, ignoring", SCRATCH_ROOT_ENV, raw)
+        if sys.platform == "darwin":
+            # The relocated-scratch Seatbelt mask has no rename-ancestor guard, so the
+            # override is refused outright on macOS; the default root keeps those guards.
+            logger.warning("%s=%s is not supported on macOS, ignoring", SCRATCH_ROOT_ENV, raw)
+        else:
+            logger.warning("%s=%s is a system directory, ignoring", SCRATCH_ROOT_ENV, raw)
     return config_dir() / _SUBDIR
 
 

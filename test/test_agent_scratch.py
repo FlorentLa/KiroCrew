@@ -63,6 +63,11 @@ class TestScratchRootOverride:
         # A real directory on another "drive" becomes the managed root itself,
         # with no ``scratch`` subcomponent appended -- and allocations land
         # under it, so the override reaches the allocator, not just the getter.
+        # HOME is pinned off the real tree: pytest's tmp_path is UNDER the real
+        # ``~/.kiro/crew``, and the validator refuses an override inside any crew-home
+        # spelling, so without this the "off-drive" root would be refused as in-home.
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setenv("HOME", str(tmp_path / "realhome"))
         other = tmp_path / "data-drive" / "kirocrew-scratch"
         monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", str(other))
         assert sc.scratch_root() == other.resolve()
@@ -78,6 +83,10 @@ class TestScratchRootOverride:
         # ``KIROCREW_HOME`` does. ``Path.cwd().anchor`` is the drive root on
         # Windows (``C:\``) and ``/`` on POSIX -- the ``p == p.parent`` case the
         # predicate refuses on every OS, so the file is never created.
+        # Pin a non-darwin platform: on macOS the override is refused earlier with a
+        # different ("not supported on macOS") warning, which this system-dir wording
+        # assertion must not see.
+        monkeypatch.setattr(sys, "platform", "linux")
         monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", Path.cwd().anchor)
         with caplog.at_level("WARNING"):
             assert sc.scratch_root() == scratch_root

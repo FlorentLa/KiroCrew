@@ -623,9 +623,25 @@ class TestARelocatedScratchRootIsCoveredToo:
     unmasked root and sandboxed sessions could read each other's trees.
     """
 
+    @pytest.fixture(autouse=True)
+    def _home_off_the_real_tree(self, _floor_monkeypatch, tmp_path):
+        # pytest's tmp_path resolves UNDER the real ``~/.kiro/crew`` (its tempdir is the
+        # crew scratch runtime), so a "relocated" root built from tmp_path would land inside
+        # the real default home -- which ``valid_scratch_root_override`` now refuses (an
+        # override inside ANY crew-home spelling is masked and therefore refused). Pin HOME
+        # to an isolated dir so ``_default_home()``/``_legacy_home()`` resolve under it and a
+        # tmp_path-based relocation is genuinely off every crew home, as the real case is.
+        # Uses _floor_monkeypatch (undone independently, D11), not the shared monkeypatch,
+        # so a test calling monkeypatch.undo() cannot lift this autouse isolation.
+        _floor_monkeypatch.setenv("HOME", str(tmp_path / "realhome"))
+
     @_POSIX_ONLY
     @pytest.mark.parametrize("mode", _MODES)
     def test_the_launcher_masks_the_relocated_scratch_root(self, mode, tmp_path, monkeypatch):
+        # The override is honoured on Linux/Windows; macOS refuses it (the relocated
+        # Seatbelt mask has no rename-ancestor guard), so pin a non-darwin platform to
+        # exercise the honoured-mask path deterministically on every runner.
+        monkeypatch.setattr(sys, "platform", "linux")
         root = tmp_path / "data-drive" / "kirocrew-scratch"
         monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", str(root))
         hidden, _readonly, _files = _launcher_sets(mode)
@@ -635,6 +651,11 @@ class TestARelocatedScratchRootIsCoveredToo:
     def test_the_seatbelt_profile_masks_the_relocated_scratch_root(
         self, mode, tmp_path, monkeypatch
     ):
+        # Exercises the Seatbelt mask-string builder for a honoured override. The override
+        # itself is refused on macOS, so pin a non-darwin platform: the builder emits the
+        # same deny rule regardless of the runtime OS, and this keeps the test green on the
+        # macOS runner where the override would otherwise be refused.
+        monkeypatch.setattr(sys, "platform", "linux")
         root = tmp_path / "data-drive" / "kirocrew-scratch"
         monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", str(root))
         profile = sandbox._build_seatbelt_profile(mode)
@@ -652,6 +673,43 @@ class TestARelocatedScratchRootIsCoveredToo:
         monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", str(config_dir() / "scratch"))
         assert sandbox._relocated_scratch_root_target() == []
 
+    def test_override_nested_under_default_adds_no_nested_mask(self, monkeypatch, tmp_path):
+        # Regression: an override nested INSIDE the default scratch root is already covered
+        # by the ``scratch`` leaf's ancestor mask. Emitting it again as a nested target made
+        # the ancestor mask recreate the directory with a new inode on per-session scratch
+        # allocation, and the nested mask's _pin_mount_path then rejected the identity
+        # mismatch and aborted the launcher before the agent started. No extra rule is added.
+        from kiro_crew.config.paths import config_dir
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home" / ".kiro" / "crew"))
+        monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", str(config_dir() / "scratch" / "moved"))
+        assert sandbox._relocated_scratch_root_target() == []
+
+    @pytest.mark.parametrize("leaf", ["work", "scratch", "diag"])
+    def test_override_nested_under_any_hidden_leaf_adds_no_nested_mask(
+        self, monkeypatch, tmp_path, leaf
+    ):
+        # Same abort, generalized: an override under ANY hidden crew leaf (not only
+        # ``scratch``) -- e.g. ``<data home>/work/tmp`` -- is already covered by that leaf's
+        # mask, and a redundant scratch mask nested under it aborts the launcher. The leaf is
+        # parametrized to prove the suppression is not special-cased to ``scratch``.
+        from kiro_crew.config.paths import config_dir
+
+        assert leaf in sandbox._CREW_HIDDEN_LEAVES
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home" / ".kiro" / "crew"))
+        monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", str(config_dir() / leaf / "tmp"))
+        assert sandbox._relocated_scratch_root_target() == []
+
+    def test_override_outside_default_still_adds_its_rule(self, monkeypatch, tmp_path):
+        # The fix must not swallow a genuine relocation: a sibling of (not nested under) the
+        # default scratch root still needs its own mask so the window is not left unmasked.
+        # The override is refused on macOS, so pin a non-darwin platform to assert the
+        # honoured-relocation target deterministically on every runner.
+        monkeypatch.setattr(sys, "platform", "linux")
+        root = tmp_path / "data-drive" / "kirocrew-scratch"
+        monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", str(root))
+        assert sandbox._relocated_scratch_root_target() == [os.path.normpath(str(root.resolve()))]
+
     def test_a_resolution_failure_never_breaks_a_spawn(self, monkeypatch):
         def _boom() -> object:
             raise RuntimeError("no override")
@@ -663,7 +721,10 @@ class TestARelocatedScratchRootIsCoveredToo:
         self, monkeypatch, tmp_path
     ):
         # An absent relocated root would be skipped by the isdir-guarded mask loop and then
-        # created unmasked by allocate_scratch; the materialiser must create it first.
+        # created unmasked by allocate_scratch; the materialiser must create it first. The
+        # override is refused on macOS, so pin a non-darwin platform so the materialiser
+        # sees a honoured override on every runner.
+        monkeypatch.setattr(sys, "platform", "linux")
         root = tmp_path / "data-drive" / "kirocrew-scratch"
         assert not root.exists()
         monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", str(root))

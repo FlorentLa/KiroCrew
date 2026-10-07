@@ -4919,9 +4919,12 @@ def _relocated_scratch_root_target() -> list[str]:
     other's scratch trees. Masking the resolved override root as a hidden tree restores the
     isolation the default layout already has.
 
-    Returns the override path only when it is SET and VALID and differs from
-    ``config_dir()/scratch`` (the default, already masked), so the ordinary layout gains no
-    duplicate rule.
+    Returns the override path only when it is SET and VALID and lies OUTSIDE every hidden
+    crew leaf (``_CREW_HIDDEN_LEAVES``, e.g. ``scratch`` and ``work``). An override equal to
+    or nested under one of those already-masked leaves gains no rule: that leaf's ancestor
+    mask already covers it, and a redundant nested scratch mask aborts the launcher (see
+    below). The ordinary relocate-off-the-data-home case names a path under none of them and
+    is masked as normal.
 
     ``normpath``, never ``realpath``: lexical, like :func:`_relocated_crew_targets`. The one
     ``Path.resolve()`` the override costs happens inside ``valid_scratch_root_override`` and
@@ -4934,13 +4937,54 @@ def _relocated_scratch_root_target() -> list[str]:
         if override is None:
             return []
         resolved = os.path.normpath(str(override))
-        default = os.path.normpath(os.path.join(str(config_dir()), "scratch"))
     except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
         logger.debug(
             "could not resolve the scratch-root override for sandbox masking", exc_info=True
         )
         return []
-    return [resolved] if resolved != default else []
+    # Suppress the extra target when a hidden crew leaf's mask ALREADY covers the override:
+    # the leaf directory itself, or anything nested under it. ``scratch`` is the common case
+    # (an override equal to ``config_dir()/scratch``), but ANY hidden leaf applies -- e.g. an
+    # override at ``config_dir()/work/tmp`` sits under the ``work`` mask. A redundant mask
+    # nested inside such a hidden tree is not just a duplicate: the ancestor mask recreates
+    # the override directory with a new inode when its own private window is allocated, and
+    # the nested scratch mask's ``_pin_mount_path`` then rejects the carried identity
+    # mismatch and aborts the launcher before the agent starts. The ancestor already
+    # isolates it, so emitting no scratch rule here leaves the area masked and fail-safe.
+    for ancestor in _crew_hidden_leaf_dirs():
+        if resolved == ancestor or (resolved + os.sep).startswith(ancestor + os.sep):
+            return []
+    return [resolved]
+
+
+def _crew_hidden_leaf_dirs() -> list[str]:
+    """Normpathed hidden crew-leaf directories, under both the resolved data home and the
+    ``$HOME``-relative default, for :func:`_relocated_scratch_root_target`'s ancestor check.
+
+    A scratch override nested under any of these is already masked by that leaf's own hidden
+    tree (``_CREW_HIDDEN_LEAVES``), so a second nested scratch mask is both redundant and
+    fatal to the launcher's mount-pin check. Covers both spellings because a leaf is joined
+    with ``Path.home()`` by default and re-anchored under ``config_dir()`` when the data home
+    moves (see :func:`_relocated_crew_targets`). Never raises: an unresolvable root is
+    skipped, degrading to the default ``scratch``-only coverage rather than failing a spawn.
+    """
+    roots: list[str] = []
+    for root_fn in (
+        lambda: str(config_dir()),
+        lambda: os.path.join(str(Path.home()), _CREW_HOME_DEFAULT),
+    ):
+        try:
+            roots.append(root_fn())
+        except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+            continue
+    dirs: list[str] = []
+    for root in roots:
+        for leaf in _CREW_HIDDEN_LEAVES:
+            try:
+                dirs.append(os.path.normpath(os.path.join(root, leaf)))
+            except Exception:  # pragma: no cover - defensive
+                continue
+    return dirs
 
 
 #: Tier leaves NOT re-anchored under a pod child's remapped home, because they ARE

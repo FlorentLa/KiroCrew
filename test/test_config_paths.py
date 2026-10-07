@@ -92,6 +92,17 @@ class TestScratchRootOverride:
     """``valid_scratch_root_override()`` validates ``KIROCREW_SCRATCH_ROOT`` with
     the same ``_is_unsafe_home`` predicate as ``KIROCREW_HOME``."""
 
+    @pytest.fixture(autouse=True)
+    def _home_off_the_real_tree(self, _floor_monkeypatch, tmp_path: Path) -> None:
+        # pytest's tmp_path resolves UNDER the real ``~/.kiro/crew``, so a tmp_path-based
+        # "off-drive" override would land inside the real default home, which the validator
+        # now refuses (an override inside ANY crew-home spelling is masked and refused). Pin
+        # HOME to an isolated dir so ``_default_home()``/``_legacy_home()`` resolve under it
+        # and a tmp_path relocation is genuinely off every crew home, as the real case is.
+        # Uses _floor_monkeypatch (undone independently, D11), not the shared monkeypatch,
+        # so a test calling monkeypatch.undo() cannot lift this autouse isolation.
+        _floor_monkeypatch.setenv("HOME", str(tmp_path / "realhome"))
+
     def test_unset_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("KIROCREW_SCRATCH_ROOT", raising=False)
         assert paths.valid_scratch_root_override() is None
@@ -99,8 +110,43 @@ class TestScratchRootOverride:
     def test_valid_override_is_resolved(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        # Pin a supported platform: on macOS the override is refused (see
+        # ``test_override_is_refused_on_macos``), so this "is honoured" assertion
+        # must assume a non-darwin runner to stay deterministic across CI hosts.
+        monkeypatch.setattr(sys, "platform", "linux")
+        paths._scratch_root_override_pin = paths._UNSET
         target = tmp_path / "scratch-elsewhere"
         monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", str(target))
+        assert paths.valid_scratch_root_override() == target.resolve()
+
+    def test_override_is_refused_on_macos(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # On macOS the sandbox masks a relocated scratch root with a pathname-based
+        # Seatbelt rule that has no rename-ancestor guard, so a rename of a writable
+        # parent moves the scratch tree out from under the mask. The default root keeps
+        # those guards, so the override is refused on darwin and scratch_root() falls
+        # back to it. A valid off-home target that WOULD be accepted elsewhere is used,
+        # so only the platform decides the refusal.
+        target = tmp_path / "data-drive" / "scratch"
+        monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", str(target))
+        monkeypatch.setattr(sys, "platform", "darwin")
+        paths._scratch_root_override_pin = paths._UNSET
+        assert paths.valid_scratch_root_override() is None
+        import kiro_crew.agent_scratch as agent_scratch
+
+        assert agent_scratch.scratch_root() == paths.config_dir() / "scratch"
+
+    @pytest.mark.parametrize("platform", ["linux", "win32"])
+    def test_valid_override_is_honoured_off_macos(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, platform: str
+    ) -> None:
+        # Linux and Windows build the mask differently and keep honouring a valid
+        # off-home override; only macOS refuses it.
+        target = tmp_path / "data-drive" / "scratch"
+        monkeypatch.setattr(sys, "platform", platform)
+        monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", str(target))
+        paths._scratch_root_override_pin = paths._UNSET
         assert paths.valid_scratch_root_override() == target.resolve()
 
     def test_system_dir_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -130,10 +176,151 @@ class TestScratchRootOverride:
     def test_sibling_of_config_dir_is_accepted(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        monkeypatch.setattr(sys, "platform", "linux")
+        paths._scratch_root_override_pin = paths._UNSET
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home" / ".kiro" / "crew"))
         sibling = tmp_path / "data-drive" / "scratch"
         monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", str(sibling))
         assert paths.valid_scratch_root_override() == sibling.resolve()
+
+    def test_path_inside_data_home_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # A scratch root INSIDE the data home would be masked as a hidden tree,
+        # hiding whatever governance tree sits there -- e.g. ``<data home>/profiles``
+        # drops the read-only profile seal, so a profile-bound policy silently falls
+        # back to the permissive default. Any descendant of config_dir() is refused.
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home" / ".kiro" / "crew"))
+        home = paths.config_dir()
+        for inside in (home / "profiles", home / "scratch" / "moved", home / "deep" / "nested"):
+            monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", str(inside))
+            paths._scratch_root_override_pin = paths._UNSET
+            assert paths.valid_scratch_root_override() is None, inside
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX launcher staging roots")
+    def test_launcher_staging_roots_are_refused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # The sandbox launcher stages private windows on ``/run/user/$UID`` then
+        # ``/dev/shm`` (sandbox_launcher_program.pick_stand_in_root); masking one of
+        # those as the scratch root hides the launcher's staging and aborts agent
+        # start with ENOENT. The guard refuses each staging root, anything UNDER it,
+        # AND any ANCESTOR of it (/run, /dev) -- a mask on the parent covers the child.
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home" / ".kiro" / "crew"))
+        import os as _os
+
+        candidates = list(paths._launcher_staging_roots()) + ["/run", "/dev"]
+        if hasattr(_os, "getuid"):
+            candidates.append("/run/user")
+        for staging in paths._launcher_staging_roots():
+            monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", staging + "/kc")
+            paths._scratch_root_override_pin = paths._UNSET
+            assert paths.valid_scratch_root_override() is None, staging + "/kc"
+        for cand in candidates:
+            monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", cand)
+            paths._scratch_root_override_pin = paths._UNSET
+            assert paths.valid_scratch_root_override() is None, cand
+
+    def test_path_inside_legacy_home_is_refused_even_with_active_home_elsewhere(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # GPT 6.1 round-4 case: with a non-default KIROCREW_HOME active, an override inside
+        # the pre-move legacy ``~/.kirocrew`` home is still masked under the legacy home
+        # spelling, so a redundant nested mask aborts the launcher. The override must be
+        # refused at ANY crew-home spelling (active config_dir, default ~/.kiro/crew, legacy
+        # ~/.kirocrew), not only the active one. Fall back to the default.
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "active" / ".kiro" / "crew"))
+        legacy = paths._legacy_home()
+        for inside in (legacy / "scratch" / "moved", legacy, paths._default_home() / "x"):
+            monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", str(inside))
+            paths._scratch_root_override_pin = paths._UNSET
+            assert paths.valid_scratch_root_override() is None, inside
+
+    def test_launcher_staging_roots_reuse_the_sweep_canonical_list(self) -> None:
+        # The guard names exactly the tmpfs roots the launcher stages private windows on,
+        # in the launcher's own worst-first order (/run/user/$UID then /dev/shm). It is a
+        # self-contained list, NOT the sweep's _mount_source_candidate_roots, because that
+        # list is monkeypatched by the test harness and carries a tempfile.gettempdir()
+        # fallback this guard must not refuse. This pins the pairing so the two cannot
+        # drift silently.
+        import os
+
+        roots = paths._launcher_staging_roots()
+        assert roots and roots[-1] == "/dev/shm"
+        if hasattr(os, "getuid"):
+            assert roots[0] == f"/run/user/{os.getuid()}"
+        # The system tempdir is NOT a staging root the guard refuses.
+        import tempfile
+
+        assert tempfile.gettempdir() not in roots
+
+    def test_symlinked_override_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # A symlink AT the override name could be repointed to another session's root
+        # between the first resolve and a later allocation, so a symlinked override is
+        # refused outright (fall back to the default), and scratch_root() stays pinned.
+        # On Windows a directory SYMLINK needs a privilege the CI runner lacks, so the
+        # alias is staged with ``make_dir_link`` -- a JUNCTION there, a symlink on POSIX.
+        # Both are reparse points whose ``realpath`` differs from the lexical path, which
+        # is exactly what the validator refuses, so the refusal/pinning asserts run on
+        # every OS. If a runner cannot create the reparse point at all, only that creation
+        # is skipped (with a reason) -- never the assertions.
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home" / ".kiro" / "crew"))
+        real_a = tmp_path / "scratch-a"
+        real_a.mkdir()
+        real_b = tmp_path / "scratch-b"
+        real_b.mkdir()
+        alias = tmp_path / "current"
+
+        def _repoint(dest: Path) -> None:
+            # A junction is a directory reparse point and must be removed with rmdir()
+            # on Windows; a POSIX symlink is removed with unlink().
+            if alias.exists() or alias.is_symlink():
+                if sys.platform == "win32":
+                    alias.rmdir()
+                else:
+                    alias.unlink()
+            make_dir_link(alias, dest)
+
+        try:
+            make_dir_link(alias, real_a)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"cannot create a directory link on this runner: {exc}")
+        monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", str(alias))
+        paths._scratch_root_override_pin = paths._UNSET
+        import kiro_crew.agent_scratch as agent_scratch
+
+        before = agent_scratch.scratch_root()
+        # The override is a reparse point, so it is refused and scratch_root() is the default.
+        assert paths.valid_scratch_root_override() is None
+        assert before == paths.config_dir() / "scratch"
+        # Repoint the alias; the root must not change (refused + pinned, no re-resolve).
+        _repoint(real_b)
+        after = agent_scratch.scratch_root()
+        assert after == before
+
+    def test_resolved_override_is_pinned_for_the_process(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # A valid real-directory override is resolved ONCE and pinned: later calls read
+        # the pin, so even repointing a symlink that sits BELOW the override name cannot
+        # change the resolved root mid-process. A changed env string recomputes.
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home" / ".kiro" / "crew"))
+        target = tmp_path / "data-drive" / "scratch"
+        target.mkdir(parents=True)
+        monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", str(target))
+        paths._scratch_root_override_pin = paths._UNSET
+        first = paths.valid_scratch_root_override()
+        assert first == target.resolve()
+        # Same env string -> pinned value returned, not recomputed.
+        assert paths.valid_scratch_root_override() is first
+        # A genuinely CHANGED variable is honoured (different relocation).
+        other = tmp_path / "other-drive" / "scratch"
+        other.mkdir(parents=True)
+        monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", str(other))
+        assert paths.valid_scratch_root_override() == other.resolve()
 
 
 class TestLedgerRoot:

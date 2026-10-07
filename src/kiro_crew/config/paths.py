@@ -283,8 +283,48 @@ def _valid_override_home() -> Path | None:
 #: want it on a data drive without relocating the whole data home.
 SCRATCH_ROOT_ENV = "KIROCREW_SCRATCH_ROOT"
 
+#: Process-lifetime pin for the validated, resolved scratch-root override. The override
+#: is validated and ``realpath``-resolved exactly ONCE, on the first ``scratch_root()``
+#: call, and every later allocation, sweep and sandbox-plan reads this pinned value
+#: instead of re-reading the environment or re-resolving the path. That closes a
+#: time-of-check/time-of-use hole: if the override named a writable symlink alias, an
+#: agent could repoint it between calls so allocation and the sandbox mask resolved to
+#: different roots, exposing one session's scratch to another. The pin is keyed on the
+#: raw env string so a legitimately CHANGED variable (a different relocation) is honoured
+#: -- only a repoint of the SAME string's target is frozen out. ``_UNSET`` means "not yet
+#: computed"; ``None`` means "computed, no valid override" (fall back to the default).
+_UNSET: object = object()
+_scratch_root_override_pin: object = _UNSET
+
 
 def valid_scratch_root_override() -> Path | None:
+    """The validated, resolved ``KIROCREW_SCRATCH_ROOT`` override, pinned per process.
+
+    Validates and ``realpath``-resolves the override exactly ONCE (via
+    :func:`_validate_scratch_root_override`) and PINS the result for the process
+    lifetime, keyed on the raw env string. Every later ``scratch_root()`` call --
+    allocation, sweep, sandbox plan -- reads the pinned value instead of re-reading the
+    environment or re-resolving the path. That is the time-of-use half of the symlink
+    defence: even if the override named a symlink alias (already refused outright by
+    :func:`_validate_scratch_root_override`), nothing re-resolves it later, so an alias
+    repointed after the first call cannot make allocation and the sandbox mask diverge.
+
+    A legitimately CHANGED variable is still honoured: the pin is keyed on the raw string,
+    so setting ``KIROCREW_SCRATCH_ROOT`` to a different directory recomputes; only a
+    repoint of the SAME string's target is frozen out, which is exactly the attack. Tests
+    reset the pin through the ``config.paths`` cache-reset fixture, like ``_resolved_home``.
+    """
+    global _scratch_root_override_pin
+    raw = os.environ.get(SCRATCH_ROOT_ENV) or ""
+    pin = _scratch_root_override_pin
+    if pin is not _UNSET and isinstance(pin, tuple) and pin[0] == raw:
+        return pin[1]
+    resolved = _validate_scratch_root_override()
+    _scratch_root_override_pin = (raw, resolved)
+    return resolved
+
+
+def _validate_scratch_root_override() -> Path | None:
     """Return the resolved ``KIROCREW_SCRATCH_ROOT`` override iff set AND valid.
 
     Mirrors :func:`_valid_override_home`: a filesystem/drive root or a known
@@ -294,6 +334,9 @@ def valid_scratch_root_override() -> Path | None:
     ignores it and falls back to ``config_dir()/scratch`` with a one-line
     warning, exactly as :func:`config_dir` does for an unsafe ``KIROCREW_HOME``.
 
+    Called once per distinct env value through :func:`valid_scratch_root_override`,
+    which pins the result; do not call this directly from allocation/sweep/plan.
+
     This is the supported alternative to junctioning the scratch directory onto
     another drive, which the auto-improvement clone-setup refuses for safety.
     The returned path is used AS the managed root (not with a ``scratch``
@@ -301,40 +344,139 @@ def valid_scratch_root_override() -> Path | None:
     refusal on the managed root intact: the override names a real directory,
     not a link planted at the ``scratch`` leaf.
 
-    It also refuses an override that EQUALS or CONTAINS the data home
-    (:func:`config_dir`) or the workspace base: the OS sandbox masks the resolved
-    scratch root as a hidden tree, so an override that is an ancestor of
-    ``config_dir()`` would hide the governance ceiling below it (turning a
-    tightest-wins policy into the permissive default) and hide the operator's own
-    work. A path on a different drive or a sibling of the data home is fine; only
-    an ancestor-or-equal of the protected trees is refused.
+    It refuses a SYMLINKED override (its ``realpath`` differs from its lexical path): a
+    writable alias at the override name could be repointed to another session's root after
+    the first resolve, so only a real directory is accepted. It refuses an override that
+    EQUALS, CONTAINS, or lies INSIDE any crew-home spelling --
+    the active data home (:func:`config_dir`), the default ``~/.kiro/crew``, AND the legacy
+    ``~/.kirocrew`` -- and one that equals or contains the workspace base: the OS sandbox
+    masks the resolved scratch root as a hidden tree under BOTH the default and legacy home
+    spellings regardless of which is active, so an override that is an ancestor of a crew
+    home would hide the governance ceiling below it (turning a tightest-wins policy into the
+    permissive default), and an override INSIDE one would hide whatever governance tree sits
+    there -- e.g. ``<data home>/profiles`` masks the read-only profile seal -- or, inside the
+    legacy home while another is active, produce a redundant nested mask that aborts the
+    launcher. Finally it refuses the launcher's private-window staging roots
+    (``/run/user/$UID``, ``/dev/shm``) and ANY ancestor of one (``/run``, ``/dev``): masking
+    a staging root or a parent of it hides the staging the launcher needs and aborts agent
+    start with ENOENT. A path on a different drive or a sibling of the data home is fine;
+    only a symlinked override, an ancestor-or-equal of the protected trees, a path inside
+    any crew home, or a launcher staging root (or an ancestor of one) is refused.
     """
     override = os.environ.get(SCRATCH_ROOT_ENV)
     if not override:
         return None
+    # Refuse the override on macOS. On macOS the sandbox masks a relocated scratch root
+    # with a PATHNAME-based Seatbelt rule, and that mask has no rename-ancestor guard: the
+    # guards that stop an agent renaming a parent out from under the mask cover only the
+    # default home, so under an operator-writable parent a single rename of an ancestor
+    # would move the scratch tree out from under the mask and expose other sessions'
+    # scratch. The default root (``config_dir()/scratch``) already carries those
+    # rename-ancestor guards, so refusing the override here makes ``scratch_root()`` fall
+    # back to it -- the fail-safe root -- on macOS. Linux and Windows build the mask
+    # differently and keep honouring a valid override.
+    if sys.platform == "darwin":
+        return None
     p = Path(override).expanduser().resolve()
     if _is_unsafe_home(p):
         return None
-    # Refuse a root that equals or contains a protected tree. Masking an ancestor of
-    # the data home hides the policy ceiling and the operator's files below it; the
-    # override is meant to RELOCATE scratch, never to shadow the home or workspace.
-    protected: list[Path] = []
+    # Refuse a SYMLINKED override name (``realpath`` differs from the lexical ``abspath``).
+    # The override is used AS the managed root and is masked by the sandbox as a hidden
+    # tree; a writable symlink AT the override name could be repointed to another session's
+    # root between the resolve here and a later allocation/sweep/plan, so allocation and the
+    # mask would diverge and one session's scratch would be exposed to another. A real
+    # directory cannot be repointed that way, so refusing a symlinked override (fall back to
+    # the default) closes the alias entirely. The resolve-ONCE pin in
+    # :func:`valid_scratch_root_override` is the second half of the same defence.
     try:
-        protected.append(config_dir())
-    except Exception:  # pragma: no cover - defensive; never block resolution on this
-        pass
-    try:
-        protected.append(_default_workspace_base())
+        lexical = os.path.abspath(os.path.expanduser(override))
     except Exception:  # pragma: no cover - defensive
-        pass
-    for guarded in protected:
+        lexical = None
+    if lexical is not None and os.path.realpath(lexical) != lexical:
+        return None
+    # Refuse a root that equals, CONTAINS, or lies INSIDE a protected tree. Masking an
+    # ancestor of the data home hides the policy ceiling and the operator's files below
+    # it; masking a path INSIDE the data home hides whatever governance tree sits there --
+    # the sandbox exposes ``profiles``, ``security_policy.json`` and the rest of the
+    # read-only governance leaves under ``config_dir()``, and a scratch override pointing
+    # at e.g. ``<data home>/profiles`` would mask that leaf as a HIDDEN tree, dropping its
+    # read-only seal so the policy silently resolves to the permissive default. The
+    # workspace base is refused equal-or-above only: it holds the operator's own work, not
+    # policy, so a path merely under it is their choice. The override is meant to RELOCATE
+    # scratch to a different drive or a sibling of the data home, never to shadow or
+    # tunnel into the home, the governance ceiling, or the workspace.
+    #
+    # The refusal covers EVERY crew-home spelling, not only the active one: the active data
+    # home (``config_dir()``, which may be a custom ``KIROCREW_HOME``), the default
+    # ``~/.kiro/crew``, AND the pre-move legacy ``~/.kirocrew``. The sandbox masks the crew
+    # hidden leaves under both the default and legacy home spellings regardless of which one
+    # is active, so an override inside the OLD ``~/.kirocrew`` home (while a different
+    # ``KIROCREW_HOME`` is active) would still be masked twice -- the legacy-home mask and
+    # the override's own -- and the redundant nested mask aborts the launcher's mount pin.
+    # Refusing an override at, under, or above any of these homes closes that at the source
+    # (the module that owns the override) and falls back to the safe default.
+    crew_homes: list[Path] = []
+    for home_fn in (config_dir, _default_home, _legacy_home):
         try:
-            guarded_resolved = guarded.resolve()
+            crew_homes.append(home_fn().resolve())
+        except Exception:  # pragma: no cover - defensive; never block resolution on this
+            continue
+    for home_resolved in crew_homes:
+        if p == home_resolved or p in home_resolved.parents or home_resolved in p.parents:
+            return None
+    try:
+        workspace_resolved = _default_workspace_base().resolve()
+    except Exception:  # pragma: no cover - defensive
+        workspace_resolved = None
+    if workspace_resolved is not None and (
+        p == workspace_resolved or p in workspace_resolved.parents
+    ):
+        return None
+    # Refuse the launcher's private-window staging roots, AND any ancestor of one. The
+    # sandbox launcher stages the per-session private windows on the first usable tmpfs
+    # among ``/run/user/$UID`` then ``/dev/shm`` (``sandbox_launcher_program``); the sandbox
+    # then masks the resolved scratch root as a hidden tree. An override at, under, OR ABOVE
+    # one of those roots (e.g. ``/run`` or ``/dev``) would mask the launcher's own staging,
+    # so reopening the staged windows fails with ENOENT and the agent never starts. The
+    # ancestor case matters because the mask on a parent covers the staging child beneath
+    # it. These are volatile system runtime directories, not a sensible place to relocate
+    # durable scratch, so refusing them loses nothing and keeps the start fail-safe.
+    for staging in _launcher_staging_roots():
+        try:
+            staging_resolved = Path(staging).resolve()
         except Exception:  # pragma: no cover - defensive
             continue
-        if p == guarded_resolved or p in guarded_resolved.parents:
+        if p == staging_resolved or staging_resolved in p.parents or p in staging_resolved.parents:
             return None
     return p
+
+
+def _launcher_staging_roots() -> tuple[str, ...]:
+    """The tmpfs roots the sandbox launcher stages private windows on, worst-first.
+
+    Mirrors ``sandbox_launcher_program.pick_stand_in_root``'s tmpfs candidate order
+    (``/run/user/$UID`` then ``/dev/shm``). Deliberately a SELF-CONTAINED list rather than
+    a reuse of ``sandbox_mount_sweep._mount_source_candidate_roots``: that canonical list
+    is monkeypatched by the test harness (to a per-test sandbox-mount-source dir) and, by
+    its own contract, ends with ``tempfile.gettempdir()`` as a last-resort fallback -- a
+    path that is NOT a tmpfs staging root and that this guard must not refuse (refusing all
+    of ``$TMPDIR`` would reject the legitimate temp-dir scratch relocations tests, pods and
+    worktree previews rely on). A security guard that decides whether to accept an operator
+    override must name the staging roots directly, not inherit a list the harness can
+    rewrite or that carries a non-staging entry. ``getuid`` is POSIX-only, so the
+    ``/run/user`` entry is omitted where it is unavailable (Windows), leaving ``/dev/shm``
+    which simply does not exist there -- the guard then matches nothing, which is correct.
+    The pairing with the launcher's own order is pinned by ``test_config_paths``.
+    """
+    roots: list[str] = []
+    getuid = getattr(os, "getuid", None)
+    if getuid is not None:
+        try:
+            roots.append(f"/run/user/{getuid()}")
+        except Exception:  # pragma: no cover - defensive
+            pass
+    roots.append("/dev/shm")
+    return tuple(roots)
 
 
 def shared_kiro_settings_writable() -> bool:
