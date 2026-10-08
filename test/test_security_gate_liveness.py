@@ -217,7 +217,13 @@ def _url_payload_command(n: int) -> str:
 #: subcommand. It is a security-deciding predicate, so it cannot leave the package,
 #: and no dead code remains to offset it. Its first word is split on space and tab
 #: only, the way bash splits, so a Unicode space cannot pose as a word break.
-_PACKAGE_LINE_BUDGET = 28_665
+#:
+#: Raised again, from 28,665, for one write-protected TARGET in ``paths.py``: the microvm
+#: lane's crew records, whose rows carry the VM id ``teardown`` hands to
+#: ``launcher.terminate``. Ten lines, of which four are the comprehension and six the
+#: reason every entry in that list carries. No matching rule, no threshold and no pass
+#: moved -- a target was added to a list the gate already walks.
+_PACKAGE_LINE_BUDGET = 28_675
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second
