@@ -331,6 +331,8 @@ interface SidePanelProps {
    *  path and whether it is a file or a directory to the composer host, which
    *  inserts the same `@`-mention the file picker does. */
   onAddToContext?: (absPath: string, kind: 'file' | 'dir') => void
+  /** Put a reply a dashboard page offered into this chat's composer; the person sends it. */
+  onComposerInsert?: (text: string) => void
   projectDir?: string
   navLinks?: ExtractedLink[]
   navResolving?: boolean
@@ -501,7 +503,7 @@ export function sidePanelEffectiveWidth(
 }
 
 export default function SidePanel({
-  tabsCtl, slot, slotOwner, persistSlot, onFileOpen, onArtifactOpen, onAddToContext,
+  tabsCtl, slot, slotOwner, persistSlot, onFileOpen, onArtifactOpen, onAddToContext, onComposerInsert,
   projectDir, navLinks, navResolving, sources, selectedSourceUrl, onSelectSource, onReconcileSource,
   issues, selectedIssueUrl, onSelectIssue, onReconcileIssue,
   onAddSourceToChat, onSubmitComments, connected = true, onFileSave, onClose, panelHidden,
@@ -1365,12 +1367,11 @@ export default function SidePanel({
                   to load after main.tsx's preload-reload heal declined would
                   otherwise reject up to the ROUTE boundary and replace the whole
                   chat page with an error card. The fallback is the shared error
-                  surface, not nothing, so the tab says why it is empty; the dock
-                  above the composer keeps working from its own chunk. */}
+                  surface, not nothing, so the tab says why it is empty. */}
               {/* No hand-off: the adjacent chat composer holds unsent text and the
                   panel's own answer drafts live in this tab. */}
               <ErrorBoundary scope="command-center" fallback={<ErrorNotice className="m-3" message={i18nT('commandCenter.panel_load_failed')} />}>
-                <Suspense fallback={null}><CommandCenterPanel slot={slot ?? null} active={isActive && !panelHidden} /></Suspense>
+                <Suspense fallback={null}><CommandCenterPanel slot={slot ?? null} active={isActive && !panelHidden} onAct={onComposerInsert} /></Suspense>
               </ErrorBoundary>
             </div>
           )
