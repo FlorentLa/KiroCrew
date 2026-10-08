@@ -130,6 +130,7 @@ def test_running_and_turn_running_slot_readers_are_enumerated() -> None:
                 ("chat_handlers.py", "_switch_target_busy"),
                 # The agent route's transaction; the in-turn /agent command shares it.
                 ("chat_handlers.py", "switch_slot_agent"),
+                ("chat_handlers.py", "api_chat_slot_create"),
                 ("chat_api/slot_detail.py", "api_chat_slot_detail"),
                 ("chat_handlers.py", "api_chat_slot_interrupt"),
                 ("chat_handlers.py", "api_chat_slot_model"),
@@ -153,6 +154,7 @@ def test_running_and_turn_running_slot_readers_are_enumerated() -> None:
                 ("handlers/members.py", "api_member_thread"),
                 ("handlers/members.py", "api_members"),
                 ("handlers/messaging.py", "api_send_message"),
+                ("session_control.py", "_file_child_or_retract"),
                 ("session_control.py", "create_session"),
                 # The roster verb. Reservation state, like `read_messages` beside
                 # it and for the same reason: it reports whether a session is
