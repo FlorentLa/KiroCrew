@@ -1468,7 +1468,7 @@ class TestScriptContextKeepsServers:
         started = []
 
         class FakeClient:
-            def __init__(self, server, session_key=""):
+            def __init__(self, server, session_key="", own_app=""):
                 self.server, self.calls, self.closed = server, [], 0
                 self.running, self.fail_next = True, None
                 started.append(self)
