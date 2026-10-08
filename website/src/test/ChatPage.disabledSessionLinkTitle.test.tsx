@@ -8,12 +8,21 @@
  * `ChatPage.noteSessionLink.test.tsx`); here the roster holds a DIFFERENT
  * session, so the link names a session by shape (`namesASession`) yet does not
  * resolve — exactly the `text-muted` branch of `MdAnchor`.
+ *
+ * It must NOT fire on a session that is open. A short name (`chat-2`) resolves
+ * through `sessionKeyFromShort`, which returns null in two cases that are not
+ * "closed": the message carries no `writtenAtEpoch`, or two open slots share the
+ * number (ambiguous). In both the named session may well be open — including the
+ * one the reader is in — so "Session not open" would be a false statement. Those
+ * cases are the review finding on #18036; they stay silent.
  */
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen } from '@testing-library/react'
 
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import { i18nT } from '../i18n/t'
+
+const NOT_OPEN_TITLE = i18nT('components.markdownRenderer.session_closed_link_disabled')
 
 /** Real slot-key shape (`chat-<n>-<unix-ts>`); `sessionKeyFrom` refuses anything else. */
 const OPEN = 'chat-2-1788000001'
@@ -25,7 +34,7 @@ const CLOSED = 'chat-9999-1788000099'
 const sessions = new Map<string, string>([[OPEN, 'some other session']])
 
 describe('a disabled session link explains itself on hover', () => {
-  it('carries a non-empty title on the muted, unresolved branch', () => {
+  it('carries the explanatory title on the muted, unresolved branch (full key not open)', () => {
     render(
       <MarkdownRenderer
         content={`see [the old chat](/chat?sid=${CLOSED})`}
@@ -41,6 +50,73 @@ describe('a disabled session link explains itself on hover', () => {
     // The fix: hover now says why nothing happens.
     const title = anchor.getAttribute('title')
     expect(title).toBeTruthy()
-    expect(title).toBe(i18nT('components.markdownRenderer.session_closed_link_disabled'))
+    expect(title).toBe(NOT_OPEN_TITLE)
+  })
+
+  it('carries the title for a SHORT name no open slot answers to', () => {
+    // The roster holds `chat-2` but the link names `chat-5`; no open slot has
+    // that number, so it genuinely is not open and the tooltip is true. The
+    // timestamp reaches the resolver via `messageTs` (an epoch the renderer
+    // reads as the message write time).
+    render(
+      <MarkdownRenderer
+        content={'see [a gone chat](/chat?sid=chat-5)'}
+        onSessionOpen={vi.fn()}
+        sessions={sessions}
+        activeSession={OPEN}
+        messageTs={1788000050}
+      />,
+    )
+    const anchor = screen.getByText('a gone chat').closest('a')!
+    expect(anchor).toHaveClass('text-muted')
+    expect(anchor.getAttribute('title')).toBe(NOT_OPEN_TITLE)
+  })
+
+  it('stays SILENT for a short name unresolved only because the message has no timestamp', () => {
+    // `chat-2` IS in the roster and open, but with no `messageTs` the short
+    // lookup fails closed. The session is open, so "not open" must not show.
+    render(
+      <MarkdownRenderer
+        content={'see [that chat](/chat?sid=chat-2)'}
+        onSessionOpen={vi.fn()}
+        sessions={sessions}
+        activeSession={OPEN}
+        // messageTs deliberately omitted — no write time
+      />,
+    )
+    const anchor = screen.getByText('that chat').closest('a')!
+    expect(anchor.getAttribute('title')).not.toBe(NOT_OPEN_TITLE)
+  })
+
+  it('stays SILENT for an ambiguous short name (two open slots share the number)', () => {
+    const ambiguous = new Map<string, string>([
+      ['chat-7-1788000010', 'older seven'],
+      ['chat-7-1788000020', 'newer seven'],
+    ])
+    render(
+      <MarkdownRenderer
+        content={'see [a seven](/chat?sid=chat-7)'}
+        onSessionOpen={vi.fn()}
+        sessions={ambiguous}
+        activeSession={OPEN}
+        messageTs={1788000030}
+      />,
+    )
+    const anchor = screen.getByText('a seven').closest('a')!
+    expect(anchor.getAttribute('title')).not.toBe(NOT_OPEN_TITLE)
+  })
+
+  it('stays SILENT on the active session (open, so "not open" would be false)', () => {
+    render(
+      <MarkdownRenderer
+        content={`see [this chat](/chat?sid=${OPEN})`}
+        onSessionOpen={vi.fn()}
+        sessions={sessions}
+        activeSession={OPEN}
+      />,
+    )
+    const anchor = screen.getByText('this chat').closest('a')!
+    // The active key is muted (click is a no-op) but is open, so no "not open" tooltip.
+    expect(anchor.getAttribute('title')).not.toBe(NOT_OPEN_TITLE)
   })
 })
