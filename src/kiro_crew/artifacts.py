@@ -1226,8 +1226,8 @@ class ArtifactStore:
             # 1. the content is a valid package, stored canonically;
             # 2. a REVERT restores layout only: ``revert_package`` keeps the
             #    LIVE ``bound_to`` so rolling back past a rebind cannot hand
-            #    this page to the crewmate it used to belong to (values need no
-            #    handling -- they were never in the package);
+            #    this page to the crewmate the stale binding names (values need
+            #    no handling -- they were never in the package);
             # 3. the version. A dashboard snapshots exactly when the layout
             #    changed, overriding the caller's ``snapshot`` either way: an
             #    MCP write defaults it to True and would version every
