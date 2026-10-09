@@ -11863,7 +11863,9 @@
       "crew_group_disabled": "꺼짐. 켜기 전까지 연결하지 않습니다.",
       "crew_enable": "사용",
       "crew_enable_named": "{{name}} 사용",
-      "crew_enable_failed": "{{name}}을(를) 켤 수 없습니다"
+      "crew_enable_failed": "{{name}}을(를) 켤 수 없습니다",
+      "chat_with_session": "{{title}}과(와) 채팅",
+      "chat_with_session_desc": "이 폴더의 다른 채팅을 시작한 세션"
     },
     "connectionsPage": {
       "action_failed": "작업에 실패했습니다: {{error}}",

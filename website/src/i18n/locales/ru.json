@@ -12427,7 +12427,9 @@
       "crew_group_disabled": "Выключен. Подключения не будет, пока ты его не включишь.",
       "crew_enable": "Включить",
       "crew_enable_named": "Включить {{name}}",
-      "crew_enable_failed": "Не удалось включить {{name}}"
+      "crew_enable_failed": "Не удалось включить {{name}}",
+      "chat_with_session": "Чат с {{title}}",
+      "chat_with_session_desc": "Сессия, которая начала остальные чаты в этой папке"
     },
     "connectionsPage": {
       "action_failed": "Не удалось выполнить действие: {{error}}",

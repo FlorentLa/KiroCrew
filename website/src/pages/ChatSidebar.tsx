@@ -128,6 +128,7 @@ import { useSidebarTags } from './chat-sidebar/tags'
 import { useBoardColumns, useColumnPopover, useBoardColumnMutations, useColumnMatches, useBoardFolderCollapse } from './chat-sidebar/board'
 import { useHoverHold, useHoverPinLiveness } from './chat-sidebar/hoverHold'
 import { useLineageAvailable, useConductorLane, citedCreatorOf } from './chat-sidebar/conductor'
+import { detectFolderConductor } from './chat-sidebar/folderConductor'
 import { useShortcutOrder } from './chat-sidebar/shortcuts'
 import { useFolderDropOps, useSidebarMoveUndo, useSidebarDragHandlers, useNativeSessionDrag } from './chat-sidebar/dnd/useSidebarDrag'
 import { useSidebarReveal } from './chat-sidebar/reveal'
@@ -2896,6 +2897,29 @@ function ChatSidebar({
 
   const { hoverPinRef, heldDisplacedRef, releaseHoverPin, heldLane, onRootPointerOver } = useHoverHold()
 
+  /**
+   * The session CONDUCTING a folder, derived from the folder's own rows.
+   *
+   * Read once, by the folder's menu, to decide whether that menu offers the
+   * chat item and to name the session it opens. A folder whose rows resolve no
+   * conductor gets `null` and its menu is the menu on main, which is why no
+   * other branch in this file had to change: the ordinary folder row is still
+   * the only shape this lane draws.
+   *
+   * The whole row comes back rather than its key, because the item names the
+   * session it opens: a label that says only "conductor" leaves a first-time
+   * reader with no idea what the click does.
+   *
+   * Computed per render rather than memoized. `sidebarRows` is a fresh object
+   * every render, so a memo keyed on it would recompute anyway and only add a
+   * cache to read; the work is one pass over each folder's own rows.
+   */
+  const folderConductorOf = (folderId: string): Slot | null => {
+    const rows = sidebarRows.folderTree.rowsIn(folderId)
+    const key = detectFolderConductor(rows)
+    return key == null ? null : rows.find(r => r.key === key) ?? null
+  }
+
   const { lineageAvailable } = useLineageAvailable({ allRows })
   // Which lane the sidebar is actually rendering (see `renderedLane`). The tag-column
   // board wins when columns exist — flat view does not replace it, it applies INSIDE
@@ -3646,8 +3670,36 @@ function ChatSidebar({
         <Item data-testid={tid('new-temporary')} onClick={() => { createChatInFolder(folder.id, { memoryMode: 'temporary' }) }}><VenetianMask size={13} className="text-aim" /> {i18nT('components.welcomeView.temporary')}</Item>
       </>
     )
+    // The conductor's own chat, reachable from the folder row instead of from an
+    // expand-and-scan. It is a MENU item rather than a button beside the row's
+    // other two, because a third peer action in that cluster is over the
+    // two-controls-per-row cap and the overflow menu is where the cap sends it.
+    // Both menus render from here, so the ⋯ menu and the right-click menu offer
+    // the same action. A folder whose rows resolve no conductor gets nothing
+    // added, which is why no other branch in this file changes: the row, the
+    // hover cluster and the session cards are what they are on main.
+    //
+    // The label NAMES the session and the second line says what that session is
+    // to this folder. A label carrying the word "conductor" and nothing else
+    // left a first-time reader unable to say what the click opens, and the two
+    // other chat affordances on the same row made that worse rather than
+    // clearer. The two-line shape is the one the ephemeral-chat items in this
+    // file already use.
+    const conductor = folderConductorOf(folder.id)
     return (
       <>
+        {conductor && (
+          <Item className="items-start" data-testid={tid('conductor-chat')} onClick={() => {
+            dispatch(switchSlot({ key: conductor.key, announceOnMissing: true }))
+            onSelectSlot?.(conductor.key)
+          }}>
+            <MessageSquare size={14} className="text-accent mt-[3px] shrink-0" />
+            <span className="flex min-w-0 flex-col gap-px">
+              <span className="truncate">{i18nT('pages.chatSidebar.chat_with_session', { title: conductor.title || conductor.key })}</span>
+              <span className="whitespace-normal text-[11px] leading-snug text-muted">{i18nT('pages.chatSidebar.chat_with_session_desc')}</span>
+            </span>
+          </Item>
+        )}
         <Item data-testid={tid('rename')} onClick={() => { suppressMenuRestoreRef.current = true; setEditingId(folder.id); setEditScope('list'); setEditName(folder.name) }}><Pencil size={13} /> {i18nT('pages.chatSidebar.rename')}</Item>
         <Item data-testid={tid('new-subfolder')} onClick={() => { setFolderModal({ mode: 'create', parentId: folder.id }) }}><FolderPlus size={13} /> {i18nT('pages.chatSidebar.new_subfolder')}</Item>
         {/* A flyout has nowhere to open at phone width, so inline the rows

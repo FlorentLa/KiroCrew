@@ -669,6 +669,8 @@
     "components.guideLayer.predicate_goal_loop_running": "Guide blocker before the goal button: no goal loop (auto-nudge) runs in the open chat, so its Pause is not there.",
     "components.guideLayer.predicate_monitor_running": "Guide blocker before the goal button: no unfinished monitor watches the open chat, so its Stop monitor is not there.",
     "components.guideLayer.select_the_only_one_tick": "Guide panel line on a choose-one step whose pick is the row's checkbox (the outline is on that checkbox) when the list holds exactly one job.",
-    "components.guideLayer.select_the_only_one_app": "Guide panel line on the Library's choose-the-app step when only one app card is listed: the outline is on that card's ⋯ (More actions) button."
+    "components.guideLayer.select_the_only_one_app": "Guide panel line on the Library's choose-the-app step when only one app card is listed: the outline is on that card's ⋯ (More actions) button.",
+    "pages.chatSidebar.chat_with_session": "First line of the item in a sidebar folder's actions menu that opens the chat of the session which started the folder's other sessions. {{title}} is that session's own title, shown verbatim.",
+    "pages.chatSidebar.chat_with_session_desc": "Second, quieter line of that same menu item, explaining what the named session is to the folder. It carries the whole explanation, so keep it a plain description rather than a label."
   }
 }

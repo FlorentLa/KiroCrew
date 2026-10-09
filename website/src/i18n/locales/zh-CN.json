@@ -11863,7 +11863,9 @@
       "crew_group_disabled": "已关闭。启用前不会连接。",
       "crew_enable": "启用",
       "crew_enable_named": "启用 {{name}}",
-      "crew_enable_failed": "无法启用 {{name}}"
+      "crew_enable_failed": "无法启用 {{name}}",
+      "chat_with_session": "与 {{title}} 对话",
+      "chat_with_session_desc": "开启本文件夹其他对话的那个会话"
     },
     "connectionsPage": {
       "action_failed": "操作失败：{{error}}",

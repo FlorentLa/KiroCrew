@@ -12051,7 +12051,9 @@
       "crew_group_disabled": "बंद है। चालू करने तक कनेक्ट नहीं होगा।",
       "crew_enable": "चालू करो",
       "crew_enable_named": "{{name}} चालू करो",
-      "crew_enable_failed": "{{name}} चालू नहीं हो सका"
+      "crew_enable_failed": "{{name}} चालू नहीं हो सका",
+      "chat_with_session": "{{title}} के साथ चैट",
+      "chat_with_session_desc": "वह सत्र जिसने इस फ़ोल्डर की बाकी चैट शुरू कीं"
     },
     "connectionsPage": {
       "action_failed": "कार्रवाई विफल: {{error}}",

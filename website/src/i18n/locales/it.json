@@ -12239,7 +12239,9 @@
       "crew_group_disabled": "Spento. Nessuna connessione finché non lo attivi.",
       "crew_enable": "Attiva",
       "crew_enable_named": "Attiva {{name}}",
-      "crew_enable_failed": "Impossibile attivare {{name}}"
+      "crew_enable_failed": "Impossibile attivare {{name}}",
+      "chat_with_session": "Chat con {{title}}",
+      "chat_with_session_desc": "La sessione che ha avviato le altre chat di questa cartella"
     },
     "connectionsPage": {
       "action_failed": "Azione non riuscita: {{error}}",

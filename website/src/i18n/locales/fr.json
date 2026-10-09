@@ -12239,7 +12239,9 @@
       "crew_group_disabled": "Éteint. Aucune connexion tant que tu ne l'actives pas.",
       "crew_enable": "Activer",
       "crew_enable_named": "Activer {{name}}",
-      "crew_enable_failed": "Impossible d'activer {{name}}"
+      "crew_enable_failed": "Impossible d'activer {{name}}",
+      "chat_with_session": "Chat avec {{title}}",
+      "chat_with_session_desc": "La session qui a lancé les autres chats de ce dossier"
     },
     "connectionsPage": {
       "action_failed": "Échec de l’action : {{error}}",

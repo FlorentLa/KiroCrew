@@ -12239,7 +12239,9 @@
       "crew_group_disabled": "Desligado. Sem conexão até você ativar.",
       "crew_enable": "Ativar",
       "crew_enable_named": "Ativar {{name}}",
-      "crew_enable_failed": "Não foi possível ativar {{name}}"
+      "crew_enable_failed": "Não foi possível ativar {{name}}",
+      "chat_with_session": "Chat com {{title}}",
+      "chat_with_session_desc": "A sessão que iniciou os outros chats desta pasta"
     },
     "connectionsPage": {
       "action_failed": "Falha na ação: {{error}}",
