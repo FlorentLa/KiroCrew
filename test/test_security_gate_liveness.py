@@ -217,7 +217,266 @@ def _url_payload_command(n: int) -> str:
 #: subcommand. It is a security-deciding predicate, so it cannot leave the package,
 #: and no dead code remains to offset it. Its first word is split on space and tab
 #: only, the way bash splits, so a Unicode space cannot pose as a word break.
-_PACKAGE_LINE_BUDGET = 28_665
+#:
+#: Raised for the recursive-force ``rm`` deletion floor in the ``rm_floor.py`` sibling
+#: module: an argv-structural gate that reads the ``rm`` command's own argv (flags in
+#: any position/spelling, the ``$HOME``/``~``/glob targets, brace-expanded flags and
+#: operands). It is a UNION with the two catalog regexes, which stay in the ``re`` tier
+#: as a fail-closed deny-net, and the ``grep`` inert-search carve-out
+#: (``_DENY_EXCEPTIONS``) narrows the regex's one false positive. A per-argv ``rm``-span
+#: cap (``_RM_CLASSIFY_SPAN_CAP``) and the mover-operand skip keep the synchronous gate
+#: linear on a hostile input. The floor delegates substitution/backtick/xargs/brace
+#: scanning to the shared ``shell_normalizer`` / ``argv_floor`` helpers rather than
+#: carrying private copies.
+#:
+#: Raised once more for the GPT 6.1 review-round fixes to this floor: xargs
+#: ``--replace``/``--replace=VALUE`` replace-string detection, a projected-byte +
+#: count overflow that fails CLOSED to the deny sentinel (never an appended argv),
+#: and preserving a reconstructed-argv home verdict through the final quoted-home
+#: suppression. All three are added security logic plus their reason comments.
+#:
+#: Raised again for two more review-round fixes: re-quoting a dequoted xargs
+#: operand on serialization so a quoted ``;``/``|`` literal is not read back as a
+#: command boundary that hides the home/root target, and bounding a ``printf``
+#: producer's projected stdout (fail-closed deny on overflow) so a reused format x
+#: many args cannot exceed the synchronous gate's watchdog.
+#:
+#: Raised once more for a cumulative brace-materialization byte budget
+#: (``_RM_EXPANSION_BYTE_BUDGET``): the per-word count cap and per-span
+#: classification cap do not bound the BYTES a word's members carry, so a word at
+#: the count cap with large members, re-materialized once per span, stalled the
+#: synchronous gate past its watchdog; once the budget is exhausted a span falls
+#: back to the cheap root/home-shape verdict instead of materializing members.
+#:
+#: LOWERED when the xargs unverifiable-expansion apparatus was subtracted: a blanket
+#: deny of every ``sh -c`` / ``bash -c`` / ``eval`` xargs pipeline, the ungated
+#: unverifiable-expansion floor, the NUL marker, the projected-byte caps and the
+#: ``-I`` line-record splitter sat outside this change's Goal (rm flag spellings +
+#: home variable spellings) and newly refused legitimate commands, so they were
+#: removed. The rm-floor's own-argv home/root classification is unchanged.
+#:
+#: Adjusted when the rm-floor xargs RECONSTRUCTION moved out of ``shell_normalizer``
+#: into ``rm_floor.py``: the general payload scan now uses ``shell_normalizer``'s
+#: base string ``_xargs_reconstructed_command`` (byte-identical to main), while the
+#: flag-keeping reconstruction the rm floor needs to see a home/root wipe through an
+#: xargs pipeline lives beside the floor that consumes it. A replace-count overflow
+#: on that rm-floor path is treated as unverifiable and denied with a reason (rm
+#: floor only). The lines moved between files; the package total is near flat.
+#:
+#: Raised for the minimal round-12 producer-output byte cap restored to
+#: ``rm_floor.py``: a ``printf`` producer reuses its format per argument batch, so a
+#: long format x many args projects to tens of MB that stalled the gate; the
+#: projection is bounded before the string is built and an overflow goes through the
+#: same unverifiable denial path (rm floor only).
+#:
+#: Raised for two more rm-floor fixes: a CUMULATIVE projected-byte cap in the
+#: replacement substitution (one operand with thousands of recurring ``{}`` x many
+#: records projects to tens of MB -> the overflow sentinel), and running the
+#: executed shell ``-c`` payload pass in the heavy-substitution fallback so a
+#: ``bash -c`` / ``sh -c`` home wipe buried behind many substitution openers is
+#: classified instead of skipped.
+#:
+#: Raised for the budget-fallback xargs reconstruction + the per-span operand cap:
+#: both the heavy-substitution and budget-exhausted fallbacks now run the bounded
+#: xargs reconstruction (an ``echo ~ | xargs rm -fr`` wipe hidden behind openers no
+#: longer slips), and a single ``rm`` span past ``_RM_SPAN_OPERAND_CAP`` operands
+#: falls back to the cheap root/home-shape verdict so a bare-``rm`` flood classifies
+#: in bounded work (the cap cuts before the O(operands) structural scans).
+#:
+#: Raised for the single quote-aware boundary helper (``_rm_token_ends_argv``, every
+#: rm-floor scan/fallback routes through it so a quoted ``'a;b'`` is data, not a
+#: span end), the expanded-home equality in the overflow-span scan, and the shared
+#: xargs-reconstruction + flat-token budgets that bound the frame walk to O(1) total
+#: past the frame budget (a 200-pipeline line classifies in bounded work).
+#:
+#: Raised for three more rm-floor fixes: the data-consumer ``-c``-payload scan
+#: precomputes command boundaries so a long ``echo sh … rm`` mention is O(n) not
+#: O(n x n); ``xargs -d`` / ``--delimiter`` is honored when splitting stdin records
+#: (``printf '%s:' ~ | xargs -d: rm -fr`` is a home wipe); and the operand cap
+#: counts RAW operands (not brace-expanded members) with an empty-alternative suffix
+#: beside a range group ruled non-catastrophic, so a numbered brace cleanup
+#: (``rm -rf {1..70}{,.log}``) classifies as the descendant cleanup it is.
+#:
+#: Raised again: the xargs reconstruction budget switched from a COUNT cap (which
+#: discarded, then over-refused, the unclassified remainder) to a cumulative-BYTES
+#: budget with per-source memoization, so every pipeline whose bytes fit is
+#: classified -- a home wipe past the 64th pipeline denies while a benign many-
+#: pipeline line stays allowed (GPT 6.1 F1, security-class) -- and the data-consumer
+#: scan's O(n) bound is proved by a deterministic operation-count assertion instead
+#: of a wall-clock bound (GPT 6.1 F2, tests-are-deterministic).
+#:
+#: LOWERED when the ENTIRE rm-floor xargs/printf/replacement RECONSTRUCTION apparatus
+#: was subtracted (maintainer ruling: the Goal is rm flag spellings + home variable
+#: spellings; xargs emulation is not the Goal and kept producing security findings in
+#: its own emulation). Removed from ``rm_floor.py``: the flag-keeping reconstruction
+#: and its pipeline walk, the ``echo``/``printf`` producer-output resolver, the
+#: ``-I``/``-i``/``--replace`` replacement expansion, the ``-d`` delimiter decode,
+#: the record-split/quote helpers, the cumulative byte budgets and the unverifiable
+#: overflow sentinel; and from ``__init__.py`` the dead unverifiable deny branch. A
+#: home/root wipe reached THROUGH an xargs pipeline is left to main's general scan +
+#: whole-text deny-net regex, exactly as main does. The rm-floor's own-argv home/
+#: root flag/spelling classification, the quote-aware boundary helper, the frame/
+#: token budgets and the executed ``bash -c`` payload classification are unchanged.
+#:
+#: Raised slightly for the heredoc quoted-delimiter capture fix: the opener regex
+#: now captures a QUOTED delimiter with interior spaces (``<<'END OF TEXT'``) so the
+#: body-strip ends at the real terminator instead of truncating to ``END`` and
+#: dropping a trailing ``rm -fr ~`` (GPT 6.1 security-class home-wipe bypass).
+#:
+#: Raised again for the heredoc CROSS-LINE quote-state fix: the body-stripper now
+#: computes quote / command-substitution masks over the WHOLE source once (indexed
+#: by absolute offset) and folds backslash line-continuations first, so a ``<<EOF``
+#: inside a multi-line quoted string is seen as quoted and opens no heredoc -- the
+#: per-line masks had reset state each line, taking it as an unterminated heredoc
+#: and discarding a trailing ``rm -fr "$HOME"`` (GPT 6.1 security-class bypass). The
+#: stale ``xargs stdin`` protection claim in ``denied_rules.py`` was also removed.
+#:
+#: Raised for the token-budget-exhaustion fix: past the frame-descent cap, every
+#: remaining frame now also gets a CHEAP, bounded, quote-normalized exact root/home
+#: scan (``_rm_frame_overflow_targets``) instead of being silently skipped once the
+#: shared 4096-token budget is spent -- a padded line of many substitutions
+#: exhausted the budget before an obfuscated ``r''m -fr ~`` frame and the split
+#: spelling slipped the whole-text regex (GPT 6.1 security-class, UNBOUNDED). The
+#: expensive full classification stays budget-gated, so total work stays bounded.
+#:
+#: Net change this round: all reviewer/round citations were stripped from
+#: ``rm_floor.py`` comments (present-tense behavioral descriptions only), and three
+#: fixes were added -- a bounded ONE-LEVEL descent into the trailing unbalanced
+#: ``$(`` so a wipe hidden after a long opener run is caught on the heavy linear
+#: path (the opener cap is lowered to 48, which stays fail-closed because of this
+#: descent, closing a ~24 s frame-walk stall past the 25 s watchdog); an unterminated
+#: UNQUOTED heredoc opener now keeps the remaining lines (a ``<<`` bash never reads
+#: as a heredoc keeps a trailing wipe for classification); and the heavy innermost-body
+#: scan also runs the de-quoted exact scan so a split spelling is caught there too.
+#:
+#: LOWERED when ``shell_normalizer.py`` was reverted to byte-identical with main
+#: (all four PR hardenings removed, per the invariant that this module stays
+#: unchanged): the quote-reset in ``_matching_close_paren`` had regressed the
+#: git-publish floor on a quoted ``"$(command -v git)"`` program word, and the home
+#: var-boundary / peel-cap belong in the floor, not the shared module. The behaviors
+#: still needed are re-homed in ``rm_floor.py``: a ``$HOME``-prefixed DIFFERENT
+#: variable (``$HOME_BAK``) stays unresolved rather than collapsing to root via
+#: ``..``; ``flock FILE -c 'cmd'`` is classified as an executed shell payload; and a
+#: run of child-glob stars (``~/**`` / ``/***``) is treated as the target itself.
+#:
+#: Raised for two more rm-floor fixes: the span scan uses a QUOTE-AWARE substitution
+#: depth delta (``_rm_substitution_depth_delta``) so a literal ``)`` inside a quoted
+#: operand (``rm -fr 'a)b' ~``) does not end the argv before a later target; and the
+#: heavy-path top-level segment loop also runs the de-quoted exact scan, so a split
+#: spelling (``r''m``) after a run of substitutions past the opener cap is caught
+#: there as it already is for substitution bodies and the unbalanced-opener tail.
+#:
+#: Raised for two more rm-floor fixes: a ``<<`` under an unclosed ``${`` parameter
+#: expansion (``echo ${v:-<<'x'}``) opens no heredoc, so the stripper does not drop
+#: a real trailing ``rm -rf "$HOME"``; and a command-string wrapper (``watch 'rm -rf
+#: "$HOME"'``) surfaces its first non-flag operand as an executed shell payload. An
+#: ``identity-home-path`` scan literal in a comment was also replaced with a
+#: placeholder.
+#: Raised for the single quote-aware boundary consolidation: the DECODED-view
+#: classification kept operands de-quoted and ended an ``rm`` span at a non-quote-
+#: aware ``_ends_argv``, so a split spelling whose operand is a literal filename
+#: holding ``;``/``|`` (``r''m -fr 'a;b' ~`` / ``r''m -fr "a;b" $HOME``) lost the
+#: trailing home target. The decoded view now decodes only the program and flag
+#: WORDS (operands kept literal via ``_rm_decoded_argv_preserving_operands``) and
+#: every boundary test routes through the one quote-aware ``_rm_token_ends_argv``;
+#: the non-live-home suppression masks per TOKEN so a double-quoted operand does not
+#: re-expose its separator. ``_rm_frame_overflow_targets`` also takes the quote-
+#: preserving source at every call site.
+#: Raised for one more rm-floor fix: a redirection ``&`` (``2>&1``, ``1>&2``,
+#: ``&>/dev/null``, ``>&2``) duplicates a file descriptor and does not end the
+#: command, but the boundary scan split on it as a backgrounding ``&``, so
+#: ``rm -fr 2>&1 ~`` lost the trailing home operand. The two boundary helpers were
+#: MERGED into the single ``_rm_unescaped_boundary`` (the former
+#: ``_rm_boundary_outside_quotes`` is gone; its one caller passes
+#: ``treat_subshell_closer=False``), and that one scan exempts a redirection ``&``
+#: via ``_rm_amp_is_redirection``; a real backgrounding ``&`` and the ``&&`` operator
+#: still end the command.
+#: Raised for two rm-floor over-refusal fixes (GPT 6.1, security-class false
+#: denials): a backslash-escaped ``\$HOME`` is now treated as a literal (the mask
+#: drops the escaped ``$`` as it drops ``\~``) and the literal-home test runs on an
+#: operand's dot-normalized de-quoted form too, so a co-present live ``$HOME`` no
+#: longer activates a quoted-literal ``"~"/./`` target; and a ``rm`` passed as a
+#: positional argument of a shell ``-c`` invocation (``sh -c '<string>' _ rm -fr
+#: /``) is skipped by the outer executable scan via a one-pass
+#: ``_rm_shell_c_positional_arg_mask`` -- it is data, classified only inside the
+#: command string. A real executed ``-c`` payload wipe still denies. The mask is
+#: built once per argv (and only when an O(n) ``argv_has_shell_c`` precheck finds a
+#: shell ``-c``), so a bare-``rm`` flood pays nothing and a shell-``-c`` flood pays
+#: one linear pass instead of a per-token left-scan,
+#: which would be O(n**2) and timed out the fail-open regression test on CI.
+#:
+#: Raised for one more rm-floor over-refusal fix (GPT 6.1, security-class false
+#: denial): program ownership was computed by the quote-UNAWARE shared
+#: ``_argv_programs``, so a quoted separator in a PRINTED argument (``echo
+#: 'cleanup; then' sudo rm -fr /``) was read as a command boundary and the
+#: following ``sudo`` became ``rm``'s parent, refusing a pure print. A quote-aware
+#: ``_rm_argv_programs`` (routing boundaries through ``_rm_token_ends_argv``) now
+#: owns the four program-ownership scans; a real ``sudo rm`` and an unquoted
+#: separator still deny.
+#:
+#: Raised for the GPT 6.1 F1 over-refusal fix (quoted-metachar literal): a QUOTED
+#: brace/glob (``rm -fr '/{,tmp}'`` / ``'/*'``) is a literal filename, not an
+#: expansion, so the RAW ``strip_quotes=True`` classification now neutralizes a
+#: quoted/escaped ``{``/``}``/``*`` that is NOT a ``${...}`` parameter expansion
+#: (``_rm_neutralize_literal_metachars``). An unquoted metachar, a ``${HOME}``
+#: expansion and an escaped ``\$HOME`` are unchanged. RESIDUAL: a quoted-metachar
+#: literal inside a ``$(...)`` body may still over-refuse (the decoded view has
+#: already lost its quotes); scoped to raw operands only.
+#:
+#: Raised for three more GPT 6.1 over-refusal fixes: a grep-FAMILY ``-e`` pattern
+#: list keeps its data-consumer exemption past the sed/awk script marker
+#: (``_rm_command_disqualified``); a ``printf`` with a ``%`` format directive in a
+#: substitution operand is left unresolved rather than approximated by its first
+#: literal (``rm -fr "$(printf '%s/tmp/build-cache' /)"`` resolves to a descendant,
+#: not root); and a heredoc terminator matches the delimiter EXACTLY (leading tabs
+#: stripped only for ``<<-``), so a body line ``EOF `` stays heredoc data rather
+#: than ending it. All three keep ``shell_normalizer`` and ``argv_floor``
+#: byte-identical.
+#:
+#: Raised for three more GPT 6.1 fixes, all a scanned-view / executed-view
+#: divergence: a lowercase ``$home`` / ``home=`` is neutralized before the
+#: case-insensitive home matchers read it as ``$HOME`` (shell names are
+#: case-sensitive); a command-substitution's OUTPUT is treated as already-expanded,
+#: so a quoted ``"$(printf '~')"`` / ``"$(printf '/*')"`` is a literal filename
+#: rather than a re-expanded home/root glob; and the shell ``-c`` positional-arg
+#: check is a single-pass mask (``_rm_shell_c_positional_arg_mask``) instead of a
+#: per-token left-scan, so a ``bash -c ':'`` + thousands-of-``rm`` flood classifies
+#: in well under the 25 s watchdog. All keep ``shell_normalizer`` and ``argv_floor``
+#: byte-identical.
+#:
+#: Raised for two more GPT 6.1 scanned-view / executed-view divergences: removing a
+#: quote delimiter keeps a bare ``$name`` run from absorbing the text past the
+#: quote, so ``"$HO"ME`` reads variable ``HO`` + literal ``ME`` rather than
+#: fabricating ``$HOME`` (fixed at EVERY quote-strip site --
+#: ``_rm_strip_all_quotes``, ``_rm_has_live_home_expansion``,
+#: ``_rm_mask_non_live_home`` -- scoped to a ``$name`` run so a split program
+#: spelling like ``r''m`` still fuses); and a one-word exec wrapper's EFFECTIVE
+#: program gets the data-consumer exemption, so ``env printf … rm -fr /`` prints
+#: rather than wipes while a wrapped ``rm`` and a piped-into-shell printer still
+#: deny. All keep ``shell_normalizer`` and ``argv_floor`` byte-identical.
+#:
+#: The total also carries ``redaction._ROUTED_COMMIT_RE`` and a whitespace-elided
+#: deny view, which live on main and sum into the measured count here.
+#:
+#: It also carries two over-refusal fixes in the floor: an operand that merely
+#: NAMES ``rm`` as a ``find`` predicate value or a ``timeout``-wrapped printer's
+#: argument reads as DATA (``_rm_find_command_word_mask`` and the
+#: ``_RM_DURATION_WRAPPERS`` resolution), so a read-only search or print stays
+#: allowed; and a mandatory brace RANGE group over a home/root-rooted frame reads
+#: as a descendant cleanup, not a bare-target wipe.
+#:
+#: It further carries the split-spelling and parameter-expansion coverage: a
+#: program word fused from adjacent quotes (``r''m``) resolves through
+#: ``_rm_program_basename`` even after an assignment prefix or a one-word wrapper,
+#: a balanced ``${HOME:?word}`` stays one operand through word-splitting
+#: (``_rm_rejoin_param_expansions``) and the single boundary scan, a dispatch
+#: wrapper's printer (``sudo``/``setsid`` + ``_RM_DISPATCH_WRAPPERS``) leaves its
+#: operands as data, and the overflow / heavy fallbacks keep the quoted-literal
+#: metachar and single-quoted-substitution-body exemptions the non-overflow path
+#: has. The number is the measured package total; it last moved to seat the two
+#: GPT 6.1 fixes -- a substitution body walked in its own fresh inner-shell quote
+#: context, and the dropped escape-blind ``endswith("&")`` boundary override.
+_PACKAGE_LINE_BUDGET = 32_296
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second
