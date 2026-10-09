@@ -211,12 +211,22 @@ class TestFlushAuditQueueBeforeHardExit:
 
 class TestEveryGatewayHardExitFlushesTheAuditQueue:
     """Ratchet: the audit log only survives if EVERY hard exit in the gateway
-    process drains it. ``slack/gateway.py`` and ``slack/events.py`` are the two
-    modules that call ``os._exit`` or ``platform_compat.hard_exit`` from inside
-    the long-lived gateway process --
+    process drains it. ``slack/gateway.py``, ``slack/events.py`` and
+    ``platform_compat.py`` are the modules that call ``os._exit`` or
+    ``platform_compat.hard_exit`` from inside the long-lived gateway process --
     the other ``os._exit`` sites in the tree (``sandbox.py``,
     ``_process_group_supervisor.py``) run in forked/pre-exec children that never
     initialize a SEL singleton.
+
+    ``platform_compat.hard_exit`` itself is the shared ``os._exit`` primitive the
+    gateway's signal force-exit and the restart path both route through, each
+    after draining SEL in its OWN body. Like the gateway.log sibling's
+    ``drain_log_queue_before_hard_exit``, the primitive does not drain -- it is a
+    sync pass-through a signal handler calls and cannot be made to await -- so the
+    scan exempts it BY NAME. The exemption is the one function ``hard_exit`` in
+    ``platform_compat.py``; every other ``os._exit`` in that module (such as
+    ``exit_after_failed_restart_exec``) is still held to the contract, which is
+    exactly the gap this ratchet now closes.
 
     The check is per-function and does NOT look inside nested functions, so a
     flush in a sibling closure cannot vouch for its parent. It mirrors the
@@ -230,8 +240,14 @@ class TestEveryGatewayHardExitFlushesTheAuditQueue:
     _MODULES = (
         Path(__file__).resolve().parents[1] / "src/kiro_crew/slack/gateway.py",
         Path(__file__).resolve().parents[1] / "src/kiro_crew/slack/events.py",
+        Path(__file__).resolve().parents[1] / "src/kiro_crew/platform_compat.py",
     )
     _HELPERS = {"flush_audit_queue", "flush_audit_queue_before_hard_exit"}
+
+    #: The shared ``os._exit`` primitive, exempt by name (see the class docstring).
+    #: A ``module name -> {function names}`` map so the exemption cannot leak to a
+    #: same-named function in another scanned module.
+    _EXEMPT = {"platform_compat.py": {"hard_exit"}}
 
     @staticmethod
     def _has_inline_drain(fn):
@@ -341,13 +357,16 @@ class TestEveryGatewayHardExitFlushesTheAuditQueue:
         total = 0
         for path in self._MODULES:
             total += len(self._hard_exit_functions(ast.parse(path.read_text(encoding="utf-8"))))
-        assert total >= 3, f"expected the known hard-exit sites, found {total}"
+        assert total >= 4, f"expected the known hard-exit sites, found {total}"
 
     def test_no_hard_exit_strands_the_queued_audit_tail(self):
         violations = []
         for path in self._MODULES:
             tree = ast.parse(path.read_text(encoding="utf-8"))
+            exempt = self._EXEMPT.get(path.name, set())
             for fn, lineno in self._hard_exit_functions(tree):
+                if fn.name in exempt:
+                    continue
                 if not self._drains(fn):
                     violations.append(f"{path.name}:{lineno} in {fn.name}()")
         assert not violations, (
@@ -356,3 +375,104 @@ class TestEveryGatewayHardExitFlushesTheAuditQueue:
             "flush_audit_queue_before_hard_exit() (or call flush_audit_queue("
             "timeout=...) from a sync handler) first: " + ", ".join(violations)
         )
+
+    def test_platform_compat_restart_exec_exit_drains(self):
+        """``platform_compat.py`` is scanned, so ``exit_after_failed_restart_exec``
+        -- a gateway hard exit -- is held to the drain contract and must satisfy
+        it."""
+        path = Path(__file__).resolve().parents[1] / "src/kiro_crew/platform_compat.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        by_name = {fn.name: fn for fn, _ in self._hard_exit_functions(tree)}
+        assert (
+            "exit_after_failed_restart_exec" in by_name
+        ), "the restart-exec-failure hard exit must be scanned"
+        assert self._drains(by_name["exit_after_failed_restart_exec"])
+
+
+class TestSelFlushPrecedesGatewayLogDrain:
+    """On every hard-exit path that drains both sinks, the SEL flush must come
+    BEFORE the gateway.log drain -- the order ``slack/events.py`` already uses.
+
+    The gateway.log drain stops the QueueListener. A SEL write failure logs its
+    ``"SEL dropped %d events after write failures"`` line through that same
+    gateway.log queue, so draining gateway.log FIRST sends that line into a dead
+    queue -- a detached gateway has no console handler and ``os._exit`` throws the
+    record away, leaving the audit loss with no trace. Flushing SEL first keeps
+    the listener alive long enough to record a drain failure.
+
+    Matched structurally in source order rather than by running the exits (a real
+    ``os._exit`` would end the test worker): for each named function, the first
+    statement line that references a SEL drain must precede the first that
+    references a gateway.log drain.
+    """
+
+    _SEL_DRAINS = {"flush_audit_queue", "flush_audit_queue_before_hard_exit", "sel"}
+    _LOG_DRAINS = {"_stop_log_queue_listener", "drain_log_queue_before_hard_exit"}
+
+    # module path -> function names that drain BOTH sinks before a hard exit.
+    # ``_handle_restart`` drains SEL with the inline ``sel().flush`` spelling,
+    # which the ``sel`` marker in ``_SEL_DRAINS`` catches. The force-exit drains
+    # live in two closures: ``_force_exit_sync`` (closed-loop fallback) and
+    # ``_force_exit_off_loop`` (the normal loop-running path, off the loop).
+    _PATHS = {
+        "src/kiro_crew/slack/gateway.py": {
+            "_force_exit_sync",
+            "_force_exit_off_loop",
+            "_shutdown_and_exit",
+        },
+        "src/kiro_crew/platform_compat.py": {"exit_after_failed_restart_exec"},
+        "src/kiro_crew/slack/events.py": {"_handle_restart"},
+    }
+
+    @staticmethod
+    def _first_line_referencing(fn, names):
+        """Lowest source line within ``fn``'s own body that uses any identifier
+        in ``names`` (skipping nested function bodies). None if absent."""
+        hits: list[int] = []
+
+        class _Walk(ast.NodeVisitor):
+            def visit_FunctionDef(self, node):  # nested def: not fn's own body
+                if node is fn:
+                    self.generic_visit(node)
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_Name(self, node):
+                if node.id in names:
+                    hits.append(node.lineno)
+
+            def visit_Attribute(self, node):
+                if node.attr in names:
+                    hits.append(node.lineno)
+                self.generic_visit(node)
+
+        _Walk().visit(fn)
+        return min(hits) if hits else None
+
+    def _functions_by_name(self, tree):
+        out: dict[str, ast.AST] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out[node.name] = node
+        return out
+
+    def test_sel_drain_comes_before_the_gateway_log_drain_on_every_both_sink_path(self):
+        root = Path(__file__).resolve().parents[1]
+        checked = 0
+        for rel, want in self._PATHS.items():
+            tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+            funcs = self._functions_by_name(tree)
+            for name in want:
+                assert name in funcs, f"{rel}: expected hard-exit function {name}() not found"
+                fn = funcs[name]
+                sel_line = self._first_line_referencing(fn, self._SEL_DRAINS)
+                log_line = self._first_line_referencing(fn, self._LOG_DRAINS)
+                assert sel_line is not None, f"{rel}:{name} has no SEL drain"
+                assert log_line is not None, f"{rel}:{name} has no gateway.log drain"
+                assert sel_line < log_line, (
+                    f"{rel}:{name} drains gateway.log (line {log_line}) before SEL "
+                    f"(line {sel_line}); flush SEL first so a drain-failure log line "
+                    f"still reaches a live gateway.log listener"
+                )
+                checked += 1
+        assert checked >= 4, f"expected to check every both-sink path, checked {checked}"

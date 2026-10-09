@@ -13763,39 +13763,75 @@ class GatewayOrchestrator:
             platform_compat.cancel_wheel_applies_in_flight("shutdown")
             if _shutting_down:
                 print("\n👻 Force exit!")
-                # Synchronous by necessity: a signal handler cannot await.
-                # The process calls os._exit immediately below, so loop latency
-                # does not matter on this path.
-                #
                 # ``narrow_with_leaders=False`` so this handler does exactly the
                 # work it did before the recycled-pid change: killing leftover
                 # processes is what this path is for, and a handler that reaches
                 # for extra work before its os._exit is a handler that may not
                 # get there.
                 cleanup_orphaned_sessions(narrow_with_leaders=False)
-                # Same reason as the log queue below: os._exit skips atexit, so the
-                # member event log's own drain hook never runs. Synchronous because
-                # a signal handler cannot await, and bounded inside the module for
-                # the same reason the log-queue drain is bounded here -- a wedged
-                # disk must delay this exit, never hold it.
-                try:
-                    from kiro_crew import eventlog_hooks
 
-                    eventlog_hooks.drain_for_shutdown()
-                except Exception:
-                    pass  # force exit must never be blocked by bookkeeping
-                # os._exit skips atexit, so the log queue's drain hook never
-                # runs — flush the queued gateway.log tail here, bounded so a
-                # wedged disk cannot hang the force exit.
-                try:
-                    from kiro_crew.cli import _stop_log_queue_listener
+                def _force_exit_sync() -> None:
+                    """The inline, on-handler drains then exit, for the closed-loop
+                    fallback.
 
-                    _stop_log_queue_listener(timeout=2.0)
-                except Exception:
-                    pass  # force exit must never be blocked by logging
-                # Hard exits skip the SEL writer's atexit drain.
-                flush_audit_queue(timeout=2.0)
-                platform_compat.hard_exit(0)
+                    ``_sigint_fallback`` calls ``_on_signal`` directly when the loop
+                    is already closed, so there is no loop to offload onto and no
+                    loop latency to protect -- synchronous bounded drains are the
+                    only option, and are correct here. Each is bounded inside its
+                    own module so a wedged disk delays this exit, never holds it.
+                    """
+                    try:
+                        from kiro_crew import eventlog_hooks
+
+                        eventlog_hooks.drain_for_shutdown()
+                    except Exception:
+                        pass  # force exit must never be blocked by bookkeeping
+                    # SEL BEFORE the gateway.log tail: a SEL write failure logs its
+                    # "dropped N events" line, and stopping the gateway.log listener
+                    # first would send it into a dead queue, so the loss would leave
+                    # no trace.
+                    flush_audit_queue(timeout=2.0)
+                    try:
+                        from kiro_crew.cli import _stop_log_queue_listener
+
+                        _stop_log_queue_listener(timeout=2.0)
+                    except Exception:
+                        pass  # force exit must never be blocked by logging
+                    platform_compat.hard_exit(0)
+
+                async def _force_exit_off_loop() -> None:
+                    """The force-exit drains, run OFF the event loop then exit.
+
+                    ``SecurityEventLog.flush`` waits on a condition variable;
+                    running it inline in this loop-registered handler would freeze
+                    every remaining loop task for up to its deadline (the
+                    no-blocking-call-on-event-loop rule). The member event log and
+                    gateway.log drains block the same way. So the bounded drains run
+                    on a worker thread -- SEL first, gateway.log second, the order
+                    ``slack/events.py`` uses so a SEL-failure log line still reaches
+                    a live listener -- and ``hard_exit`` ends the process after. The
+                    event-log drain keeps its own in-module bound off-loop too.
+                    """
+                    try:
+                        from kiro_crew import eventlog_hooks
+
+                        await asyncio.to_thread(eventlog_hooks.drain_for_shutdown)
+                    except Exception:
+                        pass  # force exit must never be blocked by bookkeeping
+                    from kiro_crew.cli import drain_log_queue_before_hard_exit
+
+                    await flush_audit_queue_before_hard_exit(timeout=2.0)
+                    await drain_log_queue_before_hard_exit(timeout=2.0)
+                    platform_compat.hard_exit(0)
+
+                if loop.is_running():
+                    # Normal second-signal path: the loop is live (this handler IS a
+                    # loop callback), so schedule the off-loop drains and return.
+                    loop.create_task(_force_exit_off_loop())
+                    return
+                # Closed-loop fallback (see _sigint_fallback): no loop to offload
+                # onto, so drain synchronously and exit here.
+                _force_exit_sync()
             _shutting_down = True
             shutdown_event.set()
 
@@ -13955,10 +13991,15 @@ class GatewayOrchestrator:
         # logged a few lines up, the one record a stuck-shutdown post-mortem
         # actually needs. Bounded and off-loop so a wedged disk cannot delay
         # the exit (see drain_log_queue_before_hard_exit).
+        #
+        # Flush SEL BEFORE the gateway.log tail (the order slack/events.py uses):
+        # draining gateway.log first stops its listener, and a SEL write failure
+        # then logs its "dropped N events" line into a dead queue, so the audit
+        # loss would leave no trace.
         from kiro_crew.cli import drain_log_queue_before_hard_exit
 
-        await drain_log_queue_before_hard_exit()
         await flush_audit_queue_before_hard_exit()
+        await drain_log_queue_before_hard_exit()
         os._exit(exit_code)
 
     # ── per-channel hoists ───────────────────────────────────────────────
