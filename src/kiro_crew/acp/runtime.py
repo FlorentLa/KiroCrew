@@ -5959,6 +5959,7 @@ class AcpRuntime:
         budget: float,
         payload_snapshot: Any,
         wire_registered: bool,
+        payload_generation: int | None = None,
     ) -> None:
         """Send ``session/set_mode`` for *mode_agent* inside the derived-spec bracket.
 
@@ -6003,6 +6004,7 @@ class AcpRuntime:
             DerivedSpecStale,
             require_fresh_derived_spec,
             require_unchanged_derived_spec,
+            stale_payload_generation_reason,
             team_lead_start_refusal,
         )
 
@@ -6239,6 +6241,19 @@ class AcpRuntime:
         except DerivedSpecStale as exc:
             await self.terminate_session(session_id)
             raise AcpRuntimeError(str(exc)) from exc
+        # The owned-stem companion to the derived-spec check above: the team lead
+        # mirrors no default, so its consume window is bracketed by the governance
+        # generation its payload was built under rather than a DerivedSpecSnapshot. A
+        # ceiling refresh landing after the payload was built but before set_mode
+        # activated it leaves the registered definition carrying grants the refresh
+        # removed, which this catches and ends the session for. ``None`` for every
+        # other agent (the guard is not applicable). Synchronous: it only compares two
+        # ints behind a lock, so it needs no thread hop (unlike the file-reading check
+        # above it).
+        stale_payload = stale_payload_generation_reason(payload_generation)
+        if stale_payload:
+            await self.terminate_session(session_id)
+            raise AcpRuntimeError(stale_payload)
 
     async def _handshake_client_capabilities(self) -> dict[str, Any]:
         """The ``clientCapabilities`` this spawn sends, with the settings channel filled.
@@ -7029,6 +7044,10 @@ class AcpRuntime:
         # The generation the wire payload was built from, or None when this host takes its
         # agent at spawn time. Consumed by the activation bracket below.
         payload_snapshot = kas_extras.derived_spec_snapshot
+        # The governance generation the team-lead payload's grants were filtered under,
+        # or None for every other agent. Rechecked at admission (below) and at activation
+        # so a ceiling refresh during the admission wait cannot ship stale grants.
+        payload_generation = kas_extras.payload_governance_generation
         # Crew's managed servers travel in the session-level array, the one
         # declaration site the captured 2.18.0 release honours over a same-named
         # global/workspace entry and 2.20.0 reports as the client's own (see
@@ -7127,6 +7146,24 @@ class AcpRuntime:
                 )
                 if start_refusal:
                     raise AcpRuntimeError(start_refusal)
+                # The team-lead payload was built BEFORE this gate's queue wait, so a
+                # ceiling refresh landing during the wait leaves it carrying grants the
+                # refresh removed. ``team_lead_start_refusal`` re-reads the DISK spec,
+                # which the refresh rewrote clean, so it cannot see this; the generation
+                # the payload was built under can. Rechecked here, before ``session/new``
+                # registers the definition, so a stale payload is refused rather than
+                # shipped. ``None`` for every non-team-lead agent -- one int comparison.
+                #
+                # Called SYNCHRONOUSLY, not through ``to_thread``: it only compares two
+                # ints behind a lock (no file read), and a thread hop here would add a
+                # scheduling point between the gate's queue edges that
+                # ``test_session_start_gate`` measures -- the same reason the refusal
+                # above is the one awaited call on this path.
+                from kiro_crew.agent import stale_payload_generation_reason
+
+                stale_payload = stale_payload_generation_reason(payload_generation)
+                if stale_payload:
+                    raise AcpRuntimeError(stale_payload)
             except BaseException:
                 permit.release()
                 raise
@@ -7177,6 +7214,7 @@ class AcpRuntime:
                 session_work_dir=session_work_dir,
                 projected_sources=projected_sources,
                 payload_snapshot=payload_snapshot,
+                payload_generation=payload_generation,
                 late_adopter=late_adopter,
                 memory_mode=memory_mode,
                 session_key=session_key,
@@ -7210,6 +7248,7 @@ class AcpRuntime:
             session_work_dir=session_work_dir,
             projected_sources=projected_sources,
             payload_snapshot=payload_snapshot,
+            payload_generation=payload_generation,
             session_key=session_key,
             member_dispatch_mounted=member_mounted,
         )
@@ -7233,6 +7272,7 @@ class AcpRuntime:
         projected_sources: dict[str, str],
         payload_snapshot: Any,
         late_adopter: "Callable[[AcpSessionHandle], Awaitable[bool]] | None",
+        payload_generation: int | None = None,
         memory_mode: str = "persistent",
         session_key: str = "",
         member_dispatch_mounted: bool = False,
@@ -7317,6 +7357,7 @@ class AcpRuntime:
                     session_work_dir=session_work_dir,
                     projected_sources=projected_sources,
                     payload_snapshot=payload_snapshot,
+                    payload_generation=payload_generation,
                     session_key=session_key,
                     member_dispatch_mounted=member_dispatch_mounted,
                 )
@@ -7414,6 +7455,7 @@ class AcpRuntime:
         session_work_dir: str | Path,
         projected_sources: dict[str, str],
         payload_snapshot: Any,
+        payload_generation: int | None = None,
         memory_mode: str = "persistent",
         session_key: str = "",
         member_dispatch_mounted: bool = False,
@@ -7551,6 +7593,7 @@ class AcpRuntime:
                 budget=budget,
                 payload_snapshot=payload_snapshot,
                 wire_registered=kas_agents is not None,
+                payload_generation=payload_generation,
             )
             handle.active_agent = mode_agent
             # Whether set_mode actually SWITCHED modes: the servers that
@@ -7965,6 +8008,7 @@ class AcpRuntime:
         # compares against it rather than re-reading the file.
         kas_agents = None
         payload_snapshot = None
+        payload_generation: int | None = None
         if self._acp_backend == ACP_BACKEND_KAS:
             kas_extras = await self._kas_custom_agents(
                 active_agent,
@@ -7975,6 +8019,9 @@ class AcpRuntime:
             )
             kas_agents = kas_extras.custom_agents
             payload_snapshot = kas_extras.derived_spec_snapshot
+            # Same owned-stem generation guard as create_session: a resume rebuilds the
+            # team-lead payload too, and the activation bracket rechecks this generation.
+            payload_generation = kas_extras.payload_governance_generation
             # Same carriage as create_session: a resumed session re-initializes
             # its servers, and the managed ones must win the same-name contest
             # on load exactly as they did on new.
@@ -8114,6 +8161,7 @@ class AcpRuntime:
                 budget=budget,
                 payload_snapshot=payload_snapshot,
                 wire_registered=kas_agents is not None,
+                payload_generation=payload_generation,
             )
             handle.active_agent = mode_agent
             # See create_session: after a real mode switch, registration frames

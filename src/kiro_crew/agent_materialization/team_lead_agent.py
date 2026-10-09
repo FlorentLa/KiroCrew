@@ -705,6 +705,78 @@ def team_lead_start_refusal(
     return None
 
 
+def is_team_lead_agent(agent: str | None) -> bool:
+    """Is *agent* the owned team-lead stem? Then its wire payload needs the
+    governance-generation guard below, because it mirrors no default spec and so
+    carries no :class:`DerivedSpecSnapshot` to bracket its consume window."""
+    return bool(agent) and agent == _TEAM_LEAD_AGENT_NAME
+
+
+def payload_governance_generation(agent: str | None) -> int | None:
+    """The governance generation to stamp on *agent*'s wire payload, or ``None``.
+
+    Captured when the KAS payload is BUILT, so the generation names the governance
+    ANSWER the payload's grants were filtered under -- the ceiling AND the profile
+    layer, because both decide which tools the team-lead spec may auto-approve
+    (``platform.governance.may_skip_gate_now`` withholds a ref that
+    ``any_configured_profile_governs``). The combined token
+    :func:`kiro_crew.platform.governance_profiles.governance_answer_generation` is what
+    the rest of the codebase compares for "has a governance answer changed", so a
+    PROFILE edit during the admission wait is caught here, not only a ceiling install.
+
+    Only the team-lead stem gets a value: every other wire-registered agent mirrors a
+    default and is bracketed by
+    :func:`require_fresh_derived_spec`/:func:`require_unchanged_derived_spec` instead, so
+    answering a generation for it would be a second, redundant guard over the same load.
+
+    Comparison-only: the consumer tests it for equality with the generation live at
+    consume time and never reads its magnitude. A pure in-process read (two locked int
+    reads, no filesystem), so it is safe on the event loop.
+    """
+    if not is_team_lead_agent(agent):
+        return None
+    from kiro_crew.platform.governance_profiles import governance_answer_generation
+
+    return governance_answer_generation()
+
+
+def stale_payload_generation_reason(generation: int | None) -> str | None:
+    """Why a team-lead payload built under *generation* must not be shipped, or ``None``.
+
+    Returns a REASON string rather than raising, for the same reason
+    :func:`team_lead_start_refusal` does: this owner module hands the runtime a verdict
+    and the runtime raises its own transport error. ``None`` admits the start.
+
+    The team-lead payload is assembled from the on-disk spec BEFORE the admission gate's
+    unbounded queue wait. A governance change landing during that wait -- a tightened
+    CEILING installed, or a PROFILE edit published -- rebuilds or re-filters what the
+    spec may auto-approve, but the already-built payload still carries the old grants and
+    is what ``session/new`` registers. The disk re-read at admission cannot catch this:
+    the file is clean, only the in-memory payload is stale. So the governance ANSWER the
+    payload was built under (ceiling ∩ profile, via
+    :func:`~kiro_crew.platform.governance_profiles.governance_answer_generation`) is
+    rechecked here, and a mismatch ends the start rather than shipping an auto-approval a
+    live revocation removed. The start is retried fresh against the current answer.
+
+    ``None`` short-circuits, because :func:`payload_governance_generation` answers
+    ``None`` for every agent that is not the owned team-lead stem -- the guard is not
+    applicable rather than satisfied.
+    """
+    if generation is None:
+        return None
+    from kiro_crew.platform.governance_profiles import governance_answer_generation
+
+    if governance_answer_generation() == generation:
+        return None
+    return (
+        f"the governance ceiling or a profile changed while the {_TEAM_LEAD_AGENT_FILENAME} "
+        "start was waiting to be admitted, so the agent definition this session would "
+        "register was built under a stale governance answer and may carry auto-approvals "
+        "the current answer removes; refusing the start so it is rebuilt against the live "
+        "governance answer"
+    )
+
+
 def _our_file_is_what_would_run(agent: str) -> bool:
     """Would a start of *agent* execute OUR file, whatever name it asks for?
 

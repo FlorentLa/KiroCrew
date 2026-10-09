@@ -1119,6 +1119,81 @@ class TestAHandEditedSpecIsRefusedRatherThanRewritten:
             "kirocrew-team-lead", agent_state.spec_digest(after), strict=True
         ), "the digest was renewed for bytes this installer never wrote"
 
+    def test_a_model_reset_aborts_when_ownership_cannot_be_read(self, tmp_path, monkeypatch):
+        """A transient read of the ownership record must ABORT the reset, not fall through
+        as "not confirmed". The confirmed-ours spec at this stem has no heal path: if a
+        failed read were degraded to False, the reset would take the unconfirmed-write
+        branch, rewrite the bytes WITHOUT renewing the recorded digest, and every later
+        start would then refuse the file forever -- for a user action, with storage that
+        had only hiccuped. The fail-safe answer is to do nothing and let the next attempt,
+        once the read recovers, succeed."""
+        _stub_environment(tmp_path, monkeypatch)
+        base = agent.build_agent_config()
+        base["model"] = "my-pinned-model"
+        monkeypatch.setattr(agent, "build_agent_config", lambda: json.loads(json.dumps(base)))
+        target = tmp_path / TEAM_LEAD_AGENT_FILENAME
+        assert agent._install_team_lead_agent() is agent.InstallOutcome.WRITTEN
+        before_bytes = target.read_text(encoding="utf-8")
+        assert json.loads(before_bytes).get("model"), (
+            "the fixture wrote no model pin, so a reset would strip nothing and this "
+            "test could not be about the reset"
+        )
+        assert agent.spec_start_refusal("kirocrew-team-lead") is None
+
+        # Make the STRICT ownership-sidecar read raise the way a transient I/O error
+        # does, exercising the real predicate path (``_attribution_reason`` ->
+        # ``_unconfirmed_digest_reason`` -> ``managed_digest_matches(strict=True)``),
+        # not a stub of the predicate. Scoped to the ownership-digest read so the reset's
+        # other strict reads (capability intent, spec load) still work -- the point is a
+        # transient failure of ONLY the ownership confirmation.
+        real_matches = agent_state.managed_digest_matches
+        strict_reads: list[str] = []
+
+        def _flaky_matches(name, candidate, *, strict=False):
+            if strict:
+                strict_reads.append(name)
+                raise OSError("transient EIO reading the ownership sidecar")
+            return real_matches(name, candidate, strict=strict)
+
+        monkeypatch.setattr(agent_state, "managed_digest_matches", _flaky_matches)
+
+        # ``FileNotFoundError`` is the class the reset CONVERTS this to, not the class the
+        # injection raises: ``reset_agent_model`` catches
+        # ``(_SpecUnusable, OSError, ValueError)`` around ``_confirms_managed_pre_write``
+        # and re-raises as ``FileNotFoundError`` (``agent.py``), which is the one failure
+        # class its own contract and its callers already handle.
+        #
+        # MATCHED on the message, and that is not decoration: three other paths in the
+        # same function raise the same class -- no spec at the name, an unreadable spec,
+        # a spec that is not a JSON object -- so a bare ``raises`` block is satisfied by
+        # an abort that happened BEFORE the ownership read, and every assertion below
+        # then holds because nothing ran. The read is also asserted to have FIRED, so
+        # neither half can go vacuous without failing.
+        with pytest.raises(FileNotFoundError, match="could not read ownership record"):
+            agent.reset_agent_model("kirocrew-team-lead")
+        assert strict_reads == ["kirocrew-team-lead"], (
+            "the injected ownership read never fired, so the abort came from somewhere "
+            f"else in the reset and this test proves nothing: {strict_reads}"
+        )
+
+        # The spec was NOT mutated: the model pin and every byte survive, so when the
+        # read recovers the agent is still its confirmed managed write.
+        monkeypatch.setattr(agent_state, "managed_digest_matches", real_matches)
+        assert (
+            target.read_text(encoding="utf-8") == before_bytes
+        ), "a failed ownership read rewrote the spec; the reset must abort before mutation"
+        assert (
+            agent.spec_start_refusal("kirocrew-team-lead") is None
+        ), "the spec was left unconfirmable by a transient read failure"
+        assert agent_state.managed_digest_matches(
+            "kirocrew-team-lead", agent_state.spec_digest(json.loads(before_bytes)), strict=True
+        )
+        # And once the read recovers, the ordinary reset still works.
+        path, previous = agent.reset_agent_model("kirocrew-team-lead")
+        assert path == target and previous
+        assert not json.loads(target.read_text(encoding="utf-8")).get("model")
+        assert agent.spec_start_refusal("kirocrew-team-lead") is None
+
     def test_a_project_shadow_refuses_the_start_and_names_the_project_file(
         self, tmp_path, monkeypatch
     ):
@@ -2971,3 +3046,83 @@ class TestTeamLeadSkillReusesRatherThanCopies:
         for banned in ("on a timer", "re-check in", "poll"):
             assert banned not in skill, banned
         assert "goal-conductor" in skill
+
+
+class TestTeamLeadPayloadGovernanceGenerationGuard:
+    """A team-lead KAS payload is built from the on-disk spec BEFORE the admission
+    gate's unbounded queue wait. A governance refresh during that wait rebuilds the disk
+    spec (stripping any grant the tightened ceiling removes), but the already-built
+    payload still carries the old grants and is what ``session/new`` registers. The
+    disk-reading admission check cannot see this; the generation the payload was built
+    under can. These pin that guard.
+
+    The worker mirror has its own ``DerivedSpecSnapshot`` bracket, so the generation
+    guard is deliberately team-lead-only -- answering a generation for any other agent
+    would be a second guard over the same consume window.
+    """
+
+    def test_only_the_team_lead_stem_gets_a_payload_generation(self, monkeypatch):
+        """``None`` for every other agent means the recheck is NOT APPLICABLE rather
+        than satisfied -- the worker and the default both mirror a spec and are
+        bracketed by the derived-spec snapshot instead."""
+        monkeypatch.setattr(
+            "kiro_crew.platform.governance_profiles.governance_answer_generation",
+            lambda: 7,
+            raising=False,
+        )
+        assert agent.payload_governance_generation("kirocrew-team-lead") == 7
+        assert agent.payload_governance_generation("kirocrew-worker") is None
+        assert agent.payload_governance_generation("kirocrew") is None
+        assert agent.payload_governance_generation(None) is None
+        assert agent.is_team_lead_agent("kirocrew-team-lead") is True
+        assert agent.is_team_lead_agent("kirocrew-worker") is False
+
+    def test_an_unchanged_generation_admits_the_start(self, monkeypatch):
+        """The payload was built under the ceiling live right now, so the recheck finds
+        no drift and the start proceeds (reason is ``None``)."""
+        gen = {"value": 4}
+        monkeypatch.setattr(
+            "kiro_crew.platform.governance_profiles.governance_answer_generation",
+            lambda: gen["value"],
+            raising=False,
+        )
+        built_under = agent.payload_governance_generation("kirocrew-team-lead")
+        # No refresh landed: the recheck must admit (None).
+        assert agent.stale_payload_generation_reason(built_under) is None
+
+    def test_a_generation_bump_during_the_wait_refuses_the_start(self, monkeypatch):
+        """THE finding. A governance change -- a ceiling install OR a profile edit --
+        landing while the start waited in the admission queue advances the COMBINED
+        governance-answer generation; the payload built under the old one must be refused
+        rather than shipped, because it may carry an auto-approval the change removed. The
+        guard reads ``governance_answer_generation`` (ceiling + profile), not the ceiling
+        counter alone, so a profile-only edit is caught too."""
+        gen = {"value": 4}
+        monkeypatch.setattr(
+            "kiro_crew.platform.governance_profiles.governance_answer_generation",
+            lambda: gen["value"],
+            raising=False,
+        )
+        built_under = agent.payload_governance_generation("kirocrew-team-lead")
+        # A governance change (ceiling or profile) advances the combined token while the
+        # start is queued.
+        gen["value"] = 5
+        reason = agent.stale_payload_generation_reason(built_under)
+        assert reason and "waiting to be admitted" in reason and "governance answer" in reason
+
+    def test_a_none_generation_short_circuits(self, monkeypatch):
+        """A non-team-lead payload carries ``None``; the recheck is a no-op and must
+        never read the live generation or refuse."""
+        calls: list[int] = []
+
+        def _tripwire() -> int:
+            calls.append(1)
+            return 0
+
+        monkeypatch.setattr(
+            "kiro_crew.platform.governance_profiles.governance_answer_generation",
+            _tripwire,
+            raising=False,
+        )
+        assert agent.stale_payload_generation_reason(None) is None
+        assert calls == [], "the None short-circuit still read the live generation"
