@@ -246,7 +246,7 @@ import { mcpAppTabTitle } from '../lib/mcpAppSrcdoc'
 import { countCompletedTurns } from '../lib/completedTurns'
 import { pinIsWithheld } from '../lib/model'
 import { slotApprovalMode } from '../utils/slotApprovalMode'
-import { isComposerSendHeld, takeComposerArrivals, useComposerArrivals, useComposerSendHeld } from '../utils/composerSendHolds'
+import { handOverComposerUploads, isComposerSendHeld, landComposerAttachments, takeComposerArrivals, useComposerArrivals, useComposerSendHeld } from '../utils/composerSendHolds'
 import FollowUpCard from '../components/FollowUpCard'
 import { useMoveSlotToFolder } from '../hooks/useMoveSlotToFolder'
 import PendingQuestionCard from '../components/PendingQuestionCard'
@@ -5415,17 +5415,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // undrained in its arrivals once the old slot left the screen -- so move it
     // across too, otherwise it is deleted with the old slot.
     recordSlotSuccession(activeSlot, next)
+    handOverComposerUploads(activeSlot, next)
     const late = [...(fileDrafts.current[activeSlot] ?? []), ...takeComposerArrivals(activeSlot)]
       .filter((p, i, all) => !carriedFiles.includes(p) && all.indexOf(p) === i)
-    if (late.length) {
-      if (boundStore.getState().chat.activeSlot === next) {
-        setPendingFiles(prev => [...prev, ...late.filter(p => !prev.includes(p))])
-      } else {
-        const cur = fileDrafts.current[next] ?? []
-        setFileDraft(fileDrafts.current, next, [...cur, ...late.filter(p => !cur.includes(p))])
-        saveDrafts()
-      }
-    }
+    // Through the arrival registry, which persists until a composer showing
+    // `next` drains it -- this page may have unmounted while the switch loaded.
+    landComposerAttachments(next, late)
     try { await dispatch(deleteSlot(activeSlot)).unwrap() } catch (error) {
       forgetSlotSuccession(activeSlot)
       showActionError(errMessage(error) || i18nT('pages.chatPage.unknown_error'))
