@@ -6708,7 +6708,12 @@ class AcpRuntime:
 
     async def _unpooled_control_planes(
         self, entries: list[dict[str, Any]], agent: str | None, work_dir: str | Path
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], frozenset[tuple[str, str]]]:
+        # Returns the composed array AND the ``(server, tool)`` deny pairs the mount
+        # chose to CARRY rather than withhold: a ``disabledTools`` toggle on a
+        # control-plane server mounts the element and rides the session's per-call
+        # gate, so the caller must feed ``carried`` to ``handle.spec_denied_tools`` or
+        # the toggled tool would run. The element expresses no restriction on its own.
         # A shared Kiro process has no session-valued environment. Its native
         # managed servers need per-element identity even with the broker off.
         if self.acp_backend == ACP_BACKEND_KIRO:
@@ -6728,6 +6733,23 @@ class AcpRuntime:
                 **projection_kwargs,
             )
             name = agent or self._agent
+            if (
+                projection is not None
+                and name in projection.search_agents
+                and ("kirocrew-core", "skill_search") in mount.carried
+            ):
+                # A settings file switched off ``skill_search`` itself. The mount
+                # carries that deny on the gate and still mounts the element, but a
+                # search agent would then start with its skill resources already
+                # dropped from the view and every ``skill_search`` call refused --
+                # worse than a clean refusal. The one tool a search agent cannot run
+                # without is not carryable for it, so refuse here, naming the way
+                # back rather than letting the session start half-crippled.
+                raise AcpRuntimeError(
+                    f"Agent {name!r}: kirocrew-core/skill_search is disabled in the MCP "
+                    "settings, so this skill-search agent cannot start. Re-enable "
+                    "skill_search in the dashboard's MCP tab to restore it."
+                )
             if (
                 projection is not None
                 and name in projection.search_agents
@@ -6759,8 +6781,8 @@ class AcpRuntime:
                         "Cannot bind skill_search to this session without losing native MCP "
                         "restrictions. Check the agent's kirocrew-core server configuration."
                     )
-            return [*entries, *mount.elements]
-        return entries
+            return [*entries, *mount.elements], mount.carried
+        return entries, frozenset()
 
     @staticmethod
     async def _source_agent(agent: str | None) -> str | None:
@@ -6894,9 +6916,13 @@ class AcpRuntime:
                     self.acp_backend,
                     session_work_dir,
                 )
-                mcp_servers = await self._unpooled_control_planes(
+                mcp_servers, control_plane_carried = await self._unpooled_control_planes(
                     pooled, agent or self._agent, session_work_dir
                 )
+                # A carried kirocrew-core disabledTools toggle rides the session's
+                # per-call gate (the element cannot express it), so the session runs
+                # minus the toggled tool instead of being refused.
+                denied_tools = denied_tools | control_plane_carried
                 mcp_servers, stub_token = await self._own_stub_session(mcp_servers, session_key)
         else:
             # An explicit array is the caller's own composition (a mirror's
@@ -7789,9 +7815,13 @@ class AcpRuntime:
                 self.acp_backend,
                 session_work_dir,
             )
-            mcp_servers = await self._unpooled_control_planes(
+            mcp_servers, control_plane_carried = await self._unpooled_control_planes(
                 pooled, active_agent, session_work_dir
             )
+            # A carried kirocrew-core disabledTools toggle rides the session's
+            # per-call gate on resume as it did on session/new, so the resumed
+            # session runs minus the toggled tool rather than being refused.
+            denied_tools = denied_tools | control_plane_carried
             mcp_servers, stub_token = await self._own_stub_session(mcp_servers, session_key)
         member_withheld = False
         # Whether the member session-control entry is IN the array, the one fact
