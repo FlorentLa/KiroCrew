@@ -113,10 +113,32 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: scoring pass (which still applies them in full) rather than used as filters.
 _MIN_TRIGRAM_CHARS = 3
 
+#: Separator joining one session's message texts into the single folded blob
+#: that both the FTS column and the scoring pass read.
+#:
+#: It must satisfy two constraints at once, and the obvious choice fails the
+#: second. A user cannot type it, so it keeps a match from spanning two
+#: messages; and it must not END the text for SQLite. ``\x00`` does: FTS5's
+#: tokenizers walk the blob as a NUL-terminated C string, so everything after
+#: the first separator went UNTOKENIZED while the column still stored it in
+#: full. Every session was therefore searchable by its FIRST MESSAGE only, and
+#: because ``_index_shortlist`` reads a vouched-for session's empty postings as
+#: proof it cannot match, the scan that would have found the hit was skipped
+#: too — the session became unfindable rather than merely slow to find.
+#:
+#: ``\x1f`` (ASCII UNIT SEPARATOR) keeps the first property and drops the
+#: terminator behaviour. Both producers below MUST use this constant: the
+#: scorer reads whichever blob is cheaper to obtain and must not be able to
+#: tell which one it got.
+FOLD_SEPARATOR = "\x1f"
+
 #: Version of the stored term representation. A bump makes existing rows
 #: unreadable rather than subtly mismatched: the store drops and rebuilds
 #: instead of serving rows indexed under different tokenization rules.
-_INDEX_VERSION = 2
+#:
+#: 3: ``FOLD_SEPARATOR`` replaced ``\x00``. Rows written under 2 hold a blob
+#: whose postings stop at the first message, so they must be rebuilt, not read.
+_INDEX_VERSION = 3
 
 _BUSY_TIMEOUT_MS = 10_000
 _CONNECT_TIMEOUT_SECS = 30
@@ -339,7 +361,7 @@ class SessionSearchIndex:
 
         Both projections the search path needs are derived here rather than by
         the caller, so the folded document can never drift from the raw texts it
-        came from: the fold is ``"\\x00".join(texts).casefold()`` and
+        came from: the fold is ``FOLD_SEPARATOR.join(texts).casefold()`` and
         ``doc_chars`` counts the ORIGINAL characters, matching
         ``SessionCatalogProjection._build_folded`` exactly. The scorer must not be
         able to tell which source its text came from.
@@ -353,7 +375,7 @@ class SessionSearchIndex:
         """
         if not self.available:
             return
-        folded = "\x00".join(texts).casefold()
+        folded = FOLD_SEPARATOR.join(texts).casefold()
         doc_chars = sum(len(t) for t in texts)
         blob = zlib.compress(json.dumps(list(texts), ensure_ascii=False).encode("utf-8"), 6)
         stored_dev = _sqlite_stat_identity(dev)
