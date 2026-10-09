@@ -217,7 +217,11 @@ def _url_payload_command(n: int) -> str:
 #: subcommand. It is a security-deciding predicate, so it cannot leave the package,
 #: and no dead code remains to offset it. Its first word is split on space and tab
 #: only, the way bash splits, so a Unicode space cannot pose as a word break.
-_PACKAGE_LINE_BUDGET = 28_665
+#:
+#: Raised again, from 28,665, for the one import ``redaction_allow`` needs to publish
+#: its hosts file through ``atomic_write.replace_with_retry``, which retries the
+#: Windows sharing violation a bare ``os.replace`` lost the write on. No pattern moved.
+_PACKAGE_LINE_BUDGET = 28_666
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second
