@@ -1421,10 +1421,23 @@ async def handle_message(
     # Post inline stop button (only in threaded conversations to avoid breaking tests)
     _working_ts: str | None = None
     if thread_ts:
+        # Same gate the timing footer applies at turn end (threaded, thread not
+        # already linked, dashboard present), evaluated NOW so the "Link to
+        # Dashboard" control exists for the whole turn rather than appearing
+        # only once the turn completes — on a long turn the footer arrives far
+        # too late to be the first chance to link. A click imports and links the
+        # thread via the existing command path; the next turn then mirrors
+        # through the normal pre-committed-link mirror below.
+        _early_link = (
+            not sessions.get_session_for_thread(reply_ts) and get_dashboard_state() is not None
+        )
         # Best-effort: a failed stop-button post must not drop the user's message.
         try:
             _working_ts = await slack.post_blocks(
-                channel, build_working_blocks(session_key), "Working…", reply_ts
+                channel,
+                build_working_blocks(session_key, include_dashboard_link=_early_link),
+                "Working…",
+                reply_ts,
             )
         except Exception:
             logger.warning("Failed to post inline stop button", exc_info=True)

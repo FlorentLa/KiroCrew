@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kiro_crew.slack.blocks import build_working_blocks, session_task_card
+from kiro_crew.slack.format import LINK_DASHBOARD_ACTION
 
 # ---------------------------------------------------------------------------
 # build_working_blocks
@@ -37,6 +38,23 @@ class TestBuildWorkingBlocks:
         blocks = build_working_blocks("k")
         btn = blocks[1]["elements"][0]
         assert btn["style"] == "danger"
+
+    def test_no_dashboard_link_by_default(self):
+        """Default: Stop button only, no Link to Dashboard control."""
+        blocks = build_working_blocks("k")
+        elements = blocks[1]["elements"]
+        assert len(elements) == 1
+        assert all(
+            e.get("action_id") != LINK_DASHBOARD_ACTION for e in elements
+        ), "default working block must not carry the dashboard link"
+
+    def test_dashboard_link_added_when_requested(self):
+        """The turn-start feature: the gated caller adds the Link to Dashboard
+        button beside Stop so a long turn can be linked from the start."""
+        blocks = build_working_blocks("k", include_dashboard_link=True)
+        elements = blocks[1]["elements"]
+        assert elements[0]["action_id"] == "mc_inline_stop_k"
+        assert any(e.get("action_id") == LINK_DASHBOARD_ACTION for e in elements), elements
 
 
 # ---------------------------------------------------------------------------
