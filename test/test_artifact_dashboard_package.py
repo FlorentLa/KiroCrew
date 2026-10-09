@@ -46,9 +46,22 @@ def package(
                 types
                 if types is not None
                 else {
-                    "open_prs": {"type": "number", "label": "Open PRs"},
-                    "last_run": {"type": "timestamp", "label": "Last run"},
-                    "lane": {"type": "enum", "label": "Lane", "choices": ["green", "red"]},
+                    "open_prs": {
+                        "type": "number",
+                        "label": "Open PRs",
+                        "source": {"fold": "work", "path": "summary.open_prs"},
+                    },
+                    "last_run": {
+                        "type": "timestamp",
+                        "label": "Last run",
+                        "source": {"fold": "status", "path": "last_run"},
+                    },
+                    "lane": {
+                        "type": "enum",
+                        "label": "Lane",
+                        "choices": ["green", "red"],
+                        "source": {"agentic": True},
+                    },
                 }
             )
         },
@@ -121,10 +134,52 @@ class TestSaveAndRead:
             "type": "enum",
             "label": "Lane",
             "choices": ["green", "red"],
+            "source": {"agentic": True},
         }
         assert model.subscriptions == {"prs": ("open_prs",), "runs": ("last_run", "lane")}
         assert model.subscribers("lane") == ("runs",)
         assert model.subscribers("open_prs") == ("prs",)
+
+    def test_resolve_bound_slug_answers_the_binding_half_alone(self, store, saved) -> None:
+        assert dp.resolve_bound_slug(BOUND, store=store) == saved.slug
+        assert dp.resolve_bound_slug("crewmate:nobody", store=store) is None
+
+
+class TestWhereAValueComesFrom:
+    """A field says who fills it, so a translation never has to guess."""
+
+    def test_a_fold_field_is_not_agent_writable_and_an_agentic_one_is(self, store, saved) -> None:
+        model = dp.read_dashboard_model(BOUND, store=store)
+        assert model is not None
+        assert sorted(model.agentic_fields()) == ["lane"]
+        assert "open_prs" not in model.agentic_fields()
+
+    def test_the_page_subscribes_to_the_folds_its_fields_read(self, store, saved) -> None:
+        model = dp.read_dashboard_model(BOUND, store=store)
+        assert model is not None
+        assert model.folds == frozenset({"work", "status"})
+        assert model.block_folds("prs") == frozenset({"work"})
+        # 'runs' reads one fold field and one agentic field, so only the fold
+        # counts as a subscription -- an agentic write is not a fold push.
+        assert model.block_folds("runs") == frozenset({"status"})
+
+    def test_the_fold_names_come_from_the_manifest_not_a_copy(self) -> None:
+        from kiro_crew.dashboard_templates.manifest import FOLD_NAMES
+
+        assert dp.fold_names() == frozenset(FOLD_NAMES)
+
+    @pytest.mark.parametrize(
+        "name",
+        ["open_prs", "a", "x9", "Open_PRs", "9lives", "open-prs", "", "a" * 65, "open prs"],
+    )
+    def test_a_name_this_package_accepts_a_manifest_field_accepts(self, name) -> None:
+        # The translation keeps the package's own field names, so the two
+        # grammars have to agree on every name, not just on the good ones.
+        from kiro_crew.dashboard_templates.manifest import _FIELD
+
+        mine = dp._FIELD_NAME_RE.fullmatch(name) is not None
+        theirs = _FIELD.match(name) is not None
+        assert mine == theirs, name
 
     def test_nothing_bound_is_the_empty_state_not_an_error(self, store, saved) -> None:
         assert dp.read_dashboard_model("crewmate:someone-else", store=store) is None
@@ -175,11 +230,17 @@ class TestVersionOnlyOnLayoutChange:
         assert store.list_versions(saved.slug) == [1, 2]
 
     def test_a_model_change_creates_a_version(self, store, saved) -> None:
-        types = {
-            "open_prs": {"type": "number", "label": "Open PRs", "unit": "PRs"},
-            "last_run": {"type": "timestamp", "label": "Last run"},
-            "lane": {"type": "enum", "label": "Lane", "choices": ["green", "red"]},
-        }
+        types = package()["model"]["types"]
+        types["open_prs"]["unit"] = "PRs"
+        art = store.update(saved.slug, content=content(types=types))
+        assert art.version == 2
+
+    def test_moving_a_field_from_a_fold_to_the_agent_creates_a_version(self, store, saved) -> None:
+        # Who fills a field is part of the model, so changing it is a layout
+        # change -- and it is the change that decides whether an agentic write
+        # may land, so it needs history.
+        types = package()["model"]["types"]
+        types["open_prs"]["source"] = {"agentic": True}
         art = store.update(saved.slug, content=content(types=types))
         assert art.version == 2
 
@@ -265,9 +326,47 @@ class TestRejectInvalid:
                 id="unknown-field-key",
             ),
             pytest.param(
-                lambda p: p["model"]["types"].update({"lane2": {"type": "enum"}}),
+                lambda p: p["model"]["types"].update(
+                    {"lane2": {"type": "enum", "source": {"agentic": True}}}
+                ),
                 "is required by this type",
                 id="missing-required-field-key",
+            ),
+            pytest.param(
+                lambda p: p["model"]["types"]["open_prs"].pop("source"),
+                "a field must say where its value comes from",
+                id="no-source",
+            ),
+            pytest.param(
+                lambda p: p["model"]["types"]["open_prs"].update(
+                    {"source": {"fold": "invented", "path": "a"}}
+                ),
+                "is not a crew-log fold",
+                id="unknown-fold",
+            ),
+            pytest.param(
+                lambda p: p["model"]["types"]["open_prs"].update(
+                    {"source": {"fold": "work", "path": "a..b"}}
+                ),
+                "must be dotted keys",
+                id="fold-path-is-not-a-path",
+            ),
+            pytest.param(
+                lambda p: p["model"]["types"]["open_prs"].update({"source": {"fold": "work"}}),
+                "must be dotted keys",
+                id="fold-source-without-a-path",
+            ),
+            pytest.param(
+                lambda p: p["model"]["types"]["lane"].update(
+                    {"source": {"agentic": True, "fold": "work"}}
+                ),
+                "unknown key(s) ['fold']",
+                id="agentic-source-also-names-a-fold",
+            ),
+            pytest.param(
+                lambda p: p["model"]["types"]["lane"].update({"source": {"agentic": False}}),
+                "an agentic source is written exactly",
+                id="agentic-false-is-not-a-source",
             ),
             pytest.param(
                 lambda p: p["view"]["blocks"][0].update({"type": "heatmap"}),

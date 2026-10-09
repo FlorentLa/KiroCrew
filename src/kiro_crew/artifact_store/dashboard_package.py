@@ -110,8 +110,13 @@ _DATA_KEYS = frozenset(
     }
 )
 
+#: A fold path: dotted keys walking the rendered fold value. The SAME grammar as
+#: ``dashboard_templates.manifest._PATH``, because the translated manifest hands
+#: this exact string to the same walker.
+_PATH_RE = re.compile(r"\A[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*\Z")
+
 #: The keys every model field carries, whatever its type.
-_UNIVERSAL_FIELD_KEYS = ("type", "label", "description")
+_UNIVERSAL_FIELD_KEYS = ("type", "source", "label", "description")
 #: The keys every view block carries, whatever its type.
 _UNIVERSAL_BLOCK_KEYS = ("id", "type", "fields", "title")
 
@@ -328,11 +333,40 @@ def package_json_schema() -> dict[str, Any]:
                         },
                         "additionalProperties": {
                             "type": "object",
-                            "required": ["type"],
+                            "required": ["type", "source"],
                             "properties": {
                                 "type": {
                                     "enum": sorted(types),
                                     "description": "A type name from data_type_catalog().",
+                                },
+                                "source": {
+                                    "description": (
+                                        "Where the value comes from. A fold source is read "
+                                        "from the crew log and no agent can write it; an "
+                                        "agentic source is one the crewmate writes itself."
+                                    ),
+                                    "oneOf": [
+                                        {
+                                            "type": "object",
+                                            "required": ["fold", "path"],
+                                            "additionalProperties": False,
+                                            "properties": {
+                                                "fold": {"enum": sorted(fold_names())},
+                                                "path": {
+                                                    "type": "string",
+                                                    "pattern": _PATH_RE.pattern.replace(
+                                                        "\\A", "^"
+                                                    ).replace("\\Z", "$"),
+                                                },
+                                            },
+                                        },
+                                        {
+                                            "type": "object",
+                                            "required": ["agentic"],
+                                            "additionalProperties": False,
+                                            "properties": {"agentic": {"const": True}},
+                                        },
+                                    ],
                                 },
                                 "label": {"type": "string", "maxLength": MAX_LABEL_LEN},
                                 "description": {"type": "string", "maxLength": MAX_LABEL_LEN},
@@ -458,6 +492,64 @@ def _apply(
             raise _refuse(f"{path}.{key}", str(exc)) from None
 
 
+def fold_names() -> frozenset[str]:
+    """The crew-log folds a field may read, as the template manifest defines them.
+
+    Imported lazily and read through this one function rather than copied: a fold
+    added to ``crew_log.projection`` has to be readable from a package without a
+    second edit here, and the reader's translation into a ``TemplateManifest``
+    hands the name straight back to the same consumer. The import is deferred
+    because ``dashboard_templates.manifest`` reaches the projection and the
+    template parity checker, and the artifact store should not carry that graph
+    just to validate a string.
+    """
+    from kiro_crew.dashboard_templates.manifest import FOLD_NAMES
+
+    return frozenset(FOLD_NAMES)
+
+
+def _validate_source(raw: Any, path: str) -> dict[str, Any]:
+    """Where a field's value comes from: a crew-log fold, or the agent itself.
+
+    Exactly the two cases ``dashboard_templates.manifest`` already has, spelled
+    the same way, because the reader translates this straight into a
+    ``FieldSpec``. Without it a package would declare a field's shape and not
+    say who fills it, and a translation could only guess -- and the only guess
+    available, ``agentic``, would make every field on the page agent-writable
+    and lose the fold-backed half entirely.
+    """
+    source = _an_object(raw, path)
+    if source.get("agentic") is True:
+        _check_keys(source, path, ("agentic",))
+        return {"agentic": True}
+    if "agentic" in source:
+        # Not "unknown key": the author reached for the right key and wrote the
+        # wrong value, and there is no third kind of source to fall back to.
+        raise _refuse(
+            f"{path}.agentic",
+            f"is {source['agentic']!r}: an agentic source is written exactly "
+            "{'agentic': true}, and a field the agent does not write declares "
+            "{'fold': <name>, 'path': <dotted keys>} instead",
+        )
+    _check_keys(source, path, ("fold", "path"))
+    fold = source.get("fold")
+    known = fold_names()
+    if not isinstance(fold, str) or fold not in known:
+        raise _refuse(
+            f"{path}.fold",
+            f"{fold!r} is not a crew-log fold: the folds are {sorted(known)}. "
+            "A field the agent writes itself declares {'agentic': true} instead",
+        )
+    walk = source.get("path")
+    if not isinstance(walk, str) or _PATH_RE.fullmatch(walk) is None:
+        raise _refuse(
+            f"{path}.path",
+            f"{walk!r} is required and must be dotted keys walking the fold value, "
+            "e.g. 'summary.open_prs'",
+        )
+    return {"fold": fold, "path": walk}
+
+
 def validate_bound_to(raw: Any) -> str:
     """Return a well-formed ``bound_to``, or raise saying why it is not one."""
     if not isinstance(raw, str):
@@ -505,7 +597,16 @@ def _validate_model(raw: Any) -> dict[str, Any]:
             )
         allowed = (*_UNIVERSAL_FIELD_KEYS, *entry.required, *entry.optional)
         _check_keys(spec, path, allowed)
-        out: dict[str, Any] = {"type": type_name}
+        if "source" not in spec:
+            raise _refuse(
+                f"{path}.source",
+                "is required: a field must say where its value comes from -- "
+                "{'fold': <name>, 'path': <dotted keys>} or {'agentic': true}",
+            )
+        out: dict[str, Any] = {
+            "type": type_name,
+            "source": _validate_source(spec["source"], f"{path}.source"),
+        }
         for key in ("label", "description"):
             if key in spec:
                 try:
@@ -816,6 +917,37 @@ class DashboardModel:
             block_id for block_id, names in self.subscriptions.items() if field_name in names
         )
 
+    def agentic_fields(self) -> Mapping[str, Mapping[str, Any]]:
+        """The fields the crewmate may write itself, by name.
+
+        A fold-backed field is NOT here: its value is read from the crew log and
+        no agent can write it. The same split
+        ``dashboard_agentic.agentic_fields`` makes over a template manifest.
+        """
+        return {
+            name: spec
+            for name, spec in self.fields.items()
+            if spec.get("source", {}).get("agentic") is True
+        }
+
+    @property
+    def folds(self) -> frozenset[str]:
+        """The crew-log folds this page subscribes to."""
+        return frozenset(
+            fold
+            for spec in self.fields.values()
+            if (fold := spec.get("source", {}).get("fold")) is not None
+        )
+
+    def block_folds(self, block_id: str) -> frozenset[str]:
+        """The folds one block reads -- what the bus decides a push on."""
+        names = self.subscriptions.get(block_id, ())
+        return frozenset(
+            fold
+            for name in names
+            if (fold := self.fields[name].get("source", {}).get("fold")) is not None
+        )
+
 
 def model_of(package: Mapping[str, Any], *, slug: str = "", version: int = 0) -> DashboardModel:
     """Project a canonical package into the :class:`DashboardModel` view of it."""
@@ -831,6 +963,38 @@ def model_of(package: Mapping[str, Any], *, slug: str = "", version: int = 0) ->
     )
 
 
+def resolve_bound_slug(bound_to: str, *, store: "ArtifactStore | None" = None) -> str | None:
+    """The slug of the dashboard artifact bound to ``bound_to``, or ``None``.
+
+    The binding half of the lookup on its own, for a caller that is keyed by
+    slug (a route, the data line's ``read_package_model``) but was handed a
+    member. Reads the ``kind="dashboard"`` artifacts newest-first, capped at
+    :data:`MAX_BINDING_SCAN`; there is one package per crewmate or slot, so this
+    ends on its first or second read in practice.
+
+    A record whose content no longer parses is SKIPPED here, because this
+    function answers "which slug" and cannot report a reason. A caller that
+    needs to tell a corrupt package from an absent one reads the slug's content
+    itself -- which is why the data line's reader takes a slug.
+    """
+    bound_to = validate_bound_to(bound_to)
+    if store is None:
+        from kiro_crew.artifacts import get_default_store
+
+        store = get_default_store()
+    from kiro_crew.artifacts import ArtifactError
+
+    for art in store.list(kind=DASHBOARD_KIND)[:MAX_BINDING_SCAN]:
+        try:
+            loaded = store.get(art.slug)
+            package = parse_package(loaded.content or "")
+        except (ArtifactError, OSError):
+            continue
+        if package["bound_to"] == bound_to:
+            return loaded.slug
+    return None
+
+
 def read_dashboard_model(
     bound_to: str, *, store: "ArtifactStore | None" = None
 ) -> DashboardModel | None:
@@ -843,6 +1007,13 @@ def read_dashboard_model(
     ``bound_to`` is ``crewmate:<slug>`` or ``session:<slot key>``; a value that
     is not a binding raises rather than quietly matching nothing. ``store``
     defaults to the process-wide artifact store.
+
+    The data line's ``dashboard_package.read_package_model(slug, member)`` is
+    the reader a CONSUMER should call: it distinguishes a corrupt package from
+    an absent one and does the translation into a template manifest. This stays
+    as the package half -- ``resolve_bound_slug`` plus :func:`model_of` are what
+    that reader composes -- and as the convenience for a caller that holds only
+    a binding.
 
     The binding is resolved by reading the ``kind="dashboard"`` artifacts
     newest-first and returning the first whose package is bound here, capped at
