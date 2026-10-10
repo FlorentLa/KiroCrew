@@ -42,9 +42,12 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import field as _dc_field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from kiro_crew.artifact_store.model import ArtifactValidationError
+
+if TYPE_CHECKING:  # pragma: no cover - a type-only import, so no cycle at run time
+    from kiro_crew.artifacts import ArtifactStore
 
 #: The artifact kind this module owns. Added to
 #: :data:`kiro_crew.artifact_store.rules.ALLOWED_KINDS`, and deliberately NOT to
@@ -799,3 +802,39 @@ def revert_package(stored_content: str, target_content: str) -> str:
         return dump_package(target)
     target["bound_to"] = live["bound_to"]
     return dump_package(target)
+
+
+#: Cap on how many dashboard artifacts :func:`resolve_bound_slug` will open while
+#: looking for a binding. There is one package per crewmate or slot, so a scan past
+#: this is a library problem, not a lookup that deserves more reads.
+MAX_BINDING_SCAN = 256
+
+
+def resolve_bound_slug(bound_to: str, *, store: "ArtifactStore | None" = None) -> str | None:
+    """The slug of the dashboard artifact bound to ``bound_to``, or ``None``.
+
+    The binding half of the lookup on its own, for a caller that is keyed by a member
+    but needs the artifact. Reads the ``kind="dashboard"`` artifacts newest-first,
+    capped at :data:`MAX_BINDING_SCAN`; there is one package per crewmate or slot, so
+    this ends on its first or second read in practice.
+
+    A record whose content does not parse is SKIPPED, because this function answers
+    "which slug" and cannot report a reason. A caller that needs to tell a corrupt
+    package from an absent one reads the slug's content itself.
+    """
+    bound_to = validate_bound_to(bound_to)
+    if store is None:
+        from kiro_crew.artifacts import get_default_store
+
+        store = get_default_store()
+    from kiro_crew.artifacts import ArtifactError
+
+    for art in store.list(kind=DASHBOARD_KIND)[:MAX_BINDING_SCAN]:
+        try:
+            loaded = store.get(art.slug)
+            package = parse_package(loaded.content or "")
+        except (ArtifactError, OSError):
+            continue
+        if package["bound_to"] == bound_to:
+            return loaded.slug
+    return None
