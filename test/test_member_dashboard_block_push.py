@@ -869,6 +869,81 @@ async def test_a_block_type_outside_the_closed_catalogue_is_not_rendered(monkeyp
     assert rendered == [], "the renderer ran for a block type nothing in the repo defines"
 
 
+async def test_the_seam_resolves_against_the_REAL_renderer():
+    """No stub. This is the test that catches a seam pointing at nothing.
+
+    Lazy resolution is right for a branch that must build before the renderer lands,
+    but it converts a wrong module path or a renamed function from an ImportError into
+    ``None`` -- and ``None`` means the first load serves no ``rendered_html``, which this
+    controller then draws as the frame's own empty state. A silently empty page is worse
+    than a red build because nobody goes looking for it.
+
+    Every test that stubs the renderer passes on a broken seam BY CONSTRUCTION, so this
+    one imports the module the constant names and asks for each name the controller
+    asks for.
+    """
+    import importlib
+
+    module = importlib.import_module(routes._PACKAGE_RENDER_MODULE)
+    assert module.__name__ == "kiro_crew.dashboard_package_render"
+    for name in ("render_dashboard", "display_values"):
+        assert routes._package_render(name) is not None, f"the seam does not resolve {name!r}"
+    assert routes._package_render_value("THEMES") == ("light", "dark")
+    # The signature, not just the name: a renderer that took different keywords would
+    # resolve here and raise inside the gate, which logs and returns None -- the same
+    # silent empty page by another route.
+    import inspect
+
+    signature = inspect.signature(module.render_dashboard)
+    assert list(signature.parameters) == ["package", "read", "theme", "title"]
+
+
+async def test_the_first_load_really_renders_a_document(store, saved):
+    """END TO END with the real renderer: a package-bound member gets a page.
+
+    The one assertion that would have caught the broken seam on the merged tree. It
+    stubs nothing: the route reads the package, builds the read, calls the renderer the
+    constant names, and the document goes through the CSP gate before it is served.
+    """
+    hub = _Hub()
+    async with _client(hub) as client:
+        body = await (await client.get(_q())).json()
+        assert "rendered_html" in body, "the seam resolved to nothing and the page was empty"
+        document = body["rendered_html"]
+        assert document.lstrip().lower().startswith("<!doctype html")
+        assert routes._csp_problems(document) == []
+        # The VALUES reached it, so this is a filled page and not an empty shell that
+        # happens to parse: the fold moved, then the next read served it.
+        page = push.live_page(SLUG)
+        assert page is not None
+        page.on_fold("work", _event("work", WORK, revision=10_000))
+        filled = await (await client.get(_q())).json()
+    assert "4" in filled["rendered_html"]
+    assert filled["read"]["display"]["open_prs"] == "4", "the renderer's formatter was skipped"
+
+
+async def test_a_build_whose_renderer_is_missing_says_so_out_loud(monkeypatch, caplog):
+    """The failure mode the seam had: absent renderer, DEBUG log, empty page, no noise.
+
+    The pin above stops the seam from being wrong. This stops a build that genuinely
+    lacks the renderer from being silent about it, which is the half a test on the merged
+    tree cannot cover.
+    """
+    import logging
+
+    monkeypatch.setattr(routes, "_PACKAGE_RENDER_MODULE", "kiro_crew.no_such_renderer")
+    routes._renderer_absence_reported.clear()
+    with caplog.at_level(logging.WARNING):
+        assert routes._package_render("render_dashboard") is None
+    assert [r for r in caplog.records if "no package renderer" in r.getMessage()]
+    # ONCE per module name, not per request: a dashboard poll would otherwise fill the
+    # log with one line per read for the life of the gateway.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert routes._package_render("render_dashboard") is None
+    assert not [r for r in caplog.records if "no package renderer" in r.getMessage()]
+
+
 async def test_the_renderer_seam_is_the_module_the_renderer_actually_lands_in(monkeypatch):
     """Named once, so the merge is one line -- and named CORRECTLY, so it is not zero.
 

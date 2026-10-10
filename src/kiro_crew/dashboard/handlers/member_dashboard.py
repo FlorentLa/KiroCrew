@@ -618,12 +618,35 @@ _CSP_META_RE: Final[Any] = re.compile(
 )
 
 
+#: Module names already reported as missing, so the warning below is said ONCE.
+#:
+#: A dashboard is polled, so a per-read log line would fill the log for the life of the
+#: gateway. Once is enough to make an absent renderer findable, which is the whole
+#: requirement: the consequence of absence is a page with no document, and this
+#: controller draws that as the frame's empty state -- a silence nobody goes looking at.
+_renderer_absence_reported: set[str] = set()
+
+
 def _package_render_value(attr: str) -> Any:
-    """One name out of the package renderer module, or ``None`` on a build without it."""
+    """One name out of the package renderer module, or ``None`` on a build without it.
+
+    WARNING, not debug, when the module will not import. Lazy resolution is what lets
+    this controller build and serve before the renderer lands, but it also turns a wrong
+    module path or a renamed function into ``None`` -- and ``None`` here is a v3 page
+    served with no ``rendered_html``, which looks exactly like a crewmate who has
+    composed nothing. That is the one failure a reader cannot detect, so the log is the
+    place it has to be visible.
+    """
     try:
         module = importlib.import_module(_PACKAGE_RENDER_MODULE)
     except Exception:
-        logger.debug("dashboard: no package renderer at %s", _PACKAGE_RENDER_MODULE)
+        if _PACKAGE_RENDER_MODULE not in _renderer_absence_reported:
+            _renderer_absence_reported.add(_PACKAGE_RENDER_MODULE)
+            logger.warning(
+                "dashboard: no package renderer at %s, so a v3 dashboard will serve "
+                "without a document and read as an empty page",
+                _PACKAGE_RENDER_MODULE,
+            )
         return None
     return getattr(module, attr, None)
 
