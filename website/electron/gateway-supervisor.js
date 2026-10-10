@@ -55,6 +55,8 @@ const {
   revealWindowForConnect,
   waitForServiceRebind,
   snapshotIncumbentForRespawn,
+  recoverIncumbentWithBackoff,
+  INCUMBENT_RETRY_STATUS,
   gatewayCliInvocation,
   unrecoverableGatewayDialog,
   shouldReresolveBackend,
@@ -1122,17 +1124,23 @@ function createGatewaySupervisor({
         // its socket but still holds the lock is never named by a socket probe
         // at all. Take one lookup, then fall back to the CLI's socket-
         // independent lock-holder probe instead of refusing on the miss.
-        const drainCapture = await snapshotIncumbentForRespawn({
-          snapshot: () => snapshotGatewayPortPids(PORT),
-          blocksRespawn: (pids) => unverifiedIncumbent(pids),
+        // An incumbent that stays unnameable is retried on the same capped
+        // backoff as the liveness path, never spawned over blind.
+        const drainCapture = await recoverIncumbentWithBackoff({
+          capture: () => snapshotIncumbentForRespawn({
+            snapshot: () => snapshotGatewayPortPids(PORT),
+            blocksRespawn: (pids) => unverifiedIncumbent(pids),
+            sleep: (ms) => new Promise((resolve) => setTimeoutFn(resolve, ms)),
+            lockHolderProbe: () => probeLockHolderPid(),
+            log: (message) => glog(`drain: ${message}`),
+          }),
           sleep: (ms) => new Promise((resolve) => setTimeoutFn(resolve, ms)),
-          lockHolderProbe: () => probeLockHolderPid(),
+          cancelled: () => quitting(),
+          onWaiting: () => sendStatus(INCUMBENT_RETRY_STATUS),
           log: (message) => glog(`drain: ${message}`),
         });
-        if (drainCapture.verdict === "unverified") {
-          glog(`drain: could not establish the incumbent on :${PORT} (socket lookup empty, lock indeterminate) — refusing an automatic respawn that could race gateway.lock`);
-          return "probe-failed";
-        }
+        if (drainCapture.verdict === "cancelled") return "abort";
+        sendStatus("Waiting for the previous gateway to exit…");
         // "released" = the lock is released (incumbent gone), nothing to outwait;
         // "captured" names the pid to wait on before spawning.
         const drainingPids = drainCapture.verdict === "released" ? null : drainCapture.pids;
@@ -2149,20 +2157,26 @@ function createGatewaySupervisor({
     // holds gateway.lock a socket probe can never name it. Take one lookup;
     // when it names no one, fall back to the CLI's lock-holder probe, which
     // reads the incumbent from the lock file and outlives the socket. Then wait
-    // for that process to exit (releasing the lock) before spawning. Only a
-    // truly indeterminate lock surfaces the terminal dialog.
-    const capture = await snapshotIncumbentForRespawn({
-      snapshot: () => snapshotGatewayPortPids(PORT),
-      blocksRespawn: (pids) => unverifiedIncumbent(pids),
+    // for that process to exit (releasing the lock) before spawning. When the
+    // incumbent stays unnameable (lock indeterminate, or held past the wait),
+    // recovery never spawns blind and never stops: it tries again on a capped
+    // backoff behind the reconnect splash, whose close control and the tray's
+    // Quit stay available throughout.
+    const capture = await recoverIncumbentWithBackoff({
+      capture: () => snapshotIncumbentForRespawn({
+        snapshot: () => snapshotGatewayPortPids(PORT),
+        blocksRespawn: (pids) => unverifiedIncumbent(pids),
+        sleep: (ms) => new Promise((resolve) => setTimeoutFn(resolve, ms)),
+        lockHolderProbe: () => probeLockHolderPid(),
+        log: (message) => glog(`liveness: ${message}`),
+      }),
       sleep: (ms) => new Promise((resolve) => setTimeoutFn(resolve, ms)),
-      lockHolderProbe: () => probeLockHolderPid(),
+      cancelled: () => !window || window.isDestroyed() || quitting(),
+      onWaiting: () => sendStatus(INCUMBENT_RETRY_STATUS),
       log: (message) => glog(`liveness: ${message}`),
     });
-    if (!window || window.isDestroyed() || quitting()) return;
-    if (capture.verdict === "unverified") {
-      glog(`liveness: could not establish the incumbent on :${PORT} (socket lookup empty, lock indeterminate) — refusing an automatic respawn that could race gateway.lock`);
-      return showUnrecoverableGatewayError(window, PORT, { probeFailed: true });
-    }
+    if (capture.verdict === "cancelled" || !window || window.isDestroyed() || quitting()) return;
+    sendStatus("Waiting for the previous gateway to exit…");
     // "released" means the lock itself is released (incumbent fully exited), so
     // there is no pid to wait on; "captured" names the pid to outwait. Both
     // then confirm the socket is free before spawning.

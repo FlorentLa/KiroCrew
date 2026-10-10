@@ -186,8 +186,8 @@ function incumbentSnapshotBlocksRespawn({ pids, isWindows = false }) {
 // draining gateway whose pid is unreadable under a Windows mandatory lock), the
 // recovery waits for the lock to be released rather than giving up. A draining
 // gateway finishes teardown in seconds to low minutes; this budget covers that
-// while still bounding the wait, so a gateway genuinely stuck holding the lock
-// surfaces the terminal dialog instead of waiting forever.
+// while still bounding one pass; a lock still held after it reads as
+// "unverified", and recoverIncumbentWithBackoff re-runs the pass later.
 const INCUMBENT_LOCK_HELD_BUDGET_MS = 120_000;
 const INCUMBENT_LOCK_HELD_POLL_MS = 2_000;
 
@@ -220,11 +220,11 @@ const INCUMBENT_LOCK_HELD_POLL_MS = 2_000;
  *    We cannot wait on a pid, but we CAN wait for the lock to be RELEASED — the
  *    same authoritative signal — so the probe is polled on a bounded budget
  *    until it reports "released" (then spawn) or the budget expires (then
- *    terminal). This is what lets recovery heal on a Windows host where the pid
+ *    "unverified"). This is what lets recovery heal on a Windows host where the pid
  *    is unreadable.
  *  - `"unverified"` — the probe could not establish the lock's state at all, or
- *    a held lock never released within the budget. The one case that still
- *    surfaces the terminal dialog, because spawning blind would race the lock.
+ *    a held lock never released within the budget. Spawning blind would race
+ *    the lock, so the caller retries later via recoverIncumbentWithBackoff.
  *
  * With no `lockHolderProbe` injected a socket lookup that names no one yields
  * `"unverified"`.
@@ -283,12 +283,12 @@ async function snapshotIncumbentForRespawn({
         // A live gateway holds the lock but cannot be named (Windows mandatory
         // lock hides the pid). We cannot wait on a pid, but we CAN wait for the
         // lock to be released — the authoritative "safe to spawn" signal — on a
-        // bounded budget. A gateway stuck holding the lock past the budget is
-        // the genuinely-unrecoverable case the terminal dialog is for.
+        // bounded budget. Past the budget this pass reads as "unverified" and
+        // the caller's backoff tries again later.
         if (Date.now() >= lockDeadline) {
           log(
             `the gateway lock is still held after waiting ${lockHeldBudgetMs}ms `
-            + "and its owner stayed unnameable — surfacing the terminal error",
+            + "and its owner stayed unnameable — ending this pass unverified",
           );
           return { verdict: "unverified", pids: null, via: "lock" };
         }
@@ -304,6 +304,63 @@ async function snapshotIncumbentForRespawn({
     }
   }
   return { verdict: "unverified", pids: null, via: "snapshot" };
+}
+
+// After an "unverified" capture, recovery re-runs the whole capture on this
+// capped schedule instead of stopping: the last delay repeats for as long as
+// the incumbent stays unnameable. A gateway that drains past the held-lock
+// budget, or a lock probe that fails once (a slow interpreter start hitting its
+// timeout), therefore heals on a later attempt instead of leaving an unattended
+// host with no gateway.
+const INCUMBENT_RECOVERY_BACKOFF_MS = Object.freeze([30_000, 60_000, 120_000]);
+
+// Splash status line shown while recovery backs off. It names no delay: the
+// line is sent once per wait and would otherwise read as a frozen countdown.
+// The splash's own close control (with its hint) is the way to stop waiting.
+const INCUMBENT_RETRY_STATUS = "Previous gateway still exiting — retrying automatically";
+
+/**
+ * Keep trying to name the incumbent until it can be named, the lock is
+ * released, or the caller stops recovering.
+ *
+ * Runs `capture` (one {@link snapshotIncumbentForRespawn} pass). Any verdict
+ * other than `"unverified"` is returned as-is. On `"unverified"` it waits the
+ * next delay of `backoffMs` (the last one repeats) and runs `capture` again —
+ * it never spawns blind, and it never gives up while the caller still wants
+ * recovery. `cancelled()` is checked before every attempt and after every
+ * wait; once it is true the result is `{ verdict: "cancelled" }` so the caller
+ * can stop quietly (window closed, app quitting).
+ *
+ * @param {object} o
+ * @param {() => Promise<{verdict:string, pids:number[]|null, via:string}>} o.capture
+ * @param {(ms:number) => Promise<void>} o.sleep
+ * @param {() => boolean} [o.cancelled]
+ * @param {(delayMs:number, attempt:number) => void} [o.onWaiting]  e.g. update the status line
+ * @param {readonly number[]} [o.backoffMs]
+ * @param {(message:string) => void} [o.log]
+ * @returns {Promise<{verdict:"captured"|"released"|"cancelled", pids:number[]|null, via?:string, attempts:number}>}
+ */
+async function recoverIncumbentWithBackoff({
+  capture,
+  sleep,
+  cancelled = () => false,
+  onWaiting = () => {},
+  backoffMs = INCUMBENT_RECOVERY_BACKOFF_MS,
+  log = () => {},
+}) {
+  for (let attempt = 1; ; attempt += 1) {
+    if (cancelled()) return { verdict: "cancelled", pids: null, attempts: attempt - 1 };
+    const result = await capture();
+    if (result.verdict !== "unverified") return { ...result, attempts: attempt };
+    if (cancelled()) return { verdict: "cancelled", pids: null, attempts: attempt };
+    const delayMs = backoffMs[Math.min(attempt - 1, backoffMs.length - 1)];
+    log(
+      `attempt ${attempt}: the incumbent is still unnameable and the lock not released `
+      + `— trying again in ${delayMs}ms rather than spawning blind or giving up`,
+    );
+    onWaiting(delayMs, attempt);
+    await sleep(delayMs);
+  }
 }
 
 /**
@@ -513,6 +570,9 @@ module.exports = {
   snapshotPortPids,
   incumbentSnapshotBlocksRespawn,
   snapshotIncumbentForRespawn,
+  recoverIncumbentWithBackoff,
+  INCUMBENT_RECOVERY_BACKOFF_MS,
+  INCUMBENT_RETRY_STATUS,
   unrecoverableGatewayDialog,
   SERVICE_REBIND_GRACE_MS,
   INCUMBENT_EXIT_GRACE_MS,

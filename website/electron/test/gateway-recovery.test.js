@@ -11,6 +11,9 @@ const {
   snapshotPortPids,
   incumbentSnapshotBlocksRespawn,
   snapshotIncumbentForRespawn,
+  recoverIncumbentWithBackoff,
+  INCUMBENT_RECOVERY_BACKOFF_MS,
+  INCUMBENT_RETRY_STATUS,
   unrecoverableGatewayDialog,
   shouldReresolveBackend,
   isStaleBundleSignal,
@@ -425,7 +428,7 @@ describe("snapshotIncumbentForRespawn", () => {
     }
   });
 
-  it("stays 'unverified' when the lock probe is indeterminate — the one terminal case", async () => {
+  it("stays 'unverified' when the lock probe is indeterminate — the caller retries later", async () => {
     const h = clockHarness();
     try {
       const result = await snapshotIncumbentForRespawn({
@@ -472,7 +475,7 @@ describe("snapshotIncumbentForRespawn", () => {
     }
   });
 
-  it("gives up (unverified) when a held lock never releases within the held budget", async () => {
+  it("ends one pass unverified when a held lock never releases within the held budget", async () => {
     const h = clockHarness();
     try {
       let probes = 0;
@@ -484,12 +487,124 @@ describe("snapshotIncumbentForRespawn", () => {
         lockHeldPollMs: 2_000,
         lockHolderProbe: async () => { probes += 1; return { verdict: "held", pid: null }; },
       });
-      assert.equal(result.verdict, "unverified", "a lock stuck held past the budget is terminal");
+      assert.equal(result.verdict, "unverified", "a pass that outlasts the budget hands back to the caller's backoff");
       assert.equal(result.via, "lock");
-      assert.ok(probes > 1, "polled the held lock across the budget before giving up");
+      assert.ok(probes > 1, "polled the held lock across the budget before ending the pass");
     } finally {
       h.restore();
     }
+  });
+});
+
+describe("recoverIncumbentWithBackoff", () => {
+  const recordingSleep = () => {
+    const slept = [];
+    return { slept, sleep: async (ms) => { slept.push(ms); } };
+  };
+
+  it("uses a capped 30s / 60s / 120s schedule that stays at 120s", () => {
+    assert.deepEqual([...INCUMBENT_RECOVERY_BACKOFF_MS], [30_000, 60_000, 120_000]);
+    assert.ok(Object.isFrozen(INCUMBENT_RECOVERY_BACKOFF_MS));
+  });
+
+  it("its splash status names no delay, so it never reads as a frozen countdown", () => {
+    assert.match(INCUMBENT_RETRY_STATUS, /retrying automatically/);
+    assert.doesNotMatch(INCUMBENT_RETRY_STATUS, /\d/);
+  });
+
+  it("returns the first pass as-is when the incumbent is named — no backoff", async () => {
+    const s = recordingSleep();
+    const result = await recoverIncumbentWithBackoff({
+      capture: async () => ({ verdict: "captured", pids: [4242], via: "snapshot" }),
+      sleep: s.sleep,
+    });
+    assert.deepEqual(result, { verdict: "captured", pids: [4242], via: "snapshot", attempts: 1 });
+    assert.deepEqual(s.slept, []);
+  });
+
+  // A gateway stuck holding the lock past every bounded wait must not end
+  // recovery: each pass runs the real held-lock wait, then the loop backs off
+  // and tries again, and the lock freeing later is what recovers it.
+  it("keeps retrying a lock stuck held past the budget, then recovers once the lock frees", async () => {
+    let now = 0;
+    const realDateNow = Date.now;
+    Date.now = () => now;
+    try {
+      const passSleeps = [];
+      const backoffSleeps = [];
+      let probes = 0;
+      const releaseAfterProbes = 40; // well past several held budgets
+      const waiting = [];
+      const result = await recoverIncumbentWithBackoff({
+        capture: () => snapshotIncumbentForRespawn({
+          snapshot: async () => null,
+          blocksRespawn: (pids) => incumbentSnapshotBlocksRespawn({ pids, isWindows: true }),
+          sleep: async (ms) => { passSleeps.push(ms); now += ms; },
+          lockHeldBudgetMs: 10_000,
+          lockHeldPollMs: 2_000,
+          lockHolderProbe: async () => {
+            probes += 1;
+            return probes >= releaseAfterProbes
+              ? { verdict: "released", pid: null }
+              : { verdict: "held", pid: null };
+          },
+        }),
+        sleep: async (ms) => { backoffSleeps.push(ms); now += ms; },
+        onWaiting: (delayMs, attempt) => waiting.push([delayMs, attempt]),
+      });
+      assert.equal(result.verdict, "released", "the freed lock recovers instead of a terminal stop");
+      assert.ok(result.attempts >= 5, `retried across several stuck passes (attempts=${result.attempts})`);
+      assert.deepEqual(
+        backoffSleeps,
+        [30_000, 60_000, 120_000, ...Array(result.attempts - 4).fill(120_000)],
+        "the backoff grows to 120s and stays there",
+      );
+      assert.deepEqual(waiting.map(([d]) => d), backoffSleeps, "the status line is told about every wait");
+      assert.ok(passSleeps.length > 0, "each pass still ran the bounded held-lock wait");
+    } finally {
+      Date.now = realDateNow;
+    }
+  });
+
+  it("keeps retrying an indeterminate lock probe and recovers when it later names the holder", async () => {
+    const s = recordingSleep();
+    const answers = [
+      { verdict: "unverified", pids: null, via: "lock" },
+      { verdict: "unverified", pids: null, via: "lock" },
+      { verdict: "captured", pids: [9191], via: "lock" },
+    ];
+    let i = 0;
+    const result = await recoverIncumbentWithBackoff({
+      capture: async () => answers[i++],
+      sleep: s.sleep,
+    });
+    assert.deepEqual(result, { verdict: "captured", pids: [9191], via: "lock", attempts: 3 });
+    assert.deepEqual(s.slept, [30_000, 60_000]);
+  });
+
+  it("stops quietly once the caller cancels (window closed or app quitting)", async () => {
+    const s = recordingSleep();
+    let captures = 0;
+    const result = await recoverIncumbentWithBackoff({
+      capture: async () => { captures += 1; return { verdict: "unverified", pids: null, via: "lock" }; },
+      sleep: s.sleep,
+      cancelled: () => s.slept.length >= 2,
+    });
+    assert.equal(result.verdict, "cancelled");
+    assert.equal(result.pids, null);
+    assert.equal(captures, 2, "no further capture after cancellation");
+    assert.deepEqual(s.slept, [30_000, 60_000]);
+  });
+
+  it("does not start a capture when already cancelled", async () => {
+    let captures = 0;
+    const result = await recoverIncumbentWithBackoff({
+      capture: async () => { captures += 1; return { verdict: "captured", pids: [1], via: "snapshot" }; },
+      sleep: async () => {},
+      cancelled: () => true,
+    });
+    assert.deepEqual(result, { verdict: "cancelled", pids: null, attempts: 0 });
+    assert.equal(captures, 0);
   });
 });
 

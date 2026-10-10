@@ -125,30 +125,27 @@ describe("gateway supervisor wiring (source pins)", () => {
   });
 
   // Liveness recovery must resolve the incumbent from a SOCKET-INDEPENDENT
-  // source before giving up: a draining gateway releases its socket while still
-  // holding gateway.lock, so the socket snapshot can never name it. The helper
-  // retries the snapshot for a transient gap, then falls back to the CLI's
-  // lock-holder probe, and surfaces the terminal error only when THAT is
-  // indeterminate ("unverified").
-  it("reconnectOrRespawnAdoptedGateway resolves the incumbent via the lock before giving up", () => {
+  // source: a draining gateway releases its socket while still holding
+  // gateway.lock, so the socket snapshot can never name it. One snapshot, then
+  // the CLI's lock-holder probe; while the incumbent stays unnameable the whole
+  // capture is retried on a capped backoff instead of ending on the terminal
+  // dialog.
+  it("reconnectOrRespawnAdoptedGateway keeps recovering while the incumbent is unnameable", () => {
     const body = fnBody("reconnectOrRespawnAdoptedGateway");
     assert.match(
       body,
-      /snapshotIncumbentForRespawn\(/,
-      "liveness recovery must retry the incumbent snapshot, not refuse on the first miss",
+      /recoverIncumbentWithBackoff\(\{\s*capture: \(\) => snapshotIncumbentForRespawn\(/,
+      "the incumbent capture must run inside the backoff loop",
     );
-    // The socket-independent lock-holder probe MUST be injected: the socket
-    // snapshot can never see a draining gateway, so a lock-file identity is
-    // required.
     assert.match(
       body,
       /lockHolderProbe:\s*\(\)\s*=>\s*probeLockHolderPid\(\)/,
       "liveness recovery must fall back to the socket-independent lock-holder probe",
     );
-    assert.match(
+    assert.doesNotMatch(
       body,
-      /capture\.verdict === "unverified"[\s\S]*?showUnrecoverableGatewayError/,
-      "the terminal dialog must be gated on the indeterminate 'unverified' verdict only",
+      /verdict === "unverified"[\s\S]*?showUnrecoverableGatewayError\(window, PORT, \{ probeFailed: true \}\)/,
+      "an unnameable incumbent must not end liveness recovery on the terminal dialog",
     );
     // A captured PID still drives waitForIncumbentExit so the lock is released
     // before spawning; a "released" lock means nothing to wait on.
@@ -183,14 +180,19 @@ describe("gateway supervisor wiring (source pins)", () => {
     );
   });
 
-  // The adopt-time drain path carries the exact
-  // same transient refusal and must route through the same retry+lock fallback.
-  it("the drain path resolves the incumbent via the lock before refusing with probe-failed", () => {
+  // The adopt-time drain path has the same race and the same backoff.
+  it("the drain path keeps recovering while the incumbent is unnameable", () => {
     assert.match(
       SUPERVISOR_JS,
-      /drainCapture = await snapshotIncumbentForRespawn\([\s\S]*?lockHolderProbe:\s*\(\)\s*=>\s*probeLockHolderPid\(\)[\s\S]*?drainCapture\.verdict === "unverified"[\s\S]*?return "probe-failed"/,
-      "the drain branch must retry the snapshot AND fall back to the lock-holder probe, not refuse on the first miss",
+      /drainCapture = await recoverIncumbentWithBackoff\(\{\s*capture: \(\) => snapshotIncumbentForRespawn\([\s\S]*?lockHolderProbe:\s*\(\)\s*=>\s*probeLockHolderPid\(\)[\s\S]*?cancelled: \(\) => quitting\(\)/,
+      "the drain branch must retry the capture on the backoff, cancelled only by quitting",
     );
+    assert.doesNotMatch(SUPERVISOR_JS, /drainCapture\.verdict === "unverified"/, "the drain path must not refuse on an unnameable incumbent");
+  });
+
+  it("both backoff loops show the shared retry status on the splash", () => {
+    const uses = SUPERVISOR_JS.match(/onWaiting: \(\) => sendStatus\(INCUMBENT_RETRY_STATUS\)/g) || [];
+    assert.equal(uses.length, 2, "liveness and drain must both report the wait on the splash");
   });
 
   it("showLoadingThenConnect routes its initial reveal through the helper", () => {
