@@ -96,7 +96,7 @@ def test_server_requires_confirmation_does_not_match(patterns: tuple[str, ...]) 
     assert not governance.server_requires_confirmation("atlassian", patterns)
 
 
-def test_confirm_tool_patterns_unreadable_config_yields_none(monkeypatch) -> None:
+def test_confirm_tool_patterns_unreadable_config_is_unknown(monkeypatch) -> None:
     from kiro_crew.config import live, loader
 
     def _boom(*_a, **_k):
@@ -104,27 +104,73 @@ def test_confirm_tool_patterns_unreadable_config_yields_none(monkeypatch) -> Non
 
     monkeypatch.setattr(live, "snapshot", lambda: None)
     monkeypatch.setattr(loader.KiroCrewConfig, "load", classmethod(lambda cls, *a, **k: _boom()))
-    assert governance._confirm_tool_patterns() == ()
+    assert governance._confirm_tool_patterns() is None
+
+
+class _Cfg:
+    def __init__(self, hooks, degraded=frozenset(), base_unreadable=False) -> None:
+        self.hooks = hooks
+        self.degraded_sections = frozenset(degraded)
+        self._base_unreadable = base_unreadable
 
 
 @pytest.mark.parametrize(
     ("hooks", "expected"),
     [
+        (None, ()),
         ({}, ()),
         ({"confirm_tools": "@jira"}, ()),
         ({"confirm_tools": ["@jira", 3, None]}, ("@jira",)),
+        ("not-an-object", None),
     ],
 )
 def test_confirm_tool_patterns_reads_the_hooks_section(monkeypatch, hooks, expected) -> None:
     from kiro_crew.config import live
 
-    class _Cfg:
-        pass
-
-    cfg = _Cfg()
-    cfg.hooks = hooks  # type: ignore[attr-defined]
-    monkeypatch.setattr(live, "snapshot", lambda: cfg)
+    monkeypatch.setattr(live, "snapshot", lambda: _Cfg(hooks))
     assert governance._confirm_tool_patterns() == expected
+
+
+@pytest.mark.parametrize(
+    ("degraded", "base_unreadable"),
+    [({"*"}, False), ({"*", "*config.json"}, False), ({"hooks"}, False), (set(), True)],
+)
+def test_confirm_tool_patterns_degraded_load_is_unknown(
+    monkeypatch, degraded, base_unreadable
+) -> None:
+    from kiro_crew.config import live
+
+    cfg = _Cfg({}, degraded=degraded, base_unreadable=base_unreadable)
+    monkeypatch.setattr(live, "snapshot", lambda: cfg)
+    assert governance._confirm_tool_patterns() is None
+
+
+def test_confirm_tool_patterns_unrelated_degraded_section_still_reads(monkeypatch) -> None:
+    from kiro_crew.config import live
+
+    cfg = _Cfg({"confirm_tools": ["@jira"]}, degraded={"telegram"})
+    monkeypatch.setattr(live, "snapshot", lambda: cfg)
+    assert governance._confirm_tool_patterns() == ("@jira",)
+
+
+def test_trailing_comma_config_withholds_static_grants(tmp_path, monkeypatch) -> None:
+    """A config.json that does not parse loads as defaults with empty hooks.
+
+    Read as "no patterns" that would write the blanket grant a confirm list in
+    the broken file was there to withhold, so the chokepoint withholds it.
+    """
+    from kiro_crew.config import live, loader
+
+    home = tmp_path / "kirocrew-home"
+    home.mkdir()
+    monkeypatch.setenv("KIROCREW_HOME", str(home))
+    (home / "config.json").write_text('{"hooks": {"confirm_tools": ["@atlassian/*"]},}')
+    monkeypatch.setattr(live, "snapshot", lambda: None)
+    loaded = loader.KiroCrewConfig.load()
+    assert not (loaded.hooks or {}).get("confirm_tools")
+    assert governance._confirm_tool_patterns() is None
+    assert not governance.may_skip_gate_now("@atlassian")
+    assert not governance.may_skip_gate_now("@github")
 
 
 # ── the chokepoint every static grant writer calls ───────────────────────────
@@ -145,6 +191,47 @@ def test_chokepoint_withholds_a_named_server(monkeypatch) -> None:
     assert not governance.may_skip_gate_now("@atlassian")
     assert not governance.may_skip_gate_now("@atlassian/getJiraIssue")
     assert governance.may_skip_gate_now("@github")
+
+
+def test_chokepoint_withholds_every_server_when_the_list_is_unknown(monkeypatch) -> None:
+    monkeypatch.setattr(governance, "_confirm_tool_patterns", lambda: None)
+    assert not governance.may_skip_gate_now("@atlassian")
+    assert not governance.may_skip_gate_now("@github/create_issue")
+    assert not governance._operator_requires_confirmation("fs_read")
+
+
+@pytest.mark.parametrize("ref", ["*", "@*", "@atl*", "@*/create*", "?", "[@]*"])
+def test_chokepoint_withholds_wildcard_grants_that_cover_mcp(monkeypatch, ref) -> None:
+    _patterns(monkeypatch, ("@atlassian/create*",))
+    assert governance._operator_requires_confirmation(ref)
+    assert not governance.may_skip_gate_now(ref)
+
+
+@pytest.mark.parametrize("ref", ["*", "@*", "@atl*"])
+def test_wildcard_grants_unchanged_without_confirm_tools(monkeypatch, ref) -> None:
+    _patterns(monkeypatch, ())
+    assert not governance._operator_requires_confirmation(ref)
+
+
+@pytest.mark.parametrize("ref", ["fs_*", "web_fetch", "@", ""])
+def test_refs_that_cover_no_mcp_call_are_left_alone(monkeypatch, ref) -> None:
+    _patterns(monkeypatch, ("*",))
+    assert not governance._operator_requires_confirmation(ref)
+
+
+def test_wildcard_grant_withheld_when_the_list_is_unknown(monkeypatch) -> None:
+    monkeypatch.setattr(governance, "_confirm_tool_patterns", lambda: None)
+    assert governance._operator_requires_confirmation("*")
+    assert not governance._operator_requires_confirmation("fs_*")
+
+
+def test_agent_config_sanitize_drops_a_star_grant(monkeypatch) -> None:
+    """``allowedTools: ["*"]`` would auto-approve the confirmed calls outright."""
+    _patterns(monkeypatch, ("@atlassian/create*",))
+    cfg: dict = {"allowedTools": ["*", "fs_read", "@github"]}
+    governance.sanitize_agent_config_governance(cfg, audit=False)
+    assert "*" not in cfg["allowedTools"]
+    assert "@github" in cfg["allowedTools"]
 
 
 def test_chokepoint_leaves_builtins_alone(monkeypatch) -> None:

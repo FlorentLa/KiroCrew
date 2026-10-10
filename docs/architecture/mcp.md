@@ -370,6 +370,22 @@ writer runs, so a grant already in `kirocrew.json` is withdrawn at the next
 rebuild (a gateway restart) or the next dashboard enable of that server. With the
 key unset, both the spec and the gate behave as before.
 
+When the list cannot be known, the writer treats it as naming every server and
+withholds every static MCP grant. That covers a read that raises, a load that
+stood in defaults for an unparseable `config.json` (a trailing comma, for
+example), and a `hooks` section that is not an object. The defaults carry no
+patterns, so reading them as an empty list would write the grant the broken file
+was there to withhold. The loader keeps a whole-file degradation flagged for the
+life of the process, so grants come back at the first rebuild after a gateway
+restart on a repaired file. Meanwhile each call asks.
+
+A grant ref is a pattern too. A ref with a wildcard in its server segment, such
+as `*`, `@*` or `@ser*`, covers servers the writer cannot list. While any
+`confirm_tools` pattern is set (or the list cannot be read), every writer
+withholds that ref, so the agent gets no namespace-wide `allowedTools` entry.
+Refs that cannot begin with `@`, such as `fs_*`, cover no MCP call and are left
+to the builtin floor.
+
 ### Two writers, one lock
 
 `~/.kiro/agents/kirocrew.json` has two independent writers: this whole-file

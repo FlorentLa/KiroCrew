@@ -4603,22 +4603,38 @@ def strip_ungoverned_auto_approve(
     return out
 
 
-def _confirm_tool_patterns() -> tuple[str, ...]:
+def _confirm_tool_patterns() -> tuple[str, ...] | None:
     """The operator's ``hooks.confirm_tools`` patterns from ``config.json``.
 
-    An unreadable config yields no patterns, which is the behaviour of an
-    operator who never set the key: the list only ever withholds a grant, so
-    reading nothing cannot widen one.
+    ``None`` means the list cannot be known: the read raised, the load stood in
+    defaults for an unparseable ``config.json`` (whole-config degradation or an
+    unreadable base file), or the ``hooks`` section is present but not an
+    object. An unknown list is not an empty one -- the defaults it would read as
+    carry no patterns, so a static grant written from them would hide calls the
+    operator asked to confirm -- and the caller withholds every grant instead.
+    ``()`` means the settings were read and name no pattern.
     """
     try:
         from kiro_crew.config import live
         from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.config.resolution import DEGRADED_WHOLE_CONFIG
 
-        hooks = (live.snapshot() or KiroCrewConfig.load()).hooks
-        raw = hooks.get("confirm_tools") if isinstance(hooks, dict) else None
+        cfg = live.snapshot() or KiroCrewConfig.load()
+        degraded: frozenset[str] = getattr(cfg, "degraded_sections", frozenset())
+        if DEGRADED_WHOLE_CONFIG in degraded or "hooks" in degraded:
+            return None
+        if getattr(cfg, "_base_unreadable", False):
+            return None
+        hooks = cfg.hooks
     except Exception:  # noqa: BLE001 — a config read must not break a writer
-        logger.debug("hooks.confirm_tools unreadable; no confirm patterns", exc_info=True)
+        logger.warning("hooks.confirm_tools unreadable; withholding static MCP grants")
+        logger.debug("hooks.confirm_tools read failed", exc_info=True)
+        return None
+    if hooks is None:
         return ()
+    if not isinstance(hooks, dict):
+        return None
+    raw = hooks.get("confirm_tools")
     if not isinstance(raw, list):
         return ()
     return tuple(p for p in raw if isinstance(p, str))
@@ -4658,11 +4674,34 @@ def server_requires_confirmation(server: str, patterns: Sequence[str]) -> bool:
 
 
 def _operator_requires_confirmation(ref: str) -> bool:
-    """Whether ``hooks.confirm_tools`` names the MCP server ``ref`` grants."""
-    if not ref.startswith("@"):
+    """Whether ``hooks.confirm_tools`` names, or may name, the MCP server ``ref`` grants.
+
+    A list that cannot be read counts as naming every server, so the grant is
+    withheld and the gate settles each call.
+
+    A grant ref is itself a pattern: ``*`` or ``@*`` covers every MCP call, and
+    ``@ser*`` covers every server whose name starts ``ser``. Such a ref is
+    withheld whenever any confirm pattern is listed, since the servers it covers
+    are not known here. A ref without a wildcard in its server segment is judged
+    for that one server. A ref whose literal prefix cannot begin with ``@`` (a
+    builtin such as ``fs_*``) covers no MCP call.
+    """
+    if not isinstance(ref, str):
         return False
-    server = ref[1:].partition("/")[0]
-    return bool(server) and server_requires_confirmation(server, _confirm_tool_patterns())
+    cut = min((i for i, ch in enumerate(ref) if ch in "*?["), default=-1)
+    literal = ref if cut < 0 else ref[:cut]
+    if not literal.startswith("@") and literal != "":
+        return False
+    server, sep, _ = literal[1:].partition("/")
+    names_one_server = literal.startswith("@") and bool(server) and (sep or cut < 0)
+    if not names_one_server and cut < 0:
+        return False
+    patterns = _confirm_tool_patterns()
+    if patterns is None:
+        return True
+    if not names_one_server:
+        return bool(patterns)
+    return server_requires_confirmation(server, patterns)
 
 
 def may_skip_gate_now(ref: str) -> bool:
