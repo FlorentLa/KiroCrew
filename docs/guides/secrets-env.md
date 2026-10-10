@@ -46,6 +46,7 @@ the server (this adds it to `mcp_gateway.stub_servers`). For the servers the
 default agent mounts (from either `mcp.json` above), an unrouted server with a
 `secret://` value is not started at all, and a warning names the env key —
 rather than starting it with the literal `secret://` text as its credential.
+Routing takes effect at the next gateway start, as any routing change does.
 An agent file you maintain by hand under `~/.kiro/agents/` is launched as
 written, so route any server it declares with a `secret://` value.
 

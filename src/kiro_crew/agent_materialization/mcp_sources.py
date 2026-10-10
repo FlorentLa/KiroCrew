@@ -33,6 +33,7 @@ from kiro_crew.mcp_cleanup import (
 from kiro_crew.mcp_gateway.secret_uri import secret_reference_keys
 from kiro_crew.mcp_provenance import (
     DERIVED_KEY,
+    WITHHELD_KEY,
     command_is_ours,
     record_derived,
     recorded_source,
@@ -418,14 +419,6 @@ def merge_mcp_sources(config: dict) -> McpSources:
     return McpSources(kirocrew_mcp, shared_mcp, extra_shared_mcp, managed_names)
 
 
-#: Rebuild-owned record that THIS rebuild wrote ``disabled: true`` onto an
-#: agent-only entry because its env holds a ``secret://`` reference nothing will
-#: resolve. It is what lets the next pass lift exactly that mute and no
-#: ``disabled`` the user wrote. The ``x-`` namespace never collides with a kiro-cli
-#: field (see ``mcp_provenance.MARKER_KEY``).
-WITHHELD_KEY = "x-kirocrew-withheld"
-
-
 def _mute_withheld(entry: dict) -> dict:
     """*entry* muted in place, with the record that this rebuild muted it.
 
@@ -434,7 +427,7 @@ def _mute_withheld(entry: dict) -> dict:
     it with the literal reference. A user-written ``disabled`` is left as found
     and gains no record, so it is never lifted.
     """
-    if entry.get("disabled") is True and WITHHELD_KEY not in entry:
+    if mcp_entry_is_muted(entry) and WITHHELD_KEY not in entry:
         return entry
     muted = dict(entry)
     muted["disabled"] = True
@@ -463,7 +456,11 @@ def _gateway_routed_names() -> frozenset[str]:
         # Deferred: the config loader is heavy and only a server that carries a
         # ``secret://`` reference needs it, so most rebuilds never import it here.
         from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.mcp_gateway import is_gateway_supported
 
+        if not is_gateway_supported():
+            # No gateway runs here, so nothing listed is ever served by one.
+            return frozenset()
         return frozenset(KiroCrewConfig.load().mcp_gateway.stub_servers)
     except Exception:  # noqa: BLE001 -- any failure means "cannot prove routed"
         agent_mod.logger.warning(
@@ -501,7 +498,13 @@ def _unrouted_secret_reference(
         return False
     alias = mcp_server_alias(name)
     routed_names = routed()
-    if name in routed_names or alias in routed_names:
+    # A rebuilt key is the alias of the routed raw name, so compare both sides as
+    # aliases as well as by the exact name.
+    if (
+        name in routed_names
+        or alias in routed_names
+        or alias in {mcp_server_alias(r) for r in routed_names}
+    ):
         return False
     if alias in app_owned():
         return False
@@ -749,20 +752,14 @@ def resolve_mcp_servers(
                 chosen = cand
                 break
 
-        if resolved and _unrouted_secret_reference(name, chosen, _routed, _app_owned):
-            if _scope_owned:
-                # A command resolved, but the session would launch this server with
-                # a ``secret://`` value it cannot resolve. The scope file still holds
-                # the declaration, so the server is withheld exactly like an
-                # unresolved command: the refs stay, and the pass after the server
-                # is routed through the gateway emits it again.
-                _unresolved_this_pass.add(name)
-                continue
-            # This file is the only copy of an agent-only declaration, so it is kept
-            # and muted in place rather than dropped; see _mute_withheld.
-            _mute_here = True
-        else:
-            _mute_here = False
+        # Kept and muted in place rather than dropped, whichever file declares
+        # it: the entry this rebuild writes carries the user's spec-only fields
+        # (``disabledTools``, ``autoApprove``), and an agent-only declaration has
+        # no other copy. The mute lifts on the first pass after the server is
+        # routed; see _mute_withheld.
+        _mute_here = bool(resolved) and _unrouted_secret_reference(
+            name, chosen, _routed, _app_owned
+        )
         if resolved:
             # Start from the merged winner so user-set NON-command fields
             # (autoApprove, disabled, ...) are preserved.  When we fall back to
@@ -1002,7 +999,9 @@ def sync_shared_server_refs(config: dict, sources: McpSources, mounted: dict[str
                 ),
             )
         )
-        if muted_here or alias in _disabled_mounted_aliases:
+        rendered_entry = valid_servers.get(alias)
+        withheld_here = isinstance(rendered_entry, dict) and WITHHELD_KEY in rendered_entry
+        if muted_here or withheld_here or alias in _disabled_mounted_aliases:
             # The rendered entry says ``true`` whenever the server is muted --
             # over a merged ``false`` from a higher-priority scope as much as over
             # a raw ``null``/``0``/``"false"``. The file kiro-cli parses must

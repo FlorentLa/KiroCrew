@@ -642,12 +642,16 @@ That gateway spawn is the **only** resolver. Every other path that would start
 the server runs where the vault cannot be read, so each now reaches that spawn
 or refuses rather than hand the server the literal reference: the agent-spec
 rebuild withholds a stdio server that carries a reference and is not routed
-through the gateway (`mcp_gateway.stub_servers`), keeping its tool refs as it
-does for an unresolved command; the overlay rewriter gives a routed server
+through the gateway (`mcp_gateway.stub_servers`, on a host that runs the
+gateway), writing it `disabled` in place so its declaration and spec-only
+fields survive until it is routed; the overlay rewriter gives a routed server
 (agent-declared or from the Kiro global `~/.kiro/settings/mcp.json`) whose env would be withheld from a
 shared backend a connection-private backend instead of leaving it unwrapped; and
 the stub's direct-exec fallback exits instead of exec'ing. Each names only the
-env-var key, never the secret's name or value. Out of scope: an app-registered
+env-var key, never the secret's name or value. A routed server that carries a
+reference stays wrapped even when its command does not resolve on the gateway
+search path or its launch is not approved: the gateway then refuses it, so the
+session never launches the spec's own entry. Out of scope: an app-registered
 server (whether an app may name a vault secret is a separate decision) and a
 hand-written agent file that Kiro Crew does not rebuild.
 
