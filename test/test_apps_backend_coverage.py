@@ -2233,8 +2233,8 @@ class TestARefusedStopRestoresTheProvenanceRecord:
         assert restored.get("spawn_instance") == self.ROW["spawn_instance"]
         assert not restored.get("revoked"), "the restored row must not carry the stamp"
         assert not restored.get("tombstone")
-        # The row is back and un-revoked, so adoption no longer refuses it for the
-        # ``revoked`` reason — the lost-recovery defect this guards against is gone.
+        # The restored row carries no stamp, so adoption does not refuse it for the
+        # ``revoked`` reason.
         _, reason = bmod._adoption_provenance("upd", [self.ROW["pid"]])
         assert "revoked" not in reason
 
@@ -2254,6 +2254,24 @@ class TestARefusedStopRestoresTheProvenanceRecord:
         assert (
             live is not None and live.get("pid") == successor["pid"]
         ), "a successor's real spawn row must be left untouched"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file mode bits")
+    def test_the_pidfile_lock_sidecar_is_owner_only(self) -> None:
+        """A fresh boot must not leave the interprocess lock sidecar readable by
+        other users: it lives in the owner-only data home, so it is created 0o600,
+        with no group or other bits set."""
+
+        import stat
+
+        prior_umask = os.umask(0o022)
+        try:
+            with bmod._pidfile_lock:
+                lock = bmod._pidfile_lock._lock_path()
+                assert lock.exists(), "the lock sidecar is created on acquisition"
+                mode = stat.S_IMODE(lock.stat().st_mode)
+                assert mode & 0o077 == 0, f"lock sidecar is group/other-accessible: {oct(mode)}"
+        finally:
+            os.umask(prior_umask)
 
     def test_revoke_backend_provenance_is_idempotent_on_an_already_revoked_row(
         self,

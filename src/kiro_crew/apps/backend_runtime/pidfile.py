@@ -82,7 +82,11 @@ class _PidfileGuard:
         try:
             path = self._lock_path()
             path.parent.mkdir(parents=True, exist_ok=True)
-            self._flock_fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+            # 0o600: this sidecar lives in the owner-only data home, so a
+            # fresh boot must not leave it readable by other users. The pidfile
+            # itself is already owner-only (atomic_write defaults a data-home
+            # target to 0o600); the lock takes the same restriction.
+            self._flock_fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
             cm = platform_compat.file_lock(self._flock_fd, exclusive=True)
             cm.__enter__()
             self._flock_cm = cm

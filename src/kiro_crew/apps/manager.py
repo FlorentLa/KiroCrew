@@ -3153,9 +3153,7 @@ def register_external_app(
     # Same holding back as ``update_app`` for added api/events entries. A first
     # registration approves what it declares: there is no earlier approval to
     # widen, as with an install.
-    new_permissions = (
-        manifest_data.get("permissions") if isinstance(manifest_data, dict) else None
-    )
+    new_permissions = manifest_data.get("permissions") if isinstance(manifest_data, dict) else None
     prior_grants = _read_approved_grants(name) if existing else None
     prior_grants_present = _approved_grants_path(name).is_file() if existing else False
     approved_grants: dict[str, list[str]] | None
