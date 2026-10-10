@@ -72,7 +72,11 @@ def _handle(begun: list, accept: bool = True) -> AcpSessionHandle:
 
     handle = AcpSessionHandle.__new__(AcpSessionHandle)
     handle._session_id = "s1"
-    handle._runtime = SimpleNamespace(begin_mcp_reattempt=begin, begin_mcp_sign_in=lambda *_: False)
+    handle._runtime = SimpleNamespace(
+        begin_mcp_reattempt=begin,
+        begin_mcp_sign_in=lambda *_: False,
+        reattempts_mcp_servers=True,
+    )
     handle._mcp_sign_in_needed = set()
     handle._mcp_sign_in_completed = set()
     handle._mcp_sign_in_last_offered = ""
@@ -342,3 +346,24 @@ def test_a_host_without_the_reset_names_the_server_at_once():
     handle._note_mcp_sign_in_status(frame, offer=False)
     handle._mcp_report.record_frame(frame, owned=True)
     assert handle._mcp_report.restart_to_load() == ["aws"]
+
+
+def test_a_kiro_cli_session_names_a_credential_failure_for_a_new_session():
+    from kiro_crew.acp.mcp_session_report import McpSessionReport
+
+    runtime = AcpRuntime()  # kiro-cli: no per-server reset
+    runtime._session_queues["s1"] = asyncio.Queue()
+    assert runtime.reattempts_mcp_servers is False
+    handle = _handle([])
+    handle._runtime = runtime
+    handle._mcp_report = McpSessionReport()
+    frame = _status(_failed())
+    handle._note_mcp_sign_in_status(frame, offer=False)
+    handle._mcp_report.record_frame(frame, owned=True)
+    handle._reattempt_failed_mcp_servers()
+    assert handle._mcp_reattempt_counts == {}
+    assert handle._mcp_report.restart_to_load() == ["aws"]
+
+
+def test_a_kas_runtime_reattempts():
+    assert _runtime().reattempts_mcp_servers is True

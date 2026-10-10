@@ -746,7 +746,7 @@ class TestRestartToLoad:
         assert payload is not None
         assert payload["restart_to_load"] == ["aws-mcp"]
         summary = r.problem_summary(include_reasons=False)
-        assert "start a new session to load it once the credential works): aws-mcp" in summary
+        assert "once the credential works, start a new session to load it): aws-mcp" in summary
         assert "No AWS credentials" not in summary
 
     def test_the_hint_clears_once_the_server_connects(self):

@@ -812,8 +812,8 @@ class McpSessionReport:
         restart = self.restart_to_load()
         if restart:
             parts.append(
-                "failed with what looks like a missing or rejected credential (start a new "
-                "session to load it once the credential works): " + _joined(restart)
+                "missing a credential, or its credential was rejected (once the credential "
+                "works, start a new session to load it): " + _joined(restart)
             )
         if self._awaiting_auth:
             parts.append("awaiting authorization: " + _joined(list(self._awaiting_auth)))
