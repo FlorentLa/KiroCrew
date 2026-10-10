@@ -2363,6 +2363,25 @@ per-sub-agent completion note. Dashboard chat only.
   drain) keeps the count. A `held` or `unknown` answer, as for a user message
   drained while a child is still out, leaves the count alone, so that batch
   keeps its synthesis.
+- **Claims, not proof** — `SUBAGENT_SYNTHESIS_PROMPT` tells the parent that a
+  completion event is the sub-agent's self-report and to check any claimed file
+  change, commit or build on disk before reporting it as done. Separately, a
+  sub-agent whose spec declares `"tools": []` (`kirocrew-lite`,
+  `kirocrew-knowledge`, a user's reasoning-only spec) is flagged where the caller
+  reads it, when the configured `agent.acp_backend` enforces that declaration
+  (`SessionCapabilities.honors_zero_tool_ban`, the question the knowledge pool
+  asks): `spawn_run` appends one `⚠ Agent '<name>' declares no tools…` line per
+  such agent to its dispatch reply, and `spawn_sub_agents` adds an `unverified`
+  field to each completed record from one (`mcp_tools/spawn.NO_TOOLS_AGENT_NOTE`,
+  `_declares_no_tools`, which asks `agent_sdk.drivers.acp.agent_spec_declares_no_tools`;
+  that reads the spec through `acp.session_mcp.agent_spec_snapshot`, the read the
+  session projection uses). The note asks the caller to check reported changes on
+  disk; it does not tell it to redo them. On a backend that does not enforce the
+  declaration no note is attached, since the sub-agent may really hold its
+  harness's own tools. The dispatch is never refused: whether a task needs writes
+  is not decidable from its prose, and these agents are correct for pure
+  reasoning. An unreadable spec or config, or a missing `tools` key, attaches no
+  note.
 - **Per-result turns kept** — each completion is still processed in its own turn
   (no raw buffering) to avoid a context-window blowup; the synthesis works over
   the already-condensed per-result turns.

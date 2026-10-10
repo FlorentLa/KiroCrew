@@ -2011,8 +2011,11 @@ SUBAGENT_SYNTHESIS_PROMPT = (
     "processed above. Produce a single consolidated synthesis as your reply for the user: "
     "(1) restate the original goal you spawned the sub-agents for, (2) synthesize the combined "
     "findings across all of them (do not just repeat each result in turn), and (3) give concrete "
-    "recommended next actions or decisions. This is the user-facing deliverable — keep it clear "
-    "and actionable."
+    "recommended next actions or decisions. A completion event is the sub-agent's own claim, not "
+    "proof: before you report a file change, commit, build or other on-disk result as done, "
+    "check it yourself (for example git status, the file itself, or git rev-parse for a claimed "
+    "commit) and report what is actually there, including any claimed work you did not find. "
+    "This is the user-facing deliverable — keep it clear and actionable."
 )
 # Synthetic continuation injected after a recoverable tool refusal (host-gate
 # policy deny or the read-only bash gate) ended a turn early. Carries the

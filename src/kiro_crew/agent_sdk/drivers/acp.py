@@ -218,6 +218,26 @@ def derived_agent_permissions(allowed_tools: object, agent_filename: str) -> dic
     return derived if derived is not None else {"rules": []}
 
 
+def agent_spec_declares_no_tools(agent: str, work_dir: str | None = None) -> bool:
+    """Does the spec *agent* resolves to declare an explicit empty ``tools`` list?
+
+    Reads through ``acp.session_mcp.agent_spec_snapshot``, the read the session
+    projection uses (project checkout first when *work_dir* is given), so the
+    answer matches the tool surface a session for *agent* is started with. A
+    missing or non-list ``tools``, an absent spec and an empty *agent* answer
+    False. Blocking (reads the spec); a read error propagates to the caller.
+    """
+    if not agent:
+        return False
+    from kiro_crew.acp.session_mcp import agent_spec_snapshot
+
+    spec = agent_spec_snapshot(agent, work_dir=work_dir or None)
+    if not isinstance(spec, dict):
+        return False
+    tools = spec.get("tools")
+    return isinstance(tools, list) and not tools
+
+
 def agent_spec_mcp_refs(agent: str) -> tuple[bool, list[tuple[str, list[str], bool]]]:
     """Per selectable backend: which of *agent*'s ``@server`` refs resolve to nothing.
 

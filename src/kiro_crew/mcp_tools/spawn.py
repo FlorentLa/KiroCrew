@@ -685,6 +685,64 @@ def _is_unknown_agent_refusal(resp: Mapping[str, Any], agent: str) -> bool:
     )
 
 
+#: What a caller is told about a sub-agent whose spec declares ``"tools": []``
+#: on a backend that enforces that declaration. Such an agent (``kirocrew-lite``,
+#: ``kirocrew-knowledge``, a user's own reasoning-only spec) has no way to write a
+#: file, run a command or make a commit, yet it still answers a task that asks
+#: for one, typically by narrating the steps as though it had taken them. The
+#: dispatch is not refused, because whether a task needs writes is not decidable
+#: from its prose and these agents are the right choice for pure reasoning; the
+#: caller is told instead, at dispatch and beside the result, to treat any
+#: reported change as a claim and check it.
+NO_TOOLS_AGENT_NOTE = (
+    'declares no tools ("tools": []), so it is not expected to write files, run '
+    "commands or make commits. Treat any file change, command output or commit it "
+    "reports as a claim: check it on disk before relying on it."
+)
+
+
+def _backend_enforces_no_tools() -> bool:
+    """Does the configured ``agent.acp_backend`` enforce a ``"tools": []`` spec?
+
+    Asked through ``SessionCapabilities.honors_zero_tool_ban``, the same question
+    the knowledge pool asks before it trusts a zero-tool worker. On a backend that
+    answers False the spec is not enforced, the sub-agent may really have its
+    harness's own tools, and saying it cannot write would mislabel real work.
+    Fails closed to False: a config that cannot be read attaches no note.
+    """
+    try:
+        from kiro_crew.agent_sdk.backends import resolve_selected_backend
+        from kiro_crew.agent_sdk.capabilities import capabilities_for
+
+        backend = resolve_selected_backend(KiroCrewConfig.load().agent.acp_backend)
+        return capabilities_for(backend).honors_zero_tool_ban
+    except Exception:
+        logger.debug("acp backend unreadable; no tool-capability note", exc_info=True)
+        return False
+
+
+def _declares_no_tools(agent: str, cwd: str = "") -> bool:
+    """True when *agent*'s spec declares ``"tools": []`` and the backend enforces it.
+
+    The spec question goes through the agent SDK's driver
+    (``agent_sdk.drivers.acp.agent_spec_declares_no_tools``), which reads the spec
+    the session projection reads, project checkout first when *cwd* is given; an
+    empty *agent* (the host default, which carries tools) answers False there.
+    Fails quiet: an unreadable spec, a missing or non-list ``tools``, a backend
+    that does not enforce the declaration, or any read error answers False, so
+    the note is never attached on a guess.
+    """
+    try:
+        from kiro_crew.agent_sdk.drivers.acp import agent_spec_declares_no_tools
+
+        if not agent_spec_declares_no_tools(agent, cwd or None):
+            return False
+    except Exception:
+        logger.debug("spec for %r unreadable; no tool-capability note", agent, exc_info=True)
+        return False
+    return _backend_enforces_no_tools()
+
+
 def _collapse_effort_verdicts(
     pairs: list[tuple[str, tuple[str, str]]],
 ) -> list[tuple[str, tuple[str, str]]]:
@@ -983,6 +1041,9 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
                 label = f"{aid} ({a})" if a else aid
                 note = "" if queued_reasons[aid] == head_reason else f" [{queued_reasons[aid]}]"
                 spawn_lines.append(f"  {label}: {t[:80]}{note}")
+        no_tools = [a for a in dict.fromkeys(agent_names) if _declares_no_tools(a, cwd)]
+        for a in no_tools:
+            spawn_lines.append(f"⚠ Agent {redact(a)!r} {NO_TOOLS_AGENT_NOTE}")
         if keep:
             spawn_lines.append(
                 "These conversations have GUARANTEED continuability: after "
@@ -1619,15 +1680,14 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
             completed += 1
             _settled_ids.add(aid)
             result_text = _inline_result(aid, sa_st.get("result", ""))
-            sa_results.append(
-                json.dumps(
-                    {
-                        "agent": label,
-                        "status": "completed",
-                        "text": result_text,
-                    }
-                )
-            )
+            record: dict[str, Any] = {
+                "agent": label,
+                "status": "completed",
+                "text": result_text,
+            }
+            if _declares_no_tools(str(sa_st.get("agent") or ""), cwd):
+                record["unverified"] = f"This agent {NO_TOOLS_AGENT_NOTE}"
+            sa_results.append(json.dumps(record))
     if _unsettled:
         sa_results.append(
             json.dumps(
