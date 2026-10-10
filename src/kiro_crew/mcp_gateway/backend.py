@@ -47,6 +47,8 @@ from kiro_crew.json_line import (
 from kiro_crew.mcp_caller import (
     CALLER_CAPABILITY_KEY,
     CALLER_META_KEY,
+    INFLIGHT_CAPABILITY_KEY,
+    INFLIGHT_NOTIFICATION,
     TENANT_META_KEY,
     CallerContext,
     build_caller_meta,
@@ -243,6 +245,15 @@ PING_STALE_SECS = 150.0
 # that gap; the load-time clamp bounds how far.
 HARD_WEDGE_CEILING_SECS = float(SUBAGENT_TIMEOUT_SECS + 300)
 
+# The ceiling for a backend that REPORTS its in-flight progress
+# (``mcp_shared.INFLIGHT_CAPABILITY_KEY``): every call that legitimately runs
+# for a long time there is deferred and refreshes its own age every
+# ``INFLIGHT_REPORT_SECS``, so an age this old on such a backend is a call that
+# stopped progressing -- a worker call hung for a quarter of an hour, which no
+# shipped tool does on purpose (the longest synchronous one bounds itself at
+# 210s). Recycling then is the self-heal the 3h ceiling above cannot give.
+PROGRESS_WEDGE_CEILING_SECS = 900.0
+
 # Upper bound on a single stub's pending-delivery inbox. Backend->stub frames
 # are enqueued by the stdout pump without awaiting the stub's socket drain, so
 # a stub that has stopped reading must not let a chatty backend grow gateway
@@ -336,6 +347,34 @@ def _parse_initialize_response(response: dict[str, Any]) -> tuple[dict[str, Any]
     return result, supports_caller_identity
 
 
+def _reports_inflight(result: dict[str, Any]) -> bool:
+    """Whether a parsed ``initialize`` result advertises
+    ``mcp_shared.INFLIGHT_CAPABILITY_KEY`` under ``capabilities.experimental``."""
+    experimental = (result.get("capabilities") or {}).get("experimental") or {}
+    return isinstance(experimental, dict) and INFLIGHT_CAPABILITY_KEY in experimental
+
+
+def _inject_inflight_capability(msg: dict[str, Any]) -> dict[str, Any]:
+    """Return ``msg`` with ``capabilities.experimental[INFLIGHT_CAPABILITY_KEY]``
+    added to an ``initialize`` frame -- the gateway asking the backend to send
+    in-flight reports -- or ``msg`` unchanged when it is not a well-formed
+    initialize. Same copy discipline as :func:`_inject_client_extensions`."""
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return msg
+    out = dict(msg)
+    params = dict(params)
+    caps_raw = params.get("capabilities")
+    caps = dict(caps_raw) if isinstance(caps_raw, dict) else {}
+    exp_raw = caps.get("experimental")
+    experimental = dict(exp_raw) if isinstance(exp_raw, dict) else {}
+    experimental.setdefault(INFLIGHT_CAPABILITY_KEY, {})
+    caps["experimental"] = experimental
+    params["capabilities"] = caps
+    out["params"] = params
+    return out
+
+
 def _is_heartbeat_id(msg_id: Any) -> bool:
     """True if ``msg_id`` is the reserved heartbeat ping id (int or its
     string form, since some backends stringify response ids)."""
@@ -399,6 +438,11 @@ class _PendingRequest:
     original_id: Any
     method: str
     t_start_ms: float = 0.0
+    # Monotonic ms of the last in-flight report that named this request
+    # (``mcp_shared.INFLIGHT_NOTIFICATION``); 0 when never reported. The wedge
+    # detector ages a request from this rather than from ``t_start_ms``, so a
+    # parked call that keeps reporting never reads as hung.
+    t_progress_ms: float = 0.0
     # The request's ``params._meta.progressToken`` if it set one, so a
     # server-emitted ``notifications/progress`` can be routed back to the
     # owning stub instead of broadcast across co-pooled tenants.
@@ -914,6 +958,10 @@ class Backend:
     created_at: float
     last_used_at: float
     supports_caller_identity: bool = False
+    # The backend advertised ``mcp_shared.INFLIGHT_CAPABILITY_KEY``: it sends
+    # ``notifications/kirocrew/inflight`` for its parked calls, so the wedge
+    # detector holds it to PROGRESS_WEDGE_CEILING_SECS instead of the 3h ceiling.
+    reports_inflight: bool = False
     # True only when the spawn that produced this process was Kiro Crew's own
     # packaged control plane -- the resolved command and args matched what the
     # managed spec emits, not merely a reserved server NAME. It gates the one
@@ -1807,7 +1855,7 @@ class Backend:
         # MCP Apps: advertise the ui extension to the backend (no-op unless
         # the KIROCREW_MCP_APPS flag is on). Must follow the strip so the
         # injected frame is our copy, never the stub's.
-        forward_msg = _inject_client_extensions(forward_msg)
+        forward_msg = _inject_inflight_capability(_inject_client_extensions(forward_msg))
         self._upstream_init_frame = _without_id(forward_msg)
         forward_msg["id"] = fid
         self.touch()
@@ -1941,7 +1989,7 @@ class Backend:
             forward_msg = _strip_caller_meta(init_msg)
             # MCP Apps: same injection as _handle_initialize so a respawned
             # backend sees the identical ui capability (flag-gated no-op).
-            forward_msg = _inject_client_extensions(forward_msg)
+            forward_msg = _inject_inflight_capability(_inject_client_extensions(forward_msg))
             self._upstream_init_frame = _without_id(forward_msg)
             forward_msg["id"] = fid
             self.touch()
@@ -2715,6 +2763,12 @@ class Backend:
             await self._settle(pending, msg)
             return
         if method is not None and msg_id is None:
+            # Gateway-internal: the backend's in-flight report. Consumed here,
+            # never routed to a stub (it names gateway forward ids, which mean
+            # nothing to a stub and would read as an unattributable frame).
+            if method == INFLIGHT_NOTIFICATION:
+                self._apply_inflight_report(msg)
+                return
             # Subscription-scoped: ``notifications/resources/updated`` carries
             # no request id, so it is attributed by URI — delivered to every
             # stub subscribed to that URI and only those. This arm is
@@ -2968,6 +3022,7 @@ class Backend:
         except ValueError as exc:
             await self._fail_init(str(exc))
             return
+        self.reports_inflight = _reports_inflight(result)
         self._init_result = result
         self._init_state = "ready"
         self._init_done_event.set()
@@ -3838,6 +3893,20 @@ class Backend:
             return set()
         return set(self._resource_subscriptions.get(uri, ()))
 
+    def _apply_inflight_report(self, msg: dict[str, Any]) -> None:
+        """Refresh ``t_progress_ms`` on every pending request the backend's
+        in-flight report names. Unknown ids (already answered) are ignored;
+        a malformed report refreshes nothing."""
+        params = msg.get("params")
+        ids = params.get("requestIds") if isinstance(params, dict) else None
+        if not isinstance(ids, list):
+            return
+        now_ms = time.monotonic() * 1000.0
+        for rid in ids:
+            pending = self._pending_requests.get(str(rid))
+            if pending is not None:
+                pending.t_progress_ms = now_ms
+
     def _notification_owner(self, msg: dict[str, Any]) -> Optional[str]:
         """Best-effort attribution of a server->client notification to the one
         stub that owns the originating request, so a request-scoped
@@ -4287,7 +4356,9 @@ class Backend:
         oldest_fid: Optional[str] = None
         oldest_pending: Optional[_PendingRequest] = None
         for fid, pending in self._pending_requests.items():
-            age = now - (pending.t_start_ms / 1000.0)
+            # A request the backend reported as still progressing is aged from
+            # that report: a parked ``wait`` is old, not stuck.
+            age = now - (max(pending.t_start_ms, pending.t_progress_ms) / 1000.0)
             if age > oldest_age:
                 oldest_age = age
                 oldest_fid = fid
@@ -4297,11 +4368,16 @@ class Backend:
             ping_age = now - self._last_ping_response_mono
             ping_stale = ping_age >= PING_STALE_SECS
 
-            # Hard ceiling: recycle regardless of ping freshness (pathological)
-            if oldest_age >= HARD_WEDGE_CEILING_SECS:
+            # Hard ceiling: recycle regardless of ping freshness (pathological).
+            # A backend that reports progress has refreshed every healthy
+            # long call's age above, so it is held to the short ceiling.
+            ceiling = (
+                PROGRESS_WEDGE_CEILING_SECS if self.reports_inflight else HARD_WEDGE_CEILING_SECS
+            )
+            if oldest_age >= ceiling:
                 self._dead_reason = (
                     f"wedged: in-flight request outstanding {oldest_age:.1f}s "
-                    f">= {HARD_WEDGE_CEILING_SECS:.0f}s hard ceiling "
+                    f">= {ceiling:.0f}s hard ceiling "
                     f"(ping_age={ping_age:.1f}s)"
                 )
                 logger.warning(
@@ -4814,7 +4890,7 @@ async def send_initialize(
         "method": "initialize",
         "params": {
             "protocolVersion": "2024-11-05",
-            "capabilities": {},
+            "capabilities": {"experimental": {INFLIGHT_CAPABILITY_KEY: {}}},
             "clientInfo": dict(client_info or {"name": "kirocrew-gateway", "version": "0"}),
         },
     }
@@ -4842,6 +4918,7 @@ async def send_initialize(
         ) from exc
 
     result, backend.supports_caller_identity = _parse_initialize_response(response)
+    backend.reports_inflight = _reports_inflight(result)
     # Seed the init cache so a multi-stub flow can replay the result to
     # later attachers without re-issuing the handshake. Single-stub callers
     # (the M1 path) never observe this cache but the tests that drive the

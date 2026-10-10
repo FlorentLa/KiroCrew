@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
 from kiro_crew import mcp_core
-from kiro_crew.mcp_shared import call_tool_with_logging
+from kiro_crew.mcp_shared import DeferredTool, call_tool_with_logging, drive_deferred
 from kiro_crew.mcp_tool_titles import with_titles
 from kiro_crew.mcp_tools.dashboard_client import (
     DashboardClient,
@@ -248,7 +248,7 @@ class ToolTable:
                 scoped = dataclasses.replace(scoped, caller_key=key)
             return tool.run(self.validate(name, valid), scoped)
 
-        return call_tool_with_logging(
+        result = call_tool_with_logging(
             name,
             args,
             self.validate,
@@ -256,3 +256,7 @@ class ToolTable:
             session_key=session_key,
             downstream_service=self.server,
         )
+        # A row's body returns text; the wrapper's type admits a DeferredTool
+        # because kirocrew-core's handlers may return one. Collapse it here so
+        # a row-based server keeps its blocking contract if a row ever does.
+        return drive_deferred(result) if isinstance(result, DeferredTool) else result

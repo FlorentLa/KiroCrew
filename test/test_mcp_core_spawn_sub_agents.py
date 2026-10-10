@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from unittest.mock import patch
 
 from kiro_crew.mcp_core import _call_tool
@@ -110,10 +111,10 @@ class TestSpawnSubAgents:
              patch.dict("os.environ", {"KIROCREW_SESSION_KEY": "s"}):
             mock_post.return_value = {"id": "a1"}
             mock_get.return_value = {"done": False, "agent": "slow"}
-            # Deadline now uses time.monotonic(): calls are
-            # (1) deadline init, (2) _next_ping init, (3) loop guard.
-            # Make the loop-guard value exceed the deadline to time out at once.
-            mock_time.monotonic.side_effect = [0, 0, 999999]
+            # The deadline is taken from the first monotonic() read; every later
+            # read is past it, so the wait expires on its first poll. Not a
+            # pinned call count: the parked wait reads the clock per step.
+            mock_time.monotonic.side_effect = itertools.chain([0], itertools.repeat(999999))
             mock_time.sleep = lambda _: None
 
             result = _call_tool("spawn_sub_agents", {
@@ -155,7 +156,7 @@ class TestSpawnSubAgents:
                 "/api/spawn/p1": {"done": False, "awaiting_approval": True},
             }
             mock_get.side_effect = lambda path, *a, **k: by_id.get(path, {"done": False})
-            mock_time.monotonic.side_effect = [0, 0, 999999]
+            mock_time.monotonic.side_effect = itertools.chain([0], itertools.repeat(999999))
             mock_time.sleep = lambda _: None
 
             result = _call_tool(
@@ -179,9 +180,9 @@ class TestSpawnSubAgents:
              patch.dict("os.environ", {"KIROCREW_SESSION_KEY": "s"}):
             mock_post.return_value = {"id": "a1"}
             mock_get.return_value = {"done": True, "agent": "w", "result": "ok"}
-            # monotonic calls: deadline init(0), next_ping init(0), loop guard(10),
-            # keepalive check(70 >= 60 -> ping), next_ping reset(70).
-            mock_time.monotonic.side_effect = [0, 0, 10, 70, 70]
+            # The deadline and first keepalive (+60s) are taken from the first
+            # read; every later read is at 70s, so the first poll pings.
+            mock_time.monotonic.side_effect = itertools.chain([0], itertools.repeat(70))
             mock_time.sleep = lambda _: None
 
             _call_tool("spawn_sub_agents", {"agents": [{"prompt": "slow task"}], "solo_reason": "bulk_data"})
@@ -217,8 +218,8 @@ class TestSpawnSubAgents:
                                        "KIROCREW_SPAWN_SUB_AGENTS_MAX_WAIT": "120"}):
             mock_post.return_value = {"id": "a1"}
             mock_get.return_value = {"done": False, "agent": "slow"}
-            # deadline = 0 + 120 = 120; loop guard at 200 exceeds it -> time out.
-            mock_time.monotonic.side_effect = [0, 0, 200]
+            # deadline = 0 + 120 = 120; every later read (200) exceeds it -> time out.
+            mock_time.monotonic.side_effect = itertools.chain([0], itertools.repeat(200))
             mock_time.sleep = lambda _: None
 
             result = _call_tool("spawn_sub_agents", {"agents": [{"prompt": "t"}], "solo_reason": "bulk_data"})
@@ -519,7 +520,7 @@ class TestSpawnSubAgentsSummarization:
             mock_post.side_effect = _post_side
             mock_get.return_value = {"done": True, "agent": "w", "result": "ok"}
             # Trigger the ping branch (70 >= 60).
-            mock_time.monotonic.side_effect = [0, 0, 10, 70, 70]
+            mock_time.monotonic.side_effect = itertools.chain([0], itertools.repeat(70))
             mock_time.sleep = lambda _: None
 
             result = _call_tool("spawn_sub_agents", {"agents": [{"prompt": "task"}], "solo_reason": "bulk_data"})

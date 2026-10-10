@@ -1339,6 +1339,14 @@ class TestStdioLoopStrayFrames:
 # --- Caller-identity extension through the stdio loop -----------------------
 
 
+#: What the loop itself advertises under ``capabilities.experimental`` on every
+#: server, independent of the caller-identity opt-in: the in-flight report, on
+#: the POSIX path only (the Windows loop cannot send a frame mid-call).
+_LOOP_OWN_CAPABILITIES: dict = (
+    {mcp_shared.INFLIGHT_CAPABILITY_KEY: {}} if platform_compat.IS_POSIX else {}
+)
+
+
 def _initialize(req_id) -> dict:
     return {"jsonrpc": "2.0", "id": req_id, "method": "initialize", "params": {}}
 
@@ -1687,18 +1695,30 @@ class TestStdioLoopCallerIdentity:
             harness.send(_initialize(1))
             assert harness.wait_for(lambda: len(harness.responses) >= 1)
             caps = harness.responses[0][1]["capabilities"]
-            assert caps["experimental"] == {"kirocrew.caller-identity": {"schemaVersion": 1}}
+            # Exact pin: this dict is what gatewayd reads to decide pooling
+            # eligibility (caller identity) and the recycle ceiling (in-flight
+            # report), so an added or misspelled key must fail here.
+            assert caps["experimental"] == {
+                "kirocrew.caller-identity": {"schemaVersion": 1},
+                **_LOOP_OWN_CAPABILITIES,
+            }
         finally:
             harness.close()
 
     def test_initialize_omits_capability_by_default(self, monkeypatch):
         # kirocrew-cron does NOT consume per-call identity — it must stay
         # single-session (gatewayd refuses to pool non-advertising backends).
+        # The in-flight report is a property of the loop itself, so it is
+        # advertised regardless (POSIX, where the loop can send one mid-call).
         harness = _LoopHarness(monkeypatch, lambda n, a: "ok")
         try:
             harness.send(_initialize(1))
             assert harness.wait_for(lambda: len(harness.responses) >= 1)
-            assert "experimental" not in harness.responses[0][1]["capabilities"]
+            caps = harness.responses[0][1]["capabilities"]
+            if _LOOP_OWN_CAPABILITIES:
+                assert caps["experimental"] == _LOOP_OWN_CAPABILITIES
+            else:
+                assert "experimental" not in caps
         finally:
             harness.close()
 

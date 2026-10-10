@@ -4156,6 +4156,92 @@ knowledge-DB and config file signature and is shared safely across calls. Never
 key a cache, or any retained object, on caller identity, session, or "the last
 request I saw".
 
+### A tool that only waits returns a `DeferredTool`
+
+The stdio dispatch loop (`mcp_shared.run_mcp_stdio_loop`) runs **one worker
+thread per server**: the part of a call that computes runs there, one call at a
+time, while the loop keeps reading stdin to answer `ping`, honour
+`notifications/cancelled` and queue the next `tools/call`. A handler that spent
+its whole duration *waiting* on that worker -- `wait` sleeping up to 1800s,
+`spawn_sub_agents` polling for up to 7200s, `ask_question` long-polling until a
+person answers -- parked the worker and every other caller's call behind it. On
+the pooled `kirocrew-core` backend that is every dashboard session at once: one
+session's `wait` stalled everyone's `memory_recall` for minutes, and because the
+loop still answered pings the gateway's wedge detector saw a healthy backend and
+never recycled it (the 3-hour hard ceiling was the only exit). A worker pool
+would only move the threshold, from one parked call to N.
+
+So a handler that only has to wait does not hold the worker. It does its setup
+on the worker (validate, resolve identity, post the spawn or open the card) and
+returns a `mcp_shared.DeferredTool` instead of a string. The loop registers it
+and, from its own 100 ms tick, runs the deferred's short `step()` whenever its
+`due_at()` has passed; the call is answered by the step that returns text. A
+`step` is one loopback round-trip (a keepalive POST, one poll pass, one wait
+slice), never a sleep, and runs with the call's caller identity installed as the
+worker had it. Steps run on a small shared pool (`DEFERRED_STEP_WORKERS`), not
+the dispatch thread, so a step blocked on a stalled gateway delays other steps
+and nothing else. `notifications/cancelled` for a parked call drops it with no
+response and runs its `cancel()` hook (the countdown card is retired, the
+question card withdrawn); a cancel that lands mid-step discards that step's
+result. The SEL `completed`/`failed` row `call_tool_with_logging` writes for a
+blocking tool at return is written for a deferred one by the DRIVER, through
+`DeferredTool.on_settled`, after the dispatch thread has ruled out a cancel --
+never inside the settling `step()`, which runs on a pool thread and could
+otherwise write `completed` beside the `cancelled` row a concurrent cancel
+produces. A directive tool's `refuse_if_markerless` tag is applied to the
+settling text the same way, so neither path can tell the two shapes apart. The
+pool is `mcp_shared._StepPool`, not `ThreadPoolExecutor`: its threads are
+created up front, so `submit` only enqueues and cannot fail after queueing
+(`ThreadPoolExecutor` starts threads lazily inside `submit`, after the item is
+queued, and a start that fails there leaves an orphan an idle worker runs later
+-- for a deferred step, a call just answered with an error consuming an answer
+or a collect). The one place a thread start can fail is the pool's construction,
+where nothing is queued yet: that fails only the call that needed it, as a
+worker that cannot start does, and the pool is tried again on the next tick. A step queued for a thread longer than `DEFERRED_STEP_STUCK_SECS` is
+left out of the report like a step holding one that long: every worker is
+stuck, so the gateway must be allowed to see it. On a pruned-install exit, a step in flight
+is let finish (bounded by `DEFERRED_STEP_STUCK_SECS`) and its outcome delivered
+before the remaining parked calls get the retryable error, because a step can
+consume something a retry would repeat -- a card's answer, a collect pass's
+`mark-collected`; a step still queued at that point (every worker stuck) has its
+future cancelled first, so no worker runs it for a caller already told to retry;
+a cancel that LOSES to a worker claiming the step means the step is running, and
+it is then waited for and delivered like the others. However the loop ends --
+EOF, the pruned exit, an exception that escaped -- its `finally` cancels every
+still-queued future before the pool's shutdown sentinels queue behind them.
+Servicing one parked call and sending the report are each guarded like one
+message on the read loop: a failure answers that call (or costs one report) and
+the loop keeps serving. `_call_tool` (what a
+test, the CLI or a non-loop caller invokes) drives a deferred to completion
+inline with `drive_deferred`, and so does the synchronous Windows dispatch path,
+where no loop timer exists: from outside the POSIX loop a deferred tool is a
+blocking one.
+
+**The in-flight report.** A backend whose long calls are all deferred can prove
+they are healthy. When the client's `initialize` declared
+`mcp_caller.INFLIGHT_CAPABILITY_KEY` under `capabilities.experimental`, the loop
+sends `mcp_caller.INFLIGHT_NOTIFICATION` every `INFLIGHT_REPORT_SECS` (30s) while
+any call is parked, naming the parked request ids that are not stuck inside a
+step (`DEFERRED_STEP_STUCK_SECS`). The loop advertises the same key in its
+`initialize` result on POSIX only -- the Windows path cannot send a frame
+mid-call, and advertising there would have the gateway shorten a ceiling the
+backend cannot vouch for. The gateway asks for the report on every `initialize`
+it forwards (`_inject_inflight_capability`, beside the MCP Apps extension
+injection) and in its own prewarm `send_initialize`; `Backend._apply_inflight_report`
+consumes the frame off the backend's stdout (it names gateway forward ids, so it
+is never routed to a stub and never recorded as an unattributable notification)
+and stamps `_PendingRequest.t_progress_ms`. The wedge detector in
+`Backend._heartbeat_once` then ages each request from its last report rather than
+its start, so a parked `wait` is old but never slow, and a backend that advertised
+the report is held to `PROGRESS_WEDGE_CEILING_SECS` (900s) instead of
+`HARD_WEDGE_CEILING_SECS` (`SUBAGENT_TIMEOUT_SECS + 300`, about 3 hours): an age
+that old on a reporting backend is a worker call that stopped progressing, and no
+shipped synchronous tool runs that long on purpose (the longest, `pod_up`, bounds
+itself at 210s). A backend that never advertised -- an older install, the Windows
+loop -- keeps the long ceiling, because it cannot tell a parked call from a hung
+one. The client side is gated on the declaration because a direct kiro-cli or an
+older gateway never asked, and would at best drop the frame as unattributable.
+
 ### Checklist for a new tool
 
 - No module global holds per-call or per-session data.
@@ -4172,6 +4258,10 @@ request I saw".
 - Durable state lives behind a gateway endpoint keyed by session.
 - The tool behaves identically whether it is the only caller or one of many
   sharing the backend.
+- A tool that waits -- for a clock, for another process, for a person -- returns
+  a `mcp_shared.DeferredTool` from its handler and does the waiting in short
+  `step()`s. A synchronous handler bounds every call it makes well under
+  `PROGRESS_WEDGE_CEILING_SECS`, or the pooled backend is recycled under it.
 
 ## Troubleshooting
 

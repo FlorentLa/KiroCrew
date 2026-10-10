@@ -16,9 +16,17 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+from kiro_crew import mcp_shared
 from kiro_crew.mcp_tools import spawn as spawn_tools
 
 _DETAIL = "low memory: 2.2 GB available, need 2.5 GB (0.50 GB for this start)"
+
+
+def _settle(result: "str | mcp_shared.DeferredTool") -> str:
+    """The handler's text: a deferred wait is driven inline, as kiro-cli sees it."""
+    if isinstance(result, mcp_shared.DeferredTool):
+        return mcp_shared.drive_deferred(result, clock=spawn_tools.mcp_core.time)
+    return result
 
 
 def _run(answers: list[dict]) -> str:
@@ -136,16 +144,17 @@ class TestSpawnSubAgentsNamesTheDeferral:
             patch.object(spawn_tools.mcp_core, "_get", side_effect=_get),
             patch.object(spawn_tools.mcp_core, "time", _Time),
             patch.object(spawn_tools.mcp_core, "_resolve_session_key", return_value="chat-1"),
-            patch.object(spawn_tools, "_hold_for_parent_resume", return_value=None),
-            patch.object(spawn_tools, "is_tool_cancelled", return_value=False),
+            patch.object(spawn_tools._ResumeHold, "probe", return_value=(True, None)),
         ):
-            out = spawn_tools.spawn_sub_agents(
-                "spawn_sub_agents",
-                {
-                    "agents": [{"prompt": "summarize the log"}],
-                    "solo_reason": "bulk_data",
-                    "solo_details": "a large log only the summary of which is needed",
-                },
+            out = _settle(
+                spawn_tools.spawn_sub_agents(
+                    "spawn_sub_agents",
+                    {
+                        "agents": [{"prompt": "summarize the log"}],
+                        "solo_reason": "bulk_data",
+                        "solo_details": "a large log only the summary of which is needed",
+                    },
+                )
             )
         # Never marked collected: it has not run, so its completion must inject.
         assert not [c for c in post.call_args_list if c.args[0] == "/api/spawn/mark-collected"]
@@ -275,16 +284,17 @@ class TestSpawnSubAgentsWaitsOnlyForStartedWork:
             patch.object(spawn_tools.mcp_core, "_get", side_effect=_get),
             patch.object(spawn_tools.mcp_core, "time", _Time),
             patch.object(spawn_tools.mcp_core, "_resolve_session_key", return_value="chat-1"),
-            patch.object(spawn_tools, "_hold_for_parent_resume", return_value=None),
-            patch.object(spawn_tools, "is_tool_cancelled", return_value=False),
+            patch.object(spawn_tools._ResumeHold, "probe", return_value=(True, None)),
         ):
-            out = spawn_tools.spawn_sub_agents(
-                "spawn_sub_agents",
-                {
-                    "agents": [{"prompt": "a"}, {"prompt": "b"}, {"prompt": "q"}],
-                    "solo_reason": "bulk_data",
-                    "solo_details": "three independent summaries",
-                },
+            out = _settle(
+                spawn_tools.spawn_sub_agents(
+                    "spawn_sub_agents",
+                    {
+                        "agents": [{"prompt": "a"}, {"prompt": "b"}, {"prompt": "q"}],
+                        "solo_reason": "bulk_data",
+                        "solo_details": "three independent summaries",
+                    },
+                )
             )
         records = [json.loads(chunk) for chunk in out.split("\n\n")]
         assert [r["status"] for r in records if r.get("agent")] == ["completed", "completed"]
@@ -333,16 +343,17 @@ class TestSpawnSubAgentsWaitsOutACapacityQueue:
             patch.object(spawn_tools.mcp_core, "_get", side_effect=_get),
             patch.object(spawn_tools.mcp_core, "time", _Time),
             patch.object(spawn_tools.mcp_core, "_resolve_session_key", return_value="chat-1"),
-            patch.object(spawn_tools, "_hold_for_parent_resume", return_value=None),
-            patch.object(spawn_tools, "is_tool_cancelled", return_value=False),
+            patch.object(spawn_tools._ResumeHold, "probe", return_value=(True, None)),
         ):
-            out = spawn_tools.spawn_sub_agents(
-                "spawn_sub_agents",
-                {
-                    "agents": [{"prompt": "c"}],
-                    "solo_reason": "bulk_data",
-                    "solo_details": "one summary",
-                },
+            out = _settle(
+                spawn_tools.spawn_sub_agents(
+                    "spawn_sub_agents",
+                    {
+                        "agents": [{"prompt": "c"}],
+                        "solo_reason": "bulk_data",
+                        "solo_details": "one summary",
+                    },
+                )
             )
         records = [json.loads(chunk) for chunk in out.split("\n\n")]
         assert [r["status"] for r in records if r.get("agent")] == ["completed"]

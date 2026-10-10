@@ -58,8 +58,9 @@ class _Clock:
         """True when the immediate caller of sleep/monotonic is the core server.
 
         Matches the whole server rather than one file: the ``wait`` handler lives
-        in ``mcp_tools/control.py`` while the plumbing it calls stays in
-        ``mcp_core.py``. Keying on a single module name would silently stop
+        in ``mcp_tools/control.py``, the plumbing it calls stays in
+        ``mcp_core.py``, and the sleep between its steps is ``drive_deferred``
+        in ``mcp_shared.py``. Keying on a single module name would silently stop
         advancing the fake timeline and leave the loop sleeping for real.
         """
         import sys
@@ -67,7 +68,7 @@ class _Clock:
         # frame 0 = this method, frame 1 = sleep/monotonic, frame 2 = actual caller
         frame = sys._getframe(2)
         filename = frame.f_code.co_filename
-        return "mcp_core" in filename or "mcp_tools" in filename
+        return "mcp_core" in filename or "mcp_tools" in filename or "mcp_shared" in filename
 
     def monotonic(self) -> float:
         if threading.current_thread() is not self._owner or not self._caller_is_code_under_test():
