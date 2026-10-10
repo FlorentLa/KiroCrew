@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Final, Mapping
 
@@ -314,25 +315,36 @@ async def _package_body(
     The body is ADDITIVE beside the v2 shape, so a reader can tell the two apart by one
     key: ``package`` is present and carries the artifact slug, its version -- which is
     the ``layout`` a patch is compared against -- and ``push_version``, the counter the
-    page starts from. ``blocks`` is every block's values, which IS the whole page in
-    data; ``rendered_html`` is the minted document when this build carries the renderer.
+    page starts from. ``read`` is the payload the document is built from and refilled
+    with, so the first paint and every patch describe one read; ``blocks`` says which
+    blocks hold which of its fields. ``rendered_html`` is the minted document when this
+    build carries the renderer.
     """
     package, model = packaged.package, packaged.model
     assert package is not None  # the caller checked both halves
-    page = arm_block_push(request, slug, member, model)
+    page = arm_block_push(request, slug, member, model, locale=locale)
     if page is None:
         # Nothing to push to (no hub). The page is still served in full: a body with no
         # live push is a page that refreshes on its own, not a refusal.
         from kiro_crew.dashboard.handlers import member_dashboard_push as push
 
         page = push.LivePage(
-            slug, member, model, state=None, loop=None, redact=_page_safe, reread=_reread_model
+            slug,
+            member,
+            model,
+            state=None,
+            loop=None,
+            redact=_page_safe,
+            reread=_reread_model,
+            locale=locale,
+            display_seam=_package_render("display_values"),
         )
     # SUBSCRIBED BEFORE THE VALUES ARE READ, and only when it is not already: a reused
     # page holds values the bus has kept current, and resubscribing would empty that
     # cache and then serve the full load out of it.
     await _run(page.ensure_subscribed)
     blocks, missing = page.blocks()
+    read = page.read()
     body: dict[str, Any] = {
         "state": "live",
         "instance_version": int(getattr(model, "version", 0) or 0),
@@ -344,25 +356,45 @@ async def _package_body(
         },
         "push_version": page.version,
         "push_frame": _push_frame_type(),
+        "page_message": _page_message_type(),
         "blocks": blocks,
         "missing": missing,
+        "read": read,
     }
     rendered = await _run(
-        lambda: _minted_package_page(
-            slug,
-            package,
-            {
-                "blocks": blocks,
-                "missing": missing,
-                "version": page.version,
-                "layout": int(getattr(model, "version", 0) or 0),
-            },
-            locale,
-        )
+        lambda: _minted_package_page(slug, package, read, theme=_page_theme(request), title=member)
     )
     if rendered is not None:
         body["rendered_html"] = rendered
     return web.json_response(body)
+
+
+def _page_theme(request: web.Request) -> str:
+    """Which base palette the document starts from, as the reader asked for it.
+
+    Checked against the renderer's own ``THEMES`` rather than passed through, so an
+    unknown value is the renderer's default instead of a string it has to defend
+    against. A build without the renderer has no themes to check and answers the
+    default name, which that build also never uses.
+    """
+    asked = request.query.get("theme", "")
+    module_themes = _package_render_value("THEMES")
+    themes = tuple(module_themes) if isinstance(module_themes, (list, tuple)) else ("light",)
+    return asked if asked in themes else str(themes[0])
+
+
+def _page_message_type() -> str:
+    """The ``postMessage`` type the document's own listener accepts.
+
+    ``dashboard_frame.DATA_MESSAGE_TYPE`` -- the repository already fixed this for the
+    v2 frame and the package renderer imports the same constant, so the page half of
+    the contract is not something this controller invents. Carried in the body for the
+    same reason ``push_frame`` is: the frontend reads the name rather than holding a
+    second copy of it.
+    """
+    from kiro_crew import dashboard_frame
+
+    return dashboard_frame.DATA_MESSAGE_TYPE
 
 
 def _push_frame_type() -> str:
@@ -541,38 +573,64 @@ def _preview_record(slug: str) -> Any | None:
 #: be reaching past its own page.
 _CREWMATE_BINDING: Final[str] = "crewmate:"
 
-#: The content-security policy a minted package document must declare before this
-#: gateway will serve it as a page. See :func:`_minted_package_page`.
-_PACKAGE_CSP: Final[str] = "default-src 'none'"
+#: The package renderer, named ONCE so the merge is one line.
+#:
+#: Resolved lazily through :func:`_package_render`, because the renderer lands on the
+#: display line's other branch and this controller must build, import and serve without
+#: it. ``render_dashboard(package, read, *, theme="light", title="") -> str`` is the whole
+#: document; ``display_values(package, fields) -> dict[str, str]`` is the formatter whose
+#: output a refill carries beside the raw values, so the page does not fall back to a
+#: second set of formatting rules.
+_PACKAGE_RENDER_MODULE: Final[str] = "kiro_crew.dashboard_package_render"
 
-#: D1's package renderer, named ONCE so the merge is one line.
+#: Directives a minted package document MUST declare before this gateway serves it.
 #:
-#: ``module:function``, resolved lazily through :func:`_package_renderer`, because the
-#: renderer lands on the display line's other branch and this controller must build,
-#: import and serve a package page without it. Assumed signature:
-#:
-#: ``render_package_page(package: Mapping[str, Any], payload: Mapping[str, Any], *,
-#: locale: str = "") -> str``
-#:
-#: where *package* is the canonical package (``model``, ``view``, ``theme``) and
-#: *payload* is ``{"blocks": {...}, "missing": [...], "version": int, "layout": int}`` --
-#: the same shape a push carries, so the document's first paint and its refills are one
-#: contract. A build without it serves the package body WITHOUT ``rendered_html``, which
-#: the frame draws as its own empty state.
-_PACKAGE_RENDERER: Final[str] = (
-    "kiro_crew.artifact_store.dashboard_package_render:render_package_page"
+#: Checked on the renderer's own output rather than assumed of it, and checked as the
+#: list of properties the safety argument actually rests on rather than as one string.
+#: The shipped policy grants ``script-src 'unsafe-inline'`` and ``style-src
+#: 'unsafe-inline'`` -- the script and the style ARE the document, and under no network
+#: there is no URL for them to live at -- so a check for ``default-src 'none'`` alone
+#: would pass while saying something false. What must hold is that the page cannot
+#: compile code it was handed and cannot reach anything: see :func:`_minted_package_page`.
+_REQUIRED_CSP_DIRECTIVES: Final[tuple[str, ...]] = (
+    "default-src 'none'",
+    "connect-src 'none'",
+    "object-src 'none'",
+    "frame-src 'none'",
+    "base-uri 'none'",
+    "form-action 'none'",
+)
+
+#: Anything in the policy that would let the document compile handed-in code or reach
+#: the network. ``*`` and the two URL schemes cover a source list opened to a host;
+#: ``'unsafe-eval'`` is what turns a string into code.
+_FORBIDDEN_CSP_SOURCES: Final[tuple[str, ...]] = ("'unsafe-eval'", "http:", "https:", "*")
+
+#: Where the policy is read from in the composed document.
+#: The attribute value is delimited by a BACKREFERENCE to its own opening quote, not by
+#: "anything but a quote": a policy is full of ``'none'`` and ``'unsafe-inline'``, so a
+#: character class excluding the apostrophe captures ``default-src`` and stops -- which
+#: made every directive read as missing and the gate refuse the document it was built
+#: for. Fail-closed on anything it cannot parse, including a different attribute order.
+_CSP_META_RE: Final[Any] = re.compile(
+    r"""<meta\s+http-equiv=["']Content-Security-Policy["']\s+content=(["'])(.*?)\1""",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
-def _package_renderer() -> Callable[..., str] | None:
-    """D1's renderer, or ``None`` on a build that does not carry it yet."""
-    module_name, _, attr = _PACKAGE_RENDERER.partition(":")
+def _package_render_value(attr: str) -> Any:
+    """One name out of the package renderer module, or ``None`` on a build without it."""
     try:
-        module = importlib.import_module(module_name)
+        module = importlib.import_module(_PACKAGE_RENDER_MODULE)
     except Exception:
-        logger.debug("dashboard: no package renderer at %s", _PACKAGE_RENDERER)
+        logger.debug("dashboard: no package renderer at %s", _PACKAGE_RENDER_MODULE)
         return None
-    fn = getattr(module, attr, None)
+    return getattr(module, attr, None)
+
+
+def _package_render(attr: str) -> Callable[..., Any] | None:
+    """One CALLABLE out of the package renderer, or ``None`` on a build without it."""
+    fn = _package_render_value(attr)
     return fn if callable(fn) else None
 
 
@@ -663,7 +721,12 @@ def _owns_package(slug: str, model: Any) -> bool:
 
 
 def _minted_package_page(
-    slug: str, package: Mapping[str, Any], payload: Mapping[str, Any], locale: str = ""
+    slug: str,
+    package: Mapping[str, Any],
+    read: Mapping[str, Any],
+    *,
+    theme: str = "light",
+    title: str = "",
 ) -> str | None:
     """The document this gateway will EXECUTE for a package page, or ``None`` to refuse.
 
@@ -674,24 +737,38 @@ def _minted_package_page(
     catalog directory and carries no markup at all, so it can never reach that gate --
     widening the set would loosen the instance adopt path and buy this page nothing.
 
-    What makes a package page safe to execute HERE, and not elsewhere:
+    What makes a package page safe to execute here. Stated as it actually is, because
+    the shipped policy is NOT ``default-src 'none'`` alone -- it grants inline script
+    and inline style, since the script and the style ARE the document and under no
+    network there is no URL for them to live at:
 
-    * **The document is MINTED by this gateway.** Nothing executable comes out of the
-      artifact: a validated package holds ``kind``, ``bound_to``, ``model``, ``view``
-      and ``theme`` and has no key that could carry markup or script. The bytes are
-      composed by the renderer named in :data:`_PACKAGE_RENDERER`, which is a function
-      in this repository.
+    * **The inline script is THE REPOSITORY'S, not the agent's.** It is the renderer's
+      own code plus the libraries it vendors, composed by a function in this repo. A
+      validated package holds ``kind``, ``bound_to``, ``model``, ``view`` and ``theme``
+      and has no key that can carry markup or script, so the agent supplies DATA and a
+      layout -- never a statement. ``'unsafe-eval'`` is withheld, so the script cannot
+      turn the data it was handed into code either.
     * **The block catalogue is CLOSED.** Every block's ``type`` is re-checked against
       ``view_block_catalog()`` here, at the render site, rather than trusted from the
       write path -- the same reason ``_trusted_page`` does not trust the record's own
       ``source`` label. An agent chooses which blocks to place and never what a block
       is made of.
-    * **CSP ``default-src 'none'``.** The composed document must declare it, checked on
-      the renderer's output rather than assumed of it, so a renderer that stops
-      declaring it refuses to be served instead of running with a network.
+    * **The page has nowhere to send anything.** ``connect-src 'none'``, no origin on
+      any fetching directive, ``form-action 'none'`` and ``base-uri 'none'``, all
+      verified on the composed output by :func:`_csp_problems`. That is what makes a
+      document trusted with an operator's own numbers: not that it cannot be wrong, but
+      that being wrong cannot carry them anywhere.
 
-    All three are properties of THIS page. None of them holds for an authored template,
-    which is why that gate stays at one value.
+    THE RESIDUAL RISK, named rather than hidden: ``script-src 'unsafe-inline'`` means an
+    escaping defect in the renderer would turn an agent-supplied VALUE into running
+    script. What that script could then do is bounded by the directives above -- no
+    fetch, no post, no navigation, no eval -- and the agent already chooses those
+    values, so what it gains is the page's appearance and not its reach. This is the
+    posture the repository already serves for its theme overlay in
+    ``dashboard/theme_validate.py``, not one introduced here.
+
+    None of the three holds for an authored template, which is why that gate stays at
+    one value.
     """
     from kiro_crew.artifact_store.dashboard_package import view_block_catalog
 
@@ -705,19 +782,22 @@ def _minted_package_page(
             sorted(set(unknown)),
         )
         return None
-    render = _package_renderer()
+    render = _package_render("render_dashboard")
     if render is None:
         return None
     try:
-        document = render(package, payload, locale=locale)
+        document = render(package, read, theme=theme, title=title)
     except Exception:
         logger.warning("dashboard: could not mint %r's package page", slug, exc_info=True)
         return None
-    if not isinstance(document, str) or _PACKAGE_CSP not in document:
+    if not isinstance(document, str):
+        return None
+    problems = _csp_problems(document)
+    if problems:
         logger.warning(
-            "dashboard: refusing to serve %r's package page: it does not declare %s",
+            "dashboard: refusing to serve %r's package page, its policy %s",
             slug,
-            _PACKAGE_CSP,
+            "; ".join(problems),
         )
         return None
     # Redacted like a template's own text, and for the same reason: this is the one step
@@ -725,7 +805,30 @@ def _minted_package_page(
     return _template_text_safe(document)
 
 
-def arm_block_push(request: web.Request, slug: str, member: str, model: Any) -> Any:
+def _csp_problems(document: str) -> list[str]:
+    """What is wrong with *document*'s content-security policy. Empty means nothing is.
+
+    Read out of the document's own ``<meta http-equiv>`` rather than taken from the
+    renderer's constant: the constant is a claim about what the renderer means to emit,
+    and this gate is about what it DID emit.
+
+    A check for ``default-src 'none'`` as a substring would pass on the shipped policy
+    while the justification beside it read as false, because that policy starts with
+    exactly those bytes and then grants inline script. So the check is the list of
+    properties the argument rests on, each named in the refusal.
+    """
+    found = _CSP_META_RE.search(document or "")
+    if found is None:
+        return ["declares no Content-Security-Policy"]
+    policy = found.group(2)
+    problems = [f"is missing {d!r}" for d in _REQUIRED_CSP_DIRECTIVES if d not in policy]
+    problems += [f"grants {s!r}" for s in _FORBIDDEN_CSP_SOURCES if s in policy]
+    return problems
+
+
+def arm_block_push(
+    request: web.Request, slug: str, member: str, model: Any, *, locale: str = ""
+) -> Any:
     """Arm -- or refresh -- the live push for this crewmate's package page.
 
     Called from the read, so the whole page and the subscriptions behind its patches are
@@ -759,6 +862,8 @@ def arm_block_push(request: web.Request, slug: str, member: str, model: Any) -> 
         loop=loop,
         redact=_page_safe,
         reread=_reread_model,
+        locale=locale,
+        display_seam=_package_render("display_values"),
     )
     return page
 

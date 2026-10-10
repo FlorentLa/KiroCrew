@@ -171,6 +171,23 @@ def _page(model, hub: _Hub, *, reread=None) -> push.LivePage:
     )
 
 
+#: A document declaring the policy the shipped renderer declares, so the gate is tested
+#: against the real thing rather than against the one directive a substring check saw.
+RENDER_CSP = (
+    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+    "img-src data:; font-src data:; connect-src 'none'; frame-src 'none'; "
+    "object-src 'none'; base-uri 'none'; form-action 'none'"
+)
+
+
+def _document(policy: str = RENDER_CSP) -> str:
+    return (
+        "<!doctype html><html><head>"
+        f'<meta http-equiv="Content-Security-Policy" content="{policy}">'
+        "</head><body><main>*{}</main></body></html>"
+    )
+
+
 @asynccontextmanager
 async def _client(hub: _Hub | None = None):
     """A started client that always closes.
@@ -214,6 +231,21 @@ async def test_the_first_load_carries_every_block(store, saved):
     # compared against and a gap at version 1 would be undetectable.
     assert body["push_version"] == 0
     assert body["push_frame"] == push.BLOCK_FRAME
+
+
+async def test_arming_a_page_does_not_push_the_values_its_own_body_carries(store, saved):
+    """The subscribe-time baseline is cached, not pushed.
+
+    The bus hands a baseline over synchronously inside ``subscribe``, and that value IS
+    what the first load is about to put in its response. Pushing it sends the browser a
+    patch carrying what it already has -- and makes the ``push_version`` in that
+    response depend on whether the patch was broadcast before or after it was read.
+    """
+    hub = _Hub()
+    async with _client(hub) as client:
+        body = await (await client.get(_q())).json()
+    assert hub.frames == [], "arming the page pushed a frame"
+    assert body["push_version"] == 0
 
 
 async def test_the_first_load_arms_the_push_before_it_reads(store, saved):
@@ -347,6 +379,92 @@ async def test_the_push_uses_the_owner_channel_and_adds_no_second_one(store, sav
     from kiro_crew.dashboard import ws_event_scope
 
     assert push.BLOCK_FRAME in ws_event_scope._OWNER_ONLY_EVENTS
+
+
+async def test_the_frame_carries_the_read_the_document_will_be_given(store, saved):
+    """The page's own listener takes ``read`` and nothing else, so the frame carries it.
+
+    ``dashboard_frame.read_payload`` builds it -- the same builder the v2 page and the
+    renderer's data island use, so a first paint and a refill cannot describe one read
+    differently.
+    """
+    from kiro_crew import dashboard_frame
+
+    hub = _Hub()
+    page = _page(_model(store, saved.slug), hub)
+    page.on_fold("work", _event("work", WORK))
+    await page.send("work")
+    _type, data = hub.frames[-1]
+    assert set(data["read"]) >= set(dashboard_frame.read_payload({}))
+    assert data["read"]["fields"]["open_prs"] == 4
+    assert data["read"]["agentic"] == []
+    assert data["read"]["stale"] is True, "panel never moved, so its field is unresolved"
+    assert "last_run" in data["read"]["missing"]
+
+
+async def test_the_read_is_complete_even_though_the_push_is_partial(store, saved):
+    """Forced by the document: its listener REPLACES what it holds.
+
+    ``read = data.read`` in the page's message handler, so a read restricted to the
+    pushed blocks would blank every cell outside them. Which blocks moved is carried
+    separately in ``blocks``; narrowing the read needs the page to merge first.
+    """
+    hub = _Hub()
+    page = _page(_model(store, saved.slug), hub)
+    page.on_fold("work", _event("work", WORK))
+    page.on_fold("panel", _event("panel", PANEL))
+    await page.send("work")
+    _type, data = hub.frames[-1]
+    assert set(data["blocks"]) == {"prs"}, "the push stopped being partial"
+    # The field only the OTHER block reads is still in the read, with its value.
+    assert data["read"]["fields"]["last_run"] == PANEL["last_run"]
+    assert data["read"]["stale"] is False
+
+
+async def test_the_read_carries_the_renderers_own_formatting_when_it_is_there(store, saved):
+    """Through the controller's seam, so a build without the renderer sends no display."""
+    hub = _Hub()
+    model = _model(store, saved.slug)
+    bare = _page(model, hub)
+    bare.on_fold("work", _event("work", WORK))
+    assert "display" not in bare.read()
+
+    page = push.LivePage(
+        SLUG,
+        MEMBER,
+        model,
+        state=hub,
+        loop=None,
+        redact=routes._page_safe,
+        reread=lambda _slug: model,
+        display_seam=lambda package, fields: {k: f"<{v}>" for k, v in fields.items()},
+    )
+    page.on_fold("work", _event("work", WORK))
+    assert page.read()["display"]["open_prs"] == "<4>"
+
+
+async def test_a_refetch_frame_carries_no_read_either(store, saved):
+    """No values means none of them -- not "none in blocks and all of them in read"."""
+    hub = _Hub()
+    page = _page(_model(store, saved.slug), hub, reread=lambda _slug: None)
+    page.on_fold("work", _event("work", WORK))
+    await page.send("work")
+    _type, data = hub.frames[-1]
+    assert data["refetch"] is True
+    assert data["blocks"] == {}
+    assert data["read"] == {}
+
+
+async def test_the_body_names_the_message_type_the_document_accepts(store, saved):
+    """Fixed by the repository, not invented here: the renderer imports this constant."""
+    from kiro_crew import dashboard_frame
+
+    hub = _Hub()
+    async with _client(hub) as client:
+        body = await (await client.get(_q())).json()
+    assert body["page_message"] == dashboard_frame.DATA_MESSAGE_TYPE
+    assert body["read"]["fields"] == body["read"]["fields"]  # present and serializable
+    assert set(body["read"]) >= {"fields", "missing", "stale", "agentic"}
 
 
 async def test_the_version_steps_by_exactly_one_per_frame(store, saved):
@@ -485,10 +603,16 @@ async def test_a_redacted_value_is_redacted_in_the_whole_pushed_payload(store, s
     _type, data = hub.frames[-1]
     serialized = json.dumps(data)
     assert SECRET not in serialized
+    # Both halves of the frame carry values, so BOTH have to be covered -- `blocks` and
+    # the `read` the document is actually given. The whole-payload assertion above is
+    # what catches the second one; these name them so a reader can see it did.
+    assert SECRET not in json.dumps(data["blocks"])
+    assert SECRET not in json.dumps(data["read"])
     # POSITIVE CONTROL: the values that must survive DID, so this is not passing on an
     # empty payload or a frame that never went out.
     assert data["blocks"]["prs"]["open_prs"] == 4
     assert "token" in data["blocks"]["prs"]["note"]
+    assert data["read"]["fields"]["open_prs"] == 4
 
 
 async def test_the_push_cannot_be_armed_without_the_controllers_redactor():
@@ -606,32 +730,96 @@ def _raise(*_a, **_k):
 # --------------------------------------------------------------------------
 
 
-async def test_a_package_page_is_served_only_when_the_document_declares_the_csp(monkeypatch):
-    """Checked on the renderer's OUTPUT, not assumed of it."""
-    pkg = package()
-    payload = {"blocks": {}, "missing": [], "version": 0, "layout": 1}
-    monkeypatch.setattr(routes, "_package_renderer", lambda: lambda *a, **k: "<html>no csp</html>")
-    assert routes._minted_package_page(SLUG, pkg, payload) is None
-    monkeypatch.setattr(
-        routes,
-        "_package_renderer",
-        lambda: lambda *a, **k: "<meta content=\"default-src 'none'\"><b>page</b>",
-    )
-    assert routes._minted_package_page(SLUG, pkg, payload) is not None
+async def test_the_shipped_policy_passes_the_gate(monkeypatch):
+    """The positive control. The real `RENDER_CSP` is what the gate must admit."""
+    monkeypatch.setattr(routes, "_package_render", lambda name: lambda *a, **k: _document())
+    assert routes._minted_package_page(SLUG, package(), {}) is not None
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        pytest.param("", id="no-policy-at-all"),
+        pytest.param(
+            RENDER_CSP.replace("connect-src 'none'", "connect-src https://example.test"),
+            id="can-reach-the-network",
+        ),
+        pytest.param(RENDER_CSP + "; script-src 'unsafe-eval'", id="can-compile-what-it-is-given"),
+        pytest.param(
+            RENDER_CSP.replace("form-action 'none'", "form-action *"), id="can-post-somewhere"
+        ),
+        pytest.param(
+            RENDER_CSP.replace("img-src data:", "img-src http:"), id="can-exfiltrate-by-image"
+        ),
+        pytest.param(
+            RENDER_CSP.replace("base-uri 'none'", "base-uri https://example.test"),
+            id="can-move-its-own-base",
+        ),
+    ],
+)
+async def test_a_document_that_could_carry_the_numbers_somewhere_is_refused(
+    monkeypatch, policy: str
+):
+    """The gate is the list of properties the safety argument rests on, not one string.
+
+    Every case here CONTAINS ``default-src 'none'`` -- the shipped policy starts with
+    exactly those bytes -- so a substring check for it would pass all of them while the
+    justification beside it read as false.
+    """
+    body = "<html><head></head><body></body></html>" if not policy else _document(policy)
+    monkeypatch.setattr(routes, "_package_render", lambda name: lambda *a, **k: body)
+    assert routes._minted_package_page(SLUG, package(), {}) is None
+
+
+async def test_the_gate_names_what_is_wrong_with_the_policy():
+    """A refusal a reviewer can act on: which directive, not that something failed."""
+    assert routes._csp_problems(_document()) == []
+    assert routes._csp_problems("<html></html>") == ["declares no Content-Security-Policy"]
+    missing = routes._csp_problems(_document("default-src 'none'"))
+    assert "is missing \"connect-src 'none'\"" in missing
+    assert routes._csp_problems(_document(RENDER_CSP + "; script-src 'unsafe-eval'")) == [
+        "grants \"'unsafe-eval'\""
+    ]
 
 
 async def test_a_block_type_outside_the_closed_catalogue_is_not_rendered(monkeypatch):
     """Re-checked at the RENDER site, like ``_trusted_page`` not trusting a stored label."""
     rendered: list[str] = []
-    monkeypatch.setattr(
-        routes,
-        "_package_renderer",
-        lambda: lambda *a, **k: rendered.append("ran") or "default-src 'none'",
-    )
+
+    def _seam(_name):
+        def _render(*_a, **_k):
+            rendered.append("ran")
+            return _document()
+
+        return _render
+
+    monkeypatch.setattr(routes, "_package_render", _seam)
     pkg = package()
     pkg["view"]["blocks"] = [{"id": "prs", "type": "iframe", "fields": ["open_prs"]}]
     assert routes._minted_package_page(SLUG, pkg, {}) is None
     assert rendered == [], "the renderer ran for a block type nothing in the repo defines"
+
+
+async def test_the_renderer_seam_is_the_module_the_renderer_actually_lands_in(monkeypatch):
+    """Named once, so the merge is one line -- and named CORRECTLY, so it is not zero.
+
+    A seam pointing at a module that never arrives resolves to None forever and the
+    first load silently serves no document, which is indistinguishable from a build
+    that has not merged the renderer yet.
+    """
+    assert routes._PACKAGE_RENDER_MODULE == "kiro_crew.dashboard_package_render"
+    # The two names this controller asks that module for.
+    import types
+
+    fake = types.ModuleType(routes._PACKAGE_RENDER_MODULE)
+    fake.render_dashboard = lambda package, read, *, theme="light", title="": _document()
+    fake.display_values = lambda package, fields: {k: str(v) for k, v in fields.items()}
+    fake.THEMES = ("light", "dark")
+    monkeypatch.setitem(__import__("sys").modules, routes._PACKAGE_RENDER_MODULE, fake)
+    assert routes._package_render("render_dashboard") is fake.render_dashboard
+    assert routes._package_render("display_values") is fake.display_values
+    assert routes._package_render_value("THEMES") == ("light", "dark")
+    assert routes._package_render("nothing_of_that_name") is None
 
 
 async def test_a_package_page_never_reaches_the_template_execution_gate():

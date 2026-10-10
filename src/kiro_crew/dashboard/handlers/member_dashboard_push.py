@@ -118,6 +118,8 @@ class LivePage:
         loop: asyncio.AbstractEventLoop | None,
         redact: Callable[[Any], Any],
         reread: Callable[[str], Any],
+        locale: str = "",
+        display_seam: Callable[..., Any] | None = None,
     ) -> None:
         if not callable(redact):
             # Refused rather than defaulted. A default would be a second redactor, and
@@ -126,15 +128,26 @@ class LivePage:
         self.slug = slug
         self.member = member
         self.model = model
+        #: The reader's UI language as the first load resolved it. Carried because a
+        #: push has no request to ask, and the document picks its own words by it.
+        self.locale = locale
         self._state = state
         self._loop = loop
         self._redact = redact
         self._reread = reread
+        self._display_seam = display_seam
         self._lock = threading.Lock()
         self._cells: dict[str, _Cell] = {}
         self._disposers: list[Callable[[], None]] = []
         self._version = 0
         self._closed = False
+        #: True only while :meth:`subscribe` is running. The bus delivers a baseline
+        #: SYNCHRONOUSLY inside ``subscribe``, on this thread, and that value is the one
+        #: the first load is about to serve -- so it is cached and NOT pushed. Without
+        #: this, arming a page sends the browser a patch carrying what its own response
+        #: body already holds, and ``push_version`` in that body depends on whether the
+        #: patch was broadcast before or after it was read.
+        self._priming = False
 
     # -- identity ----------------------------------------------------------- #
 
@@ -209,6 +222,14 @@ class LivePage:
         from kiro_crew.crew_log import bus as crew_log_bus
 
         self.unsubscribe()
+        self._priming = True
+        try:
+            return self._subscribe_each(crew_log_bus)
+        finally:
+            self._priming = False
+
+    def _subscribe_each(self, crew_log_bus: Any) -> list[str]:
+        """One subscription per reachable fold. Split out so priming is exception-safe."""
         unavailable: list[str] = []
         for fold in sorted(self.folds()):
             scope = scope_for(fold)
@@ -322,7 +343,9 @@ class LivePage:
             cell.seq = seq
             cell.seen = True
         loop = self._loop
-        if loop is None:
+        if loop is None or self._priming:
+            # CACHED, NOT PUSHED. See ``_priming``: this is the subscribe-time baseline,
+            # which is the value the first load is about to put in its own response.
             return
         try:
             loop.call_soon_threadsafe(self._arm, fold)
@@ -377,8 +400,13 @@ class LivePage:
                 "version": self._version,
                 "layout": self.layout,
                 "fold": fold,
+                # WHICH BLOCKS MOVED -- only the ones that read this fold.
                 "blocks": blocks,
                 "missing": missing,
+                # WHAT THE DOCUMENT IS GIVEN. The page's own listener takes `read` and
+                # nothing else, so this is the half that actually refills it; `blocks`
+                # says which parts of it changed.
+                "read": self.read(),
                 "refetch": False,
                 "reason": "",
             }
@@ -397,6 +425,7 @@ class LivePage:
                 "fold": "",
                 "blocks": {},
                 "missing": [],
+                "read": {},
                 "refetch": True,
                 "reason": reason,
             }
@@ -433,8 +462,7 @@ class LivePage:
         keys as well, and a per-field call would be a per-field chance to forget one.
         """
         model = self.model
-        with self._lock:
-            cells = {name: (cell.value, cell.seen) for name, cell in self._cells.items()}
+        cells = self._snapshot()
         out: dict[str, dict[str, Any]] = {}
         missing: list[str] = []
         for block_id in getattr(model, "subscriptions", {}):
@@ -451,7 +479,118 @@ class LivePage:
             out[block_id] = values
         return self._redact(out), missing
 
-    def _value_of(self, name: str, cells: Mapping[str, tuple[Any, bool]]) -> Any:
+    def read(self) -> dict[str, Any]:
+        """This page's whole read, in the shape the DOCUMENT accepts. Redacted.
+
+        ``dashboard_frame.read_payload`` builds it, which is the point: the v2 page, the
+        package renderer's data island and this refill are then one shape, and a reader
+        cannot be shown a first paint and a refill that describe the same read
+        differently.
+
+        COMPLETE, not restricted to the pushed blocks, and that is forced by the
+        document: its message listener does ``read = data.read``, replacing what it
+        holds, so a partial read would blank every cell outside the pushed blocks. Which
+        blocks actually moved is carried separately, in the frame's ``blocks``. If the
+        document's listener is changed to MERGE, this can be narrowed to the pushed
+        fields and the saving is real; until then sending everything is the correct
+        answer rather than the cheap one.
+
+        ``display`` is added when the renderer is on this build: it is that module's own
+        formatter, and a page that does not get it falls back to a plain ``String(value)``
+        -- an unformatted number a reader can SEE is unformatted, rather than one
+        formatted by a second set of rules that drifted from the renderer's.
+        """
+        model = self.model
+        cells = self._snapshot()
+        fields: dict[str, Any] = {}
+        missing: list[str] = []
+        unresolved: list[str] = []
+        written_at: dict[str, str] = {}
+        seq = 0
+        agentic = set(model.agentic_fields()) if hasattr(model, "agentic_fields") else set()
+        for name in model.fields:
+            resolved = self._value_of(name, cells)
+            if resolved is MISSING:
+                missing.append(name)
+                # STALE is about a fold-backed cell only. An agentic field the crewmate
+                # has never written is ABSENT, and counting it would raise the band
+                # forever about a value nothing had yet produced.
+                if name not in agentic:
+                    unresolved.append(name)
+                continue
+            fields[name] = resolved
+            if name in agentic:
+                at = self._written_at(name, cells)
+                if at:
+                    written_at[name] = at
+            else:
+                seq = max(seq, self._seq_of(name, cells))
+        payload = self._read_payload(
+            fields=self._redact(fields),
+            agentic=sorted(agentic),
+            seq=seq,
+            stale=bool(unresolved),
+            missing=sorted(missing),
+            written_at={name: str(self._redact(at)) for name, at in written_at.items()},
+            locale=self.locale,
+        )
+        display = self._display_values(model, payload.get("fields", {}))
+        if display is not None:
+            payload["display"] = display
+        return payload
+
+    @staticmethod
+    def _read_payload(**kwargs: Any) -> dict[str, Any]:
+        """``dashboard_frame.read_payload``, imported where it is used.
+
+        Deferred rather than at module scope for the boot-path rule the whole handler
+        follows: the frame module pulls the template manifest and the projection in.
+        """
+        from kiro_crew import dashboard_frame
+
+        return dashboard_frame.read_payload(**kwargs)
+
+    def _display_values(self, model: Any, fields: Mapping[str, Any]) -> dict[str, str] | None:
+        """The renderer's own formatter over *fields*, or ``None`` without the renderer.
+
+        Reached through the CONTROLLER's seam, so this module names no renderer of its
+        own and a build without one simply sends no ``display``.
+        """
+        getter = self._display_seam
+        if getter is None:
+            return None
+        try:
+            return getter({"model": {"types": dict(model.fields)}}, fields)
+        except Exception:
+            logger.debug("dashboard push: the display formatter failed", exc_info=True)
+            return None
+
+    def _snapshot(self) -> dict[str, tuple[Any, bool, int]]:
+        with self._lock:
+            return {name: (cell.value, cell.seen, cell.seq) for name, cell in self._cells.items()}
+
+    def _seq_of(self, name: str, cells: Mapping[str, tuple[Any, bool, int]]) -> int:
+        spec = self.model.fields.get(name)
+        source = spec.get("source") if isinstance(spec, Mapping) else None
+        fold = str(source.get("fold") or "") if isinstance(source, Mapping) else ""
+        cached = cells.get(fold)
+        return int(cached[2]) if cached is not None else 0
+
+    def _written_at(self, name: str, cells: Mapping[str, tuple[Any, bool, int]]) -> str:
+        """When an agentic cell was written, from the FOLD's own row.
+
+        Taken only where the value was taken, so the two cannot disagree about which
+        write they describe -- a stamp inside the value would be the writer's own claim
+        about its own freshness.
+        """
+        cached = cells.get(AGENTIC_FOLD)
+        if cached is None or not cached[1]:
+            return ""
+        row = resolve_path(cached[0], f"fields.{name}")
+        at = row.get("at") if isinstance(row, Mapping) else None
+        return at if isinstance(at, str) else ""
+
+    def _value_of(self, name: str, cells: Mapping[str, tuple[Any, bool, int]]) -> Any:
         """One field's value from the cached folds, or :data:`MISSING`.
 
         An agentic field is read from the agentic fold's own row, which is where the
@@ -514,6 +653,8 @@ def open_page(
     loop: asyncio.AbstractEventLoop | None,
     redact: Callable[[Any], Any],
     reread: Callable[[str], Any],
+    locale: str = "",
+    display_seam: Callable[..., Any] | None = None,
 ) -> LivePage:
     """Arm -- or refresh -- the live push for one crewmate's package page.
 
@@ -540,7 +681,17 @@ def open_page(
             existing.bind(state, loop)
             _PAGES.move_to_end(slug)
             return existing
-        page = LivePage(slug, member, model, state=state, loop=loop, redact=redact, reread=reread)
+        page = LivePage(
+            slug,
+            member,
+            model,
+            state=state,
+            loop=loop,
+            redact=redact,
+            reread=reread,
+            locale=locale,
+            display_seam=display_seam,
+        )
         if existing is not None:
             existing.close()
         _PAGES[slug] = page

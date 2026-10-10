@@ -230,12 +230,23 @@ class TestAnAgentWrittenPageCannotBeStaged:
         KEPT AT ONE VALUE BY DECISION, re-taken for v3's dashboard PACKAGE and recorded
         here because this is the test a reviewer reads as the security decision.
 
-        The v3 package page genuinely has the three properties a page needs before this
-        gateway will execute it: the document is MINTED here from a package that carries
-        no markup key at all, every block's type is re-checked at the render site
-        against a CLOSED catalogue, and the composed document must declare CSP
-        ``default-src 'none'`` or it is refused. So the page is earned -- but it is
-        earned at its OWN gate, ``member_dashboard._minted_package_page``, and not here.
+        The v3 package page genuinely has the properties a page needs before this
+        gateway will execute it, and they are NOT "CSP ``default-src 'none'``" flat --
+        the shipped policy grants ``script-src 'unsafe-inline'`` and ``style-src
+        'unsafe-inline'``, because the script and the style ARE the document and under
+        no network there is no URL for them to live at. What holds is:
+
+        * the inline script is the REPOSITORY's renderer plus the libraries it vendors,
+          never the agent's: a validated package has no key that can carry markup or
+          script, so the agent supplies data and a layout and never a statement, and
+          ``'unsafe-eval'`` is withheld so the data cannot become code;
+        * the block catalogue is CLOSED and re-checked at the render site;
+        * the page has nowhere to send anything -- ``connect-src 'none'``, no origin on
+          any fetching directive, ``form-action 'none'``, ``base-uri 'none'`` -- all
+          verified on the composed output rather than assumed of the renderer.
+
+        So the page is earned -- but it is earned at its OWN gate,
+        ``member_dashboard._minted_package_page``, and not here.
 
         Adding ``"package"`` to this set would not reach that page. This set is what
         ``_trusted_page`` and ``instance._check`` ask about a stored TEMPLATE INSTANCE,
