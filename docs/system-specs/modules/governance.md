@@ -982,9 +982,16 @@ templates tab, edited on the agent detail page, or turned into a shared template
 Those writers filter only when they write, so without this pass such a template would keep
 the grants the ceiling now denies. The shared-template pass touches nothing but those two
 lists, rewrites a file only when a pass removed something, and never writes a spec no crew is
-bound to. It does not hold spawns the way the fork gate does: a bound template it cannot
-rewrite (a markdown spec, an unreadable file, an ambiguous name) is logged at WARNING and
-retried on the next rebuild. A spec that reaches the agents directory by a hand edit and is
+bound to. It does not hold spawns the way the fork gate does. A bound template it fails to
+rewrite for a reason a retry can clear (its read raised `OSError`, it did not resolve while a
+spec file in the directory could not be read, its write raised, `config.json` could not be
+read whole) is folded into the rebuild's conductor
+hold (`_held_out` and `agent._conductor_spec_held`, below), so the ceiling memo stays behind
+and the next poll or maintenance wake retries it; the hook does not skip an unchanged
+generation while that hold is set, which covers a hold the boot path's deferred pass sets
+after `prime_ceiling_projection` seeded the baseline. A template no retry can fix (a markdown
+spec this writer cannot re-serialize, a name two specs declare, bytes that do not parse, a
+capability reconcile that refuses) is logged at WARNING and not held. A spec that reaches the agents directory by a hand edit and is
 bound to no crew is outside every Kiro Crew writer; its grants are whatever its author wrote.
 
 Two details make the generation bound safe rather than merely cheap. The baseline is seeded by

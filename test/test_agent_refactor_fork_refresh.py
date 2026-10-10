@@ -19,6 +19,7 @@ from typing import Any, Callable, Iterator
 
 import pytest
 
+from conftest import requires_symlinks
 from kiro_crew import agent, agent_state
 from kiro_crew.agent_materialization import fork_refresh
 from kiro_crew.config.loader import KiroCrewConfig
@@ -37,6 +38,8 @@ def _restore_refresh_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Every test starts settled with no failures, and leaves it that way."""
     monkeypatch.setattr(agent, "_fork_refresh_failed", frozenset())
     monkeypatch.setattr(agent, "_fork_refresh_pending", 0)
+    monkeypatch.setattr(fork_refresh, "_shared_template_held", False)
+    monkeypatch.setattr(agent, "_conductor_spec_held", False)
     fork_refresh._fork_refresh_settled.set()
     yield
     fork_refresh._fork_refresh_settled.set()
@@ -473,3 +476,147 @@ def test_no_forks_and_an_unreadable_config_records_no_failure(
         agent._refresh_forked_templates_locked(gated_off=frozenset())
     assert agent._fork_refresh_failed == frozenset()
     assert "shared template governance skipped" in caplog.text
+
+
+def test_a_shared_template_whose_write_raises_is_held_for_a_retry(
+    shared_template: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared_template.write_text(json.dumps({"name": "reviewer", "allowedTools": ["execute_bash"]}))
+    monkeypatch.setattr(agent, "_atomic_json_write", _raise)
+    agent._refresh_forked_templates_locked(gated_off=frozenset())
+    assert fork_refresh._shared_template_held is True
+    assert agent._fork_refresh_failed == frozenset()
+
+
+def test_a_shared_template_a_retry_cannot_fix_is_not_held(
+    shared_template: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    md = shared_template.parent / "reviewer.md"
+    md.write_text("---\nname: reviewer\n---\n", encoding="utf-8")
+    monkeypatch.setattr(agent, "agent_spec_path", lambda _name: md)
+    agent._refresh_forked_templates_locked(gated_off=frozenset())
+    assert fork_refresh._shared_template_held is False
+
+
+def test_a_landed_pass_clears_the_hold(
+    shared_template: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(fork_refresh, "_shared_template_held", True)
+    shared_template.write_text(json.dumps({"name": "reviewer", "allowedTools": ["execute_bash"]}))
+    agent._refresh_forked_templates_locked(gated_off=frozenset())
+    assert fork_refresh._shared_template_held is False
+    assert json.loads(shared_template.read_text(encoding="utf-8"))["allowedTools"] == []
+
+
+def test_a_deferred_pass_that_holds_a_shared_template_sets_the_rebuild_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _threads(monkeypatch, _InlineThread)
+
+    def holds(*, gated_off: frozenset[str] | None = None) -> None:
+        monkeypatch.setattr(fork_refresh, "_shared_template_held", True)
+
+    monkeypatch.setattr(agent, "_refresh_forked_templates_locked", holds)
+    fork_refresh.refresh_after_rebuild("defer", frozenset())
+    assert agent._conductor_spec_held is True
+
+
+def test_a_capability_refusal_is_warned_about_not_held(
+    shared_template: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from kiro_crew import agent_capabilities
+
+    monkeypatch.setattr(agent_state, "get_capabilities", lambda _name: {"schema_version": 1})
+
+    def refuse(_member: str) -> None:
+        raise agent_capabilities.CapabilityError("materialization_changed")
+
+    monkeypatch.setattr(agent_capabilities, "reconcile_member_capabilities", refuse)
+    with caplog.at_level(logging.WARNING, logger=agent.logger.name):
+        agent._refresh_forked_templates_locked(gated_off=frozenset())
+    assert fork_refresh._shared_template_held is False
+    assert "capability reconcile" in caplog.text
+
+
+def test_an_unresolved_template_beside_an_unreadable_spec_is_held(
+    shared_template: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared_template.write_text(json.dumps({"name": "reviewer", "allowedTools": ["execute_bash"]}))
+    monkeypatch.setattr(agent, "agent_spec_path", lambda _name: None)
+    from kiro_crew import agent_discovery
+
+    real_read = agent_discovery._read_spec_bytes
+
+    def unreadable(path: Path) -> bytes:
+        if path.name == "reviewer.json":
+            raise PermissionError("denied")
+        return real_read(path)
+
+    monkeypatch.setattr(agent_discovery, "_read_spec_bytes", unreadable)
+    agent._refresh_forked_templates_locked(gated_off=frozenset())
+    assert fork_refresh._shared_template_held is True
+
+
+@requires_symlinks
+def test_the_retry_probe_never_follows_a_link_the_resolver_refuses(
+    shared_template: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    outside = tmp_path_factory.mktemp("outside") / "secret.json"
+    outside.write_text("{}", encoding="utf-8")
+    (shared_template.parent / "linked.json").symlink_to(outside)
+    monkeypatch.setattr(agent, "agent_spec_path", lambda _name: None)
+    from kiro_crew import agent_discovery
+
+    opened: list[str] = []
+    real_read = agent_discovery._read_spec_bytes
+
+    def recording(path: Path) -> bytes:
+        opened.append(path.name)
+        return real_read(path)
+
+    monkeypatch.setattr(agent_discovery, "_read_spec_bytes", recording)
+    agent._refresh_forked_templates_locked(gated_off=frozenset())
+    assert "linked.json" not in opened
+    assert fork_refresh._shared_template_held is False
+
+
+def test_an_unresolved_template_with_every_spec_readable_is_not_held(
+    shared_template: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(agent, "agent_spec_path", lambda _name: None)
+    agent._refresh_forked_templates_locked(gated_off=frozenset())
+    assert fork_refresh._shared_template_held is False
+
+
+def test_a_config_load_that_fell_back_to_defaults_holds(
+    shared_template: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from kiro_crew.config.resolution import DEGRADED_WHOLE_CONFIG
+
+    degraded = SimpleNamespace(agents={}, degraded_sections=frozenset({DEGRADED_WHOLE_CONFIG}))
+    monkeypatch.setattr(KiroCrewConfig, "load", classmethod(lambda cls: degraded))
+    agent._refresh_forked_templates_locked(gated_off=frozenset())
+    assert fork_refresh._shared_template_held is True
+
+
+def test_a_hold_set_after_the_baseline_was_seeded_still_rebuilds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kiro_crew.platform.context import governance_generation
+
+    calls: list[int] = []
+
+    def fake_reporting(**kw: Any) -> tuple[Path, bool]:
+        calls.append(1)
+        kw["_held_out"].append(False)
+        return Path("kirocrew.json"), True
+
+    monkeypatch.setattr(agent, "rebuild_agent_config_reporting", fake_reporting)
+    monkeypatch.setattr(agent, "_projected_ceiling_generation", governance_generation())
+    agent.reproject_for_ceiling_change()
+    assert calls == [], "an unchanged generation with no hold rebuilds nothing"
+    monkeypatch.setattr(agent, "_conductor_spec_held", True)
+    agent.reproject_for_ceiling_change()
+    assert calls == [1], "a hold must not be skipped as an unchanged generation"

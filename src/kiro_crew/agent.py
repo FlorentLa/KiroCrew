@@ -3806,7 +3806,9 @@ def reproject_for_ceiling_change() -> None:
     from kiro_crew.platform.context import governance_generation
 
     generation = governance_generation()
-    if _projected_ceiling_generation == generation:
+    if _projected_ceiling_generation == generation and not _conductor_spec_held:
+        # A hold set after the baseline was seeded (the boot path's deferred
+        # template pass) keeps an unchanged generation unprojected.
         return
     held_out: list[bool] = []
     _path, wrote = rebuild_agent_config_reporting(_held_out=held_out)
@@ -4240,6 +4242,12 @@ def rebuild_agent_config(
         sync_aim_packages()
 
         fork_refresh.refresh_after_rebuild(refresh_forks, gated_off)
+        if refresh_forks is True and fork_refresh._shared_template_held:
+            # A crew-bound shared template kept grants the ceiling may now deny
+            # because its rewrite failed. Held like a conductor spec, so the
+            # ceiling memo stays behind and the next poll or wake retries.
+            conductor_held = True
+            _conductor_spec_held = True
 
         # Security: sanitize invalid hook keys in agent configs
         repair_agent_configs()
