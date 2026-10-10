@@ -83,6 +83,8 @@ import { triggerRefresh, updateSlot } from '../store/dashboardSlice'
 import { inFlightSlotSwitchOutcome, performSlotSwitch, stagedSlotSwitchTarget } from '../lib/slotSwitch'
 import { drainPendingChunks } from '../lib/pendingChunkDrain'
 import { performAgentSlotSwitch } from '../lib/agentSwitch'
+import { interceptSlashCommand, isInterceptedSlashCommand, isSideCommand } from '../pages/chat/ChatInput'
+import { extractKnowledgeQuery } from '../pages/chat/useKnowledgeFetch'
 import { api } from '../api/client'
 import { slotMessagesQueryKey } from '../api/slotMessagesQuery'
 import { resolveAskAfterSend } from '../lib/resolveAskAfterSend'
@@ -400,6 +402,9 @@ export default function ChatPane({
   // not persist — the shared toast is transient feedback, not the error surface.
   const [switchError, setSwitchError] = useState('')
   const [stopError, setStopError] = useState('')
+  // In-pane report of a client-only slash command that did not run, keyed by
+  // the slot it was typed in so a rebind does not carry it to another thread.
+  const [slashError, setSlashError] = useState<{ slot: string; message: string } | null>(null)
   // In-pane report of a title rename / regenerate that did not land (#9727):
   // the main header routes the same failure into its action banner.
   const [titleError, setTitleError] = useState<{ title: string; message: string } | null>(null)
@@ -1077,6 +1082,55 @@ export default function ChatPane({
     }))
   }, [dispatch, slotKey])
 
+  // Client-only slash commands (`/side`, `/btw`, `/agent <name>`,
+  // `/onboarding`) and the knowledge-fetch prefixes (`/kb`, `@kb`): the same
+  // matchers and the same `interceptSlashCommand` ChatPage.send runs, so the
+  // pane never posts them to the agent as text. The pane has no knowledge
+  // picker, and a host may give it no Side Chat (`openSideChat` omitted);
+  // those commands are refused here with the composer kept. Returns true when
+  // the composer text was a command (handled or refused), so the caller must
+  // not send it.
+  const interceptPaneSlash = useCallback((): boolean => {
+    // The next press retires the last refusal, whatever it carries.
+    setSlashError(null)
+    const raw = input.trim()
+    const knowledge = extractKnowledgeQuery(raw) !== null
+    if (!knowledge && !isInterceptedSlashCommand(raw)) return false
+    // A command ends a STREAMING dictation like a send does (ChatPage disarms
+    // before its intercept), or later speech would append to the command.
+    composerRef.current?.voice()?.disarmForSend()
+    const sentSlot = slotKey
+    if (knowledge || (isSideCommand(raw) && !openSideChat)) {
+      const command = raw.split(/\s/, 1)[0]
+      setSlashError({ slot: sentSlot, message: i18nT('pages.chatPage.command_not_available_here', { command }) })
+      return true
+    }
+    const blocks = readPastes()
+    const text = blocks.length ? expandPasteTokens(raw, blocks) : raw
+    void interceptSlashCommand(text, sentSlot, dispatch, {
+      ...(openSideChat ? { openSide: () => openSideChat(sentSlot) } : {}),
+    }).then(res => {
+      if (!res.intercepted) return
+      const live = mountedRef.current && slotKeyRef.current === sentSlot
+      if (res.failed) {
+        const fallback = res.stage === 'agent' ? 'pages.chatPage.agent_command_not_run' : 'pages.chatPage.side_command_not_run'
+        const message = res.error || i18nT(fallback)
+        // Off screen (the pane was rebound or is gone): the refusal goes to
+        // the sending slot's transcript, as reportUploadFailure does.
+        if (live) setSlashError({ slot: sentSlot, message })
+        else dispatch(appendSlotMessage({ slot: sentSlot, message: { role: 'error', content: message, cls: '' } }))
+        return
+      }
+      // Clear only the command this send took: newer text typed during the
+      // await is not the command and stays.
+      if (live && inputRef.current.trim() === raw && readPastes() === blocks) {
+        setInput('')
+        setPasteBlocks([])
+      }
+    })
+    return true
+  }, [input, slotKey, openSideChat, readPastes, setPasteBlocks, dispatch])
+
   const doSend = useCallback((optionText?: string, steerNow?: boolean) => {
     // `optionText` mirrors ChatPage.send's first parameter: the follow-up
     // bar's direct-send gesture (double-click / split button) hands the option
@@ -1102,6 +1156,10 @@ export default function ChatPane({
       composerRef.current?.voice()?.disarmForSend()
       return
     }
+    // An option answer is a payload for the agent, never a typed command.
+    // Before the quote is consumed: a command is not a send, so a staged
+    // quote stays staged for the real one.
+    if (!optionText && interceptPaneSlash()) return
     const sentQuote = optionText ? null : consumeQuote('').quote
     if (isEmptyTurn({ text, files: pendingFiles, quote: sentQuote })) return
     // A send while STREAMING dictation is live ends the dictation, before the
@@ -1267,7 +1325,7 @@ export default function ChatPane({
       if (!askAtSend) return
       void resolveAskAfterSend(receipt.body, askAtSend, dispatch, slotKey)
     })
-  }, [input, pendingFiles, pasteBlocks, setPasteBlocks, busy, slotKey, dispatch, restoreIntoComposer, reportSendFailure, scrollToBottom, consumeQuote, recoverQuoteInto])
+  }, [input, pendingFiles, pasteBlocks, setPasteBlocks, busy, slotKey, dispatch, restoreIntoComposer, reportSendFailure, scrollToBottom, consumeQuote, recoverQuoteInto, interceptPaneSlash])
 
   // Mid-turn steer: inject the composer content into the RUNNING turn instead
   // of queueing behind it. The pane's counterpart to ChatPage.steer, on the
@@ -1300,6 +1358,9 @@ export default function ChatPane({
     // is safe: the server finds no turn, dispatches one, and the receipt's
     // `turn` ruling demotes the steer bubble to a plain row.
     if (!running && !paneSlot?.running) { doSend(undefined, true); return }
+    // A command typed mid-turn is still a command, never steered in as text
+    // (ChatPage's steer gates on the same matcher).
+    if (interceptPaneSlash()) return
     const raw = input.trim()
     const askAtSteer = capturePendingAskId(store.getState().chat.pendingQuestions, slotKey)
     const files = pendingFiles
@@ -1377,7 +1438,7 @@ export default function ChatPane({
         void resolveAskAfterSend(receipt.body, askAtSteer, dispatch, slotKey)
       }
     })
-  }, [running, paneSlot?.running, doSend, input, pendingFiles, pasteBlocks, setPasteBlocks, slotKey, dispatch, reportSendFailure, restoreIntoComposer, consumeQuote, recoverQuoteInto])
+  }, [running, paneSlot?.running, doSend, input, pendingFiles, pasteBlocks, setPasteBlocks, slotKey, dispatch, reportSendFailure, restoreIntoComposer, consumeQuote, recoverQuoteInto, interceptPaneSlash])
 
   // Stop mirrors ChatPage's press protocol (ChatPage.onStop): the first press
   // is the cooperative cancel, a second press while the slot reports
@@ -2062,6 +2123,14 @@ export default function ChatPane({
         />
         {/* No hand-off: the composer draft is untouched by a failed stop; the
             turn is still running, so the Stop button stays for a retry. */}
+        {/* No hand-off: a refused command leaves its text in the composer. */}
+        <ErrorNotice
+          variant="inline"
+          className="mx-4 mt-2"
+          testId="chat-pane-slash-error"
+          message={slashError?.slot === slotKey ? slashError.message : ''}
+          onDismiss={() => setSlashError(null)}
+        />
         <ErrorNotice
           variant="inline"
           className="mx-4 mt-2"
