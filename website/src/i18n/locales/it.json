@@ -6443,7 +6443,9 @@
       "split_down": "Dividi in basso",
       "split_right": "Dividi a destra",
       "split_right_d": "Dividi a destra (⌘D)",
-      "type_to_filter": "Digita per filtrare…"
+      "type_to_filter": "Digita per filtrare…",
+      "earlier_conversation_show": "Ricominciato da capo alle {{time}} · Mostra i messaggi precedenti ({{count}})",
+      "earlier_conversation_hide": "Ricominciato da capo alle {{time}} · Nascondi i messaggi precedenti"
     },
     "cliPanel": {
       "copied": "Copiato",
@@ -17948,7 +17950,13 @@
       "dashboard_render_error": "Non e stato possibile disegnare questa dashboard.",
       "dashboard_frame_title": "Dashboard di {{crew}}",
       "dashboard_rendering": "Disegno della dashboard…",
-      "back_to_roster": "Torna ai compagni"
+      "back_to_roster": "Torna ai compagni",
+      "fresh_start": "Ricomincia da capo…",
+      "fresh_start_failed": "Non è stato possibile ricominciare da capo. La conversazione è rimasta.",
+      "fresh_start_confirm_title": "Far ricominciare questo compagno da capo?",
+      "fresh_start_confirm_body": "Quello che sta facendo si ferma e dimentica questa conversazione. I messaggi restano qui, ripiegati.",
+      "fresh_start_confirm_action": "Ricomincia da capo",
+      "fresh_start_hint": "Cancella la memoria di questo compagno. I messaggi restano."
     },
     "tasksCapacityCard": {
       "title": "Attività e capacità",

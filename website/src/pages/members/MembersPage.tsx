@@ -51,7 +51,7 @@
  */
 import { Fragment, lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, Check, ChevronRight, Circle, Goal, LayoutDashboard, Loader2, MessageCircleQuestionMark, Plus, RotateCw, Square, Star, X, Zap } from 'lucide-react'
+import { ArrowLeft, Check, ChevronRight, Circle, Goal, LayoutDashboard, Loader2, MessageCircleQuestionMark, Plus, RotateCcw, RotateCw, Square, Star, X, Zap } from 'lucide-react'
 import { usePreviewFlag } from '../../hooks/usePreviewFlag'
 import { PREVIEW_CREW, PREVIEW_DASHBOARD } from '../../utils/previewFlags'
 import { PanelRightSolid } from '../../components/icons/panels'
@@ -2057,6 +2057,26 @@ export default function MembersPage() {
     [orderedMembers, defaultAgent],
   )
   const activeSlot = active ? threadOutcome?.slot_key ?? '' : ''
+  // Fresh start: the server stops any turn and drops the conversation; the
+  // slot key and its transcript stay. Each slot's reset time folds the rows
+  // before it in the pane. Page state only: the rows are still on disk.
+  const [freshStarts, setFreshStarts] = useState<Record<string, string>>({})
+  const [freshStartError, setFreshStartError] = useState<{ slot: string; message: string; report?: ErrorReport } | null>(null)
+  const freshStart = useMutation({
+    mutationFn: ({ slug }: { slug: string; slot: string }) => api.memberFreshStart(slug),
+    onMutate: () => setFreshStartError(null),
+    // Fold only once the conversation is gone. A queued clear (the session was
+    // still busy) says so in the transcript line the clear path writes.
+    onSuccess: (res, { slot }) => { if (res.outcome === 'cleared') setFreshStarts((prev) => ({ ...prev, [slot]: res.reset_at })) },
+    onError: (err: unknown, { slot }) => setFreshStartError({
+      slot,
+      message: t('pages.membersPage.fresh_start_failed'),
+      report: findReport(err instanceof Error ? err.message : undefined),
+    }),
+  })
+  // The page's themed confirm, as the Schedules guard uses: one ask, naming
+  // what stops and what stays.
+  const { confirm: confirmFreshStart, confirmDialog: freshStartConfirmDialog } = useConfirm()
   // The Crewmates preview. Mate is created in the background whatever it says,
   // but nothing about Mate is put in front of the user -- no landing, no
   // welcome -- until the preview is on and the page is opened.
@@ -4366,6 +4386,35 @@ export default function MembersPage() {
                     would otherwise be announced on every change. It is in the
                     reading order for a reader who asks. */}
                 <span className="sr-only" data-testid="member-pill-activity-sr">{pillActivity.label}{isLoopOn(active) ? ` · ${t('pages.membersPage.loop_on')}` : ''}</span>
+                {/* Fresh start: one confirm, because it drops the crewmate's
+                    working context. Only on a bound thread. */}
+                {activeSlot && (
+                  <Glass
+                    as="button"
+                    variant="chip"
+                    radius={999}
+                    disabled={freshStart.isPending}
+                    onClick={() => {
+                      const slug = active.slug
+                      const slot = activeSlot
+                      void confirmFreshStart({
+                        title: t('pages.membersPage.fresh_start_confirm_title'),
+                        body: t('pages.membersPage.fresh_start_confirm_body'),
+                        confirmLabel: t('pages.membersPage.fresh_start_confirm_action'),
+                        danger: false,
+                      }).then((ok) => { if (ok) freshStart.mutate({ slug, slot }) })
+                    }}
+                    // Below sm the header's side columns are narrow: icon only,
+                    // still named by the label. The words show from sm up.
+                    className="glass-hover flex items-center justify-center gap-1.5 h-8 w-8 sm:w-auto sm:px-3 rounded-full shrink-0 text-[12.5px] font-medium text-text cursor-pointer disabled:opacity-50 disabled:cursor-default mr-1"
+                    aria-label={t('pages.membersPage.fresh_start')}
+                    title={t('pages.membersPage.fresh_start_hint')}
+                    data-testid="member-fresh-start"
+                  >
+                    {freshStart.isPending ? <Loader2 size={14} className="animate-spin" aria-hidden /> : <RotateCcw size={14} aria-hidden />}
+                    <span className="hidden sm:inline">{t('pages.membersPage.fresh_start')}</span>
+                  </Glass>
+                )}
                 {/* Glass, like the switcher opposite (#18325): on the floating
                     header a bare icon sat on scrolled text. */}
                 {showOpener && (
@@ -4458,6 +4507,18 @@ export default function MembersPage() {
                 hand-off: the ChatPane below holds the DM composer draft as
                 unsaved local state (its own notices say the same), and the
                 agent hand-off navigates away, which would unmount it. */}
+            {/* No hand-off: the ChatPane below holds the DM composer draft. */}
+            {freshStartError && freshStartError.slot === activeSlot && (
+              <ErrorNotice
+                message={freshStartError.message}
+                report={freshStartError.report}
+                onDismiss={() => setFreshStartError(null)}
+                askAgent={false}
+                variant="inline"
+                className="mx-4 mb-2"
+                testId="member-fresh-start-error"
+              />
+            )}
             {actionError && (
               <ErrorNotice
                 message={actionError}
@@ -4672,6 +4733,7 @@ export default function MembersPage() {
                     // ready" would contradict it one line down.
                     // A greeting card above already speaks for the empty chat.
                     hideEmptyHint={activeThreadFailed || mateGreeting?.kind === 'cold'}
+                    foldBefore={freshStarts[activeSlot]}
                     // Under the floating header only when nothing sits between
                     // them (see the block above); a card between already paid.
                     topInset={betweenHeaderH > 0 ? 0 : threadHeaderH}
@@ -5231,6 +5293,7 @@ export default function MembersPage() {
           the section's collapse toggle, so it must sit outside the panel subtree the
           answer may unmount. */}
       {schedConfirmDialog}
+      {freshStartConfirmDialog}
       {/* CREW-18688: the bot-edit modal, opened in place by the thread header's
           identity pill (member-identity-pill). Renders nothing until editingCrew is
           set; the hook returns open=false until its roster read resolves the

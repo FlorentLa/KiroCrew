@@ -6342,7 +6342,9 @@
       "split_down": "নিচে ভাগ করুন",
       "split_right": "ডানে ভাগ করুন",
       "split_right_d": "ডানে ভাগ করুন (⌘D)",
-      "type_to_filter": "ফিল্টার করতে লিখুন…"
+      "type_to_filter": "ফিল্টার করতে লিখুন…",
+      "earlier_conversation_show": "{{time}}-এ নতুন করে শুরু · আগের মেসেজ দেখাও ({{count}})",
+      "earlier_conversation_hide": "{{time}}-এ নতুন করে শুরু · আগের মেসেজ লুকাও"
     },
     "cliPanel": {
       "copied": "কপি হয়েছে",
@@ -17690,7 +17692,13 @@
       "dashboard_render_error": "এই ড্যাশবোর্ড আঁকা যায়নি।",
       "dashboard_frame_title": "{{crew}}-এর ড্যাশবোর্ড",
       "dashboard_rendering": "ড্যাশবোর্ড আঁকা হচ্ছে…",
-      "back_to_roster": "সঙ্গীদের তালিকায় ফিরুন"
+      "back_to_roster": "সঙ্গীদের তালিকায় ফিরুন",
+      "fresh_start": "নতুন করে শুরু…",
+      "fresh_start_failed": "নতুন করে শুরু শেষ হয়নি। কথোপকথন রাখা আছে।",
+      "fresh_start_confirm_title": "এই সঙ্গীকে নতুন করে শুরু করাবে?",
+      "fresh_start_confirm_body": "সে যা করছে তা থেমে যাবে, আর সে এই কথোপকথন ভুলে যাবে। মেসেজগুলো এখানেই ভাঁজ করা থাকবে।",
+      "fresh_start_confirm_action": "নতুন করে শুরু করো",
+      "fresh_start_hint": "এই সঙ্গীর মেমরি মুছে দাও। মেসেজগুলো থেকে যাবে।"
     },
     "tasksCapacityCard": {
       "title": "কাজ ও সামর্থ্য",
