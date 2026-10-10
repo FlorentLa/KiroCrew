@@ -617,3 +617,53 @@ def test_an_unrelated_app_swap_does_not_fence_a_read(monkeypatch):
         pass
 
     assert not manager_mod._tree_swap_spanned(before, manager_mod._tree_swap_state(APP))
+
+
+def test_the_allowlist_prime_refreshes_off_the_event_loop(monkeypatch):
+    """A cache miss reads the app's tree in a worker thread, never on the loop."""
+    import asyncio
+    import threading
+
+    monkeypatch.setattr(token_auth, "_app_perms_cache", {})
+    seen: list[int] = []
+
+    def _fake(name):
+        seen.append(threading.get_ident())
+        with token_auth._app_perms_lock:
+            token_auth._app_perms_cache[name] = (token_auth.time.time(), ("/api/x",))
+        return ("/api/x",)
+
+    monkeypatch.setattr(token_auth, "_app_api_allowlist", _fake)
+
+    async def _run() -> int:
+        await token_auth._prime_app_api_allowlist(APP)
+        # A fresh entry is not refreshed again.
+        await token_auth._prime_app_api_allowlist(APP)
+        return threading.get_ident()
+
+    loop_thread = asyncio.run(_run())
+    assert len(seen) == 1
+    assert seen[0] != loop_thread
+
+
+def test_the_allowlist_prime_refreshes_an_entry_near_expiry(monkeypatch):
+    """An entry inside the margin is dropped so the same request finds it fresh."""
+    import asyncio
+
+    stale = token_auth.time.time() - (token_auth._APP_PERMS_TTL - 1.0)
+    monkeypatch.setattr(token_auth, "_app_perms_cache", {APP: (stale, ())})
+    calls: list[str] = []
+    monkeypatch.setattr(token_auth, "_app_api_allowlist", lambda name: calls.append(name) or ())
+
+    asyncio.run(token_auth._prime_app_api_allowlist(APP))
+    assert calls == [APP]
+    assert APP not in token_auth._app_perms_cache  # the fake stores nothing back
+
+
+def test_the_allowlist_prime_skips_dashboard_tokens(monkeypatch):
+    import asyncio
+
+    calls: list[str] = []
+    monkeypatch.setattr(token_auth, "_app_api_allowlist", lambda name: calls.append(name) or ())
+    asyncio.run(token_auth._prime_app_api_allowlist(""))
+    assert calls == []
