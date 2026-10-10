@@ -1602,6 +1602,51 @@ class _TaskqBridgeMixin(ManagerComponent):
             return []
         return [r.id for r in rows]
 
+    async def has_pending_store_children_async(self, parent_session_key: str) -> bool:
+        """Whether *parent_session_key* owns a waiting row only the store holds.
+
+        The store-side half of ``has_live_or_queued_children``: a claimable row
+        of this parent that is NOT in the in-memory window and has no live run,
+        i.e. a durable-only spawn the memory floor deferred, or a window-held
+        waiter the refill has not hydrated. The retire path's teardown already
+        cancels exactly these rows (``cancel_for_teardown_impl`` sweeps
+        ``taskq_pending_ids_for_async(include_window=True)``), so the deferral
+        decision must count them too, or the sweep retires an idle parent and
+        cancels a child it could not see.
+
+        Read on the writer thread (``store.run``), never on the loop: a
+        synchronous ``list_pending`` here waits on the store lock a writer holds
+        across ``BEGIN IMMEDIATE``'s busy wait, which would freeze every chat and
+        heartbeat for as long as the busy wait lasts. The identity sweep calls
+        this BEFORE it takes the registry locks and feeds the answer into the
+        synchronous decision, so the decision itself still takes no await under
+        the lock. Bounded to existence (``limit=1``). The excluded ids match
+        ``taskq_pending_ids_for_async(include_window=True)``: window rows kept
+        (``window=False``) and admitted (claimed-not-started) rows left out, which
+        the teardown refuses as well (``allow_admitted=False``).
+
+        A refused read is NOT answered False: that would read a parent with an
+        accepted durable child as childless and let the sweep cancel it. The read
+        error propagates so the caller can treat the parent as "unknown" and defer
+        its retirement with an incomplete sweep, the same fail-safe the teardown's
+        own reading takes.
+        """
+        from kiro_crew import taskq as _taskq
+
+        store = self.taskq_store()
+        if store is None or not parent_session_key:
+            return False
+        rows = await store.run(
+            store.list_pending,
+            _taskq.KIND_SUBAGENT,
+            session_key=parent_session_key,
+            exclude_ids=self.taskq_excluded_ids(window=False),
+            include_admitted=False,
+            exclude_admitted_ids=list(self._manager._agents),
+            limit=1,
+        )
+        return bool(rows)
+
     async def taskq_pending_ids_for_async(
         self, parent_session_key: str, *, include_window: bool = False
     ) -> list[str]:

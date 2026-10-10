@@ -60,6 +60,14 @@ def _mock_provider_factory():
         m.has_active_turn = lambda: False
         m.runtime_abort_target = lambda: None
         m.stream_command = MagicMock(side_effect=_empty_provider_stream)
+        # Explicit, not AsyncMock-generated: the identity sweep reads this through
+        # ``spawn_identity_of`` to decide whether a source the holder spawned under
+        # dropped. An auto-generated Mock attribute is truthy and reads as a bogus
+        # stamp; "" is the realistic unstamped default (pre-stamping spare treatment).
+        # ``_runtime`` is cleared too, because ``spawn_identity_of`` falls back to
+        # ``_runtime.spawn_identity`` and an auto-Mock runtime would read truthy.
+        m.spawn_identity = ""
+        m._runtime = None
         return m
 
     return factory
@@ -101,6 +109,8 @@ def _alive_provider_factory():
         m.has_active_turn = lambda: False
         m.runtime_abort_target = lambda: None
         m.stream_command = MagicMock(side_effect=_empty_provider_stream)
+        m.spawn_identity = ""
+        m._runtime = None
         return m
 
     return factory
@@ -6915,17 +6925,38 @@ class TestParentEndCancelsItsChildren:
     """
 
     @staticmethod
-    def _recorder(children: dict[str, tuple[str, ...]] | None = None):
-        """A handler shaped like ``SubagentManager``'s two teardown halves.
+    def _recorder(
+        children: dict[str, tuple[str, ...]] | None = None,
+        *,
+        store_children: dict[str, bool] | None = None,
+        store_read_raises: bool = False,
+        on_store_probe=None,
+        fenced_children: dict[str, bool] | None = None,
+    ):
+        """A handler shaped like ``SubagentManager``'s teardown halves.
 
         Records the keys it was asked to snapshot and the id tuples it was asked
         to cancel, so a test can tell "asked about the right parent" apart from
         "cancelled the right runs".
+
+        The identity sweep now decides retire-vs-defer at the async teardown:
+        ``open_teardown_fence`` is called under the lock, then the decision reads
+        ``has_live_or_queued_children`` (in memory), ``has_fenced_children`` (the
+        fence), and ``has_pending_store_children`` (off-loop store). ``children``
+        drives the in-memory probe (default: a live child), ``store_children`` the
+        off-loop probe, ``fenced_children`` the fence probe, ``store_read_raises``
+        makes the store probe raise (unreadable store), and ``on_store_probe(key)``
+        runs inside that await so a test can mutate state during the read.
         """
         snapshotted: list[str] = []
         cancelled: list[tuple[str, ...]] = []
         probed: list[str] = []
+        store_probed: list[str] = []
+        fence_opened: list[str] = []
+        fence_released: list[str] = []
         owned = children if children is not None else {}
+        owned_store = store_children if store_children is not None else {}
+        owned_fenced = fenced_children if fenced_children is not None else {}
 
         class _Handler:
             def snapshot_teardown_children(self, parent_session_key: str) -> tuple[str, ...]:
@@ -6935,6 +6966,24 @@ class TestParentEndCancelsItsChildren:
             def has_live_or_queued_children(self, parent_session_key: str) -> bool:
                 probed.append(parent_session_key)
                 return bool(owned.get(parent_session_key, ("run-1",)))
+
+            def open_teardown_fence(self, parent_session_key: str):
+                fence_opened.append(parent_session_key)
+                return set()
+
+            def has_fenced_children(self, parent_session_key: str) -> bool:
+                return bool(owned_fenced.get(parent_session_key, False))
+
+            def release_teardown_fence(self, parent_session_key: str, expected=None) -> None:
+                fence_released.append(parent_session_key)
+
+            async def has_pending_store_children(self, parent_session_key: str) -> bool:
+                store_probed.append(parent_session_key)
+                if on_store_probe is not None:
+                    on_store_probe(parent_session_key)
+                if store_read_raises:
+                    raise RuntimeError("store read failed")
+                return bool(owned_store.get(parent_session_key, False))
 
             async def cancel_for_teardown(
                 self,
@@ -6947,6 +6996,9 @@ class TestParentEndCancelsItsChildren:
                 return len(tuple(agent_ids))
 
         _Handler.probed = probed  # type: ignore[attr-defined]
+        _Handler.store_probed = store_probed  # type: ignore[attr-defined]
+        _Handler.fence_opened = fence_opened  # type: ignore[attr-defined]
+        _Handler.fence_released = fence_released  # type: ignore[attr-defined]
         return snapshotted, cancelled, _Handler()
 
     @pytest.mark.asyncio
@@ -7152,6 +7204,333 @@ class TestParentEndCancelsItsChildren:
         assert complete is False  # the sweep stays incomplete, as for a busy holder
         assert "dashboard:chat-9" in mgr._sessions
         assert mgr._sessions["dashboard:chat-9"].retire_on_identity_change is True
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_identity_retire_spares_a_parent_with_only_a_store_child(self, cfg):
+        """A parent whose only child is durable-only (held by the task store, no
+        in-memory run) is deferred too, not retired.
+
+        The in-memory probe answers "no child", but the retirement teardown would
+        still cancel the store row. The sweep reads the store side off the loop
+        (``has_pending_store_children``) before taking its locks and defers on a
+        hit, so the decision matches what the teardown cancels.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        # No in-memory child, but the store holds a waiting child for this key.
+        snapshotted, seen, cb = self._recorder(
+            {"dashboard:chat-9": ()},
+            store_children={"dashboard:chat-9": True},
+        )
+        mgr.set_child_teardown_handler(cb)
+        await mgr.get_or_create("dashboard:chat-9")
+        mgr.release("dashboard:chat-9")
+
+        with patch(
+            "kiro_crew.session._provider_uses_kiro_identity_store",
+            return_value=True,
+        ):
+            retired, complete = await mgr.retire_kiro_identity_sessions(spare_children=True)
+
+        assert retired == []
+        assert seen == []  # the store child was never cancelled
+        assert "dashboard:chat-9" in cb.store_probed  # the off-loop store read ran
+        assert snapshotted == []
+        assert complete is False
+        assert "dashboard:chat-9" in mgr._sessions
+        assert mgr._sessions["dashboard:chat-9"].retire_on_identity_change is True
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_identity_retire_defers_when_the_store_read_fails(self, cfg):
+        """An unreadable store defers the parent rather than retiring it.
+
+        If the store read fails, the parent might own an accepted durable child;
+        retiring it would cancel that child. The sweep treats a failed read as
+        "unknown" and defers, the same fail-safe the sign-out and empty-fingerprint
+        paths take.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        # No in-memory child, and the store read raises.
+        snapshotted, seen, cb = self._recorder(
+            {"dashboard:chat-9": ()},
+            store_read_raises=True,
+        )
+        mgr.set_child_teardown_handler(cb)
+        await mgr.get_or_create("dashboard:chat-9")
+        mgr.release("dashboard:chat-9")
+
+        with patch(
+            "kiro_crew.session._provider_uses_kiro_identity_store",
+            return_value=True,
+        ):
+            retired, complete = await mgr.retire_kiro_identity_sessions(spare_children=True)
+
+        assert retired == []  # not retired on an unreadable store
+        assert seen == []  # nothing cancelled
+        assert "dashboard:chat-9" in cb.store_probed
+        assert complete is False
+        assert "dashboard:chat-9" in mgr._sessions
+        assert mgr._sessions["dashboard:chat-9"].retire_on_identity_change is True
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_identity_retire_defers_on_a_child_admitted_during_the_teardown(self, cfg):
+        """A child admitted through /api/spawn while the retire decision runs is
+        seen via the teardown fence and the parent is deferred, not retired.
+
+        The decision reads the store off the loop at the async teardown. The old
+        preflight read could go stale: a /api/spawn admission landing after a
+        negative read still cancelled the accepted child. Now the fence that
+        admission records into (``note_teardown_store_accept``) is opened under the
+        registry lock BEFORE the read, so an admission concurrent with the decision
+        is in ``has_fenced_children`` and defers the parent -- no in-memory and no
+        store row needed.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        # No in-memory child, no pre-existing store row, but a child WAS admitted
+        # into the fence since it opened (the concurrent /api/spawn).
+        snapshotted, seen, cb = self._recorder(
+            {"dashboard:chat-9": ()},
+            fenced_children={"dashboard:chat-9": True},
+        )
+        mgr.set_child_teardown_handler(cb)
+        await mgr.get_or_create("dashboard:chat-9")
+        mgr.release("dashboard:chat-9")
+
+        with patch(
+            "kiro_crew.session._provider_uses_kiro_identity_store",
+            return_value=True,
+        ):
+            retired, complete = await mgr.retire_kiro_identity_sessions(spare_children=True)
+
+        assert retired == []
+        assert seen == []  # the admitted child was never cancelled
+        assert "dashboard:chat-9" in cb.fence_opened  # fence opened under the lock
+        assert snapshotted == []  # no cancel snapshot taken for a spared parent
+        assert complete is False
+        assert "dashboard:chat-9" in mgr._sessions
+        assert mgr._sessions["dashboard:chat-9"].retire_on_identity_change is True
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_identity_retire_defers_on_a_pre_existing_durable_child(self, cfg):
+        """A durable-only child accepted BEFORE the fence opened is seen by the
+        off-loop store read and the parent is deferred.
+
+        The fence only records admissions since it opened; a child admitted
+        earlier is only in the store. The async decision reads the store off the
+        loop (``has_pending_store_children``) for exactly this case.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        # No in-memory child, nothing in the fence, but a pre-existing store row.
+        snapshotted, seen, cb = self._recorder(
+            {"dashboard:chat-9": ()},
+            store_children={"dashboard:chat-9": True},
+        )
+        mgr.set_child_teardown_handler(cb)
+        await mgr.get_or_create("dashboard:chat-9")
+        mgr.release("dashboard:chat-9")
+
+        with patch(
+            "kiro_crew.session._provider_uses_kiro_identity_store",
+            return_value=True,
+        ):
+            retired, complete = await mgr.retire_kiro_identity_sessions(spare_children=True)
+
+        assert retired == []
+        assert seen == []  # the durable child was never cancelled
+        assert "dashboard:chat-9" in cb.store_probed  # the off-loop read ran
+        assert snapshotted == []
+        assert complete is False
+        assert "dashboard:chat-9" in mgr._sessions
+        assert mgr._sessions["dashboard:chat-9"].retire_on_identity_change is True
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_identity_retire_defers_a_turn_that_starts_during_the_read(self, cfg):
+        """A turn that takes the parent's semaphore during the off-loop read is
+        deferred, not shut down mid-turn.
+
+        Selection and the pop were one lock hold before the teardown redesign; the
+        off-loop read reopened that gap. A turn from a path that does not go through
+        the dashboard gate (a channel or cron) can take the semaphore in it, so the commit
+        block re-checks ``semaphore.locked()`` under the re-taken lock and defers
+        rather than ``provider.shutdown()`` a live turn. A deferred parent also
+        drops its old-account sid, so its cold-started successor does not reload the
+        previous account's conversation.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+
+        # No child anywhere, so the parent would be retired -- except a turn takes
+        # its semaphore during the off-loop read (simulated inside the probe).
+        def _start_a_turn_during_read(key: str) -> None:
+            if key == "dashboard:chat-9":
+                # A turn claims the session: take its semaphore, as a non-dashboard
+                # path would without clearing retire_on_identity_change.
+                mgr._sessions["dashboard:chat-9"].semaphore._value = 0
+
+        snapshotted, seen, cb = self._recorder(
+            {"dashboard:chat-9": ()},
+            on_store_probe=_start_a_turn_during_read,
+        )
+        mgr.set_child_teardown_handler(cb)
+        await mgr.get_or_create("dashboard:chat-9")
+        mgr.release("dashboard:chat-9")  # idle at selection time
+
+        sid_cleared: list[str] = []
+        orig_clear = mgr._session_map.clear_sid
+        with (
+            patch(
+                "kiro_crew.session._provider_uses_kiro_identity_store",
+                return_value=True,
+            ),
+            patch.object(
+                mgr._session_map,
+                "clear_sid",
+                side_effect=lambda k: (sid_cleared.append(k), orig_clear(k))[1],
+            ),
+        ):
+            retired, complete = await mgr.retire_kiro_identity_sessions(spare_children=True)
+
+        assert retired == []  # not retired: a turn was running
+        assert seen == []  # nothing cancelled -- no shutdown of a live turn
+        assert snapshotted == []
+        assert "dashboard:chat-9" in mgr._sessions
+        assert mgr._sessions["dashboard:chat-9"].retire_on_identity_change is True
+        assert "dashboard:chat-9" in sid_cleared  # old-account sid dropped
+        assert complete is False
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_identity_retire_defers_a_child_admitted_during_the_read(self, cfg):
+        """A child admitted during the off-loop store read is seen by the commit
+        block's re-check and the parent is deferred, not retired.
+
+        ``_parent_has_sparable_child`` can read childless and then an ``/api/spawn``
+        admission for the parent lands during the await, recording the child in the
+        fence. Committing would snapshot and cancel that newly accepted child, so
+        the commit block re-reads the in-memory and fence child checks under its
+        lock and defers when a child appeared.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+
+        # No child at the sparable read, but one is admitted into the fence during
+        # the store probe (the concurrent /api/spawn). ``fenced`` is the dict the
+        # recorder's ``has_fenced_children`` reads, so flipping it mid-read is seen
+        # by the commit block's re-check.
+        fenced: dict[str, bool] = {}
+
+        def _admit_during_read(key: str) -> None:
+            if key == "dashboard:chat-9":
+                fenced["dashboard:chat-9"] = True
+
+        snapshotted, seen, cb = self._recorder(
+            {"dashboard:chat-9": ()},
+            fenced_children=fenced,
+            on_store_probe=_admit_during_read,
+        )
+        mgr.set_child_teardown_handler(cb)
+        await mgr.get_or_create("dashboard:chat-9")
+        mgr.release("dashboard:chat-9")
+
+        with patch(
+            "kiro_crew.session._provider_uses_kiro_identity_store",
+            return_value=True,
+        ):
+            retired, complete = await mgr.retire_kiro_identity_sessions(spare_children=True)
+
+        assert retired == []  # not retired: a child arrived during the read
+        assert seen == []  # the newly admitted child was never cancelled
+        assert snapshotted == []  # no cancel snapshot taken
+        assert "dashboard:chat-9" in mgr._sessions
+        assert mgr._sessions["dashboard:chat-9"].retire_on_identity_change is True
+        assert complete is False
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_identity_retire_cancels_when_a_spawn_stamp_source_dropped(self, cfg):
+        """A parent is spared only while every source it spawned under is still live.
+
+        The retire baseline advances only on a COMPLETE sweep, so a credential
+        source added and then removed inside an incomplete one is invisible to a
+        baseline comparison: it compares two states that never held the source.
+        The parent's OWN spawn stamp did hold it -- it is the identity its children
+        loaded -- so the spare is gated on the stamp directly. Here the parent
+        spawned under store + vault, then the store source is gone from live (an
+        external logout with the vault still populated): a component of its spawn
+        identity dropped, so the parent is retired and its child cancelled, not
+        spared, exactly as the sign-out path does.
+        """
+        import kiro_crew.kiro_prerequisite as kp
+
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        # The default recorder reports a live child for any key.
+        snapshotted, seen, cb = self._recorder()
+        mgr.set_child_teardown_handler(cb)
+        await mgr.get_or_create("dashboard:chat-9")
+        mgr.release("dashboard:chat-9")
+
+        # The parent authenticated under store S AND the Crew vault V.
+        spawn_stamp = kp._combine_identity_fingerprints("S", "V")
+        mgr._sessions["dashboard:chat-9"].provider.spawn_identity = spawn_stamp
+        # Live now holds only the vault: the store source dropped (external logout).
+        live_vault_only = kp._combine_identity_fingerprints("", "V")
+
+        with patch(
+            "kiro_crew.session._provider_uses_kiro_identity_store",
+            return_value=True,
+        ):
+            retired, complete = await mgr.retire_kiro_identity_sessions(
+                fingerprint=live_vault_only, spare_children=True
+            )
+
+        # A dropped spawn-stamp source forces the cancel path even though the
+        # parent has a live child and spare_children is True.
+        assert retired == ["dashboard:chat-9"]
+        assert seen == [("run-1",)]  # the child WAS cancelled
+        assert snapshotted == ["dashboard:chat-9"]  # teardown snapshot taken
+        assert complete is True
+        assert "dashboard:chat-9" not in mgr._sessions
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_identity_retire_still_spares_when_the_spawn_stamp_is_whole(self, cfg):
+        """The converse: when every spawn-stamp source is still present in live, a
+        parent with live children is still spared (a plain two-account switch that
+        adds nothing and drops nothing).
+        """
+        import kiro_crew.kiro_prerequisite as kp
+
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        snapshotted, seen, cb = self._recorder()
+        mgr.set_child_teardown_handler(cb)
+        await mgr.get_or_create("dashboard:chat-9")
+        mgr.release("dashboard:chat-9")
+
+        # Spawned under store S + vault V; live still carries both (plus nothing
+        # dropped). The provider is NOT spawned_under live (S2 != S), so it reaches
+        # the spare decision rather than being spared as the live account.
+        mgr._sessions["dashboard:chat-9"].provider.spawn_identity = (
+            kp._combine_identity_fingerprints("S", "V")
+        )
+        live_switched = kp._combine_identity_fingerprints("S2", "V")
+
+        with patch(
+            "kiro_crew.session._provider_uses_kiro_identity_store",
+            return_value=True,
+        ):
+            retired, complete = await mgr.retire_kiro_identity_sessions(
+                fingerprint=live_switched, spare_children=True
+            )
+
+        # Nothing dropped from the spawn stamp (store changed, vault kept), so the
+        # parent with a live child is spared.
+        assert retired == []
+        assert seen == []
+        assert "dashboard:chat-9" in mgr._sessions
+        assert mgr._sessions["dashboard:chat-9"].retire_on_identity_change is True
+        assert complete is False
         await mgr.close_all()
 
     @pytest.mark.asyncio
@@ -7485,7 +7864,9 @@ class TestParentEndCancelsItsChildren:
         assert queued.has_live_or_queued_children_impl("dashboard:chat-9") is True
 
         # Only a finished child, or one parked at a spawn approval, or a resume
-        # row -> False (nothing a retirement would cancel).
+        # row -> False (nothing a retirement would cancel). This is the IN-MEMORY
+        # half only: a durable-only / window-held store child is read off the loop
+        # by the sweep's own probe (``_parent_has_store_children``), not here.
         idle_mgr = _Manager(
             {
                 "done": _run("done", done=True),

@@ -1011,7 +1011,7 @@ class CancellationCoordinator(ManagerComponent):
         running_stopped = sum(result is True for result in results)
         return (running_stopped, queued_stopped)
 
-    def note_teardown_snapshot(self, parent_session_key: str) -> None:
+    def note_teardown_snapshot(self, parent_session_key: str) -> "set[str] | None":
         """Open the fence for the store sweep of the parent-end cancel that
         follows (``accepted_since`` on :meth:`cancel_for_teardown_impl`):
         from here on, every row the store accepts for *parent_session_key* is
@@ -1023,11 +1023,18 @@ class CancellationCoordinator(ManagerComponent):
         snapshot, so two teardowns of one key whose cancels overlap both spare
         only rows accepted after a conversation that has since ended let go of
         the key. No store, nothing to sweep: no fence.
+
+        Returns the fence set it created, so a caller that may DEFER (the
+        identity sweep) can release exactly its own fence later and never a
+        newer one a concurrent teardown opened. ``None`` when no store, so there
+        is nothing to release.
         """
         if self._manager._admission.taskq_store() is None or not parent_session_key:
-            return
+            return None
+        fence: set[str] = set()
         with self._manager._teardown_fence_lock:
-            self._manager._teardown_store_fences[parent_session_key] = set()
+            self._manager._teardown_store_fences[parent_session_key] = fence
+        return fence
 
     def take_teardown_snapshot(self, parent_session_key: str) -> set[str] | None:
         """The fence :meth:`note_teardown_snapshot` opened, consumed by the cancel
@@ -1039,6 +1046,59 @@ class CancellationCoordinator(ManagerComponent):
             if fence is not None:
                 self._manager._teardown_store_sweeps.append((parent_session_key, fence))
         return fence
+
+    def has_fenced_children_impl(self, parent_session_key: str) -> bool:
+        """Whether this parent's OPEN identity-sweep fence recorded any admitted
+        child.
+
+        The identity sweep opens a TENTATIVE fence under the registry lock and
+        reads it at the async teardown; a child the admission path accepted in
+        between is recorded into it (``note_teardown_store_accept``), so this
+        answers "did a child arrive since the fence opened" without a store read.
+        Read under the fence lock, the same lock the admission records under.
+        """
+        with self._manager._teardown_fence_lock:
+            fence = self._manager._identity_sweep_fences.get(parent_session_key)
+            return bool(fence)
+
+    def open_identity_sweep_fence_inner(self, parent_session_key: str) -> "set[str] | None":
+        """Open a TENTATIVE identity-sweep fence that records admissions but does
+        NOT suppress delivery.
+
+        The identity sweep opens this before it decides retire-vs-defer. Unlike
+        :meth:`note_teardown_snapshot`'s committed fence, it is kept in
+        ``_identity_sweep_fences`` and is invisible to
+        :meth:`accepted_before_open_teardown`, so an expiring row's delivery is
+        NOT dropped on the strength of a retirement that has not committed (the
+        parent may be spared). The admission path records into it alongside the
+        committed fences, so :meth:`has_fenced_children_impl` sees a concurrent
+        admission. Returns the set so the sweep can release exactly its own.
+        """
+        if self._manager._admission.taskq_store() is None or not parent_session_key:
+            return None
+        fence: set[str] = set()
+        with self._manager._teardown_fence_lock:
+            self._manager._identity_sweep_fences[parent_session_key] = fence
+        return fence
+
+    def release_teardown_fence_impl(
+        self, parent_session_key: str, expected: "AbstractSet[str] | None" = None
+    ) -> None:
+        """Drop this parent's TENTATIVE identity-sweep fence (DEFER or commit).
+
+        The sweep opened it with :meth:`open_identity_sweep_fence_inner`; whichever
+        way the decision goes, the tentative fence has served its purpose (a commit
+        opens a fresh COMMITTED fence through ``snapshot_teardown_children``). The
+        drop is identity-guarded: a second sweep of the same key that opened a new
+        tentative fence during this one's read keeps its own.
+        ``None`` keeps the unconditional drop. Harmless if none is open."""
+        with self._manager._teardown_fence_lock:
+            if expected is None:
+                self._manager._identity_sweep_fences.pop(parent_session_key, None)
+                return
+            current = self._manager._identity_sweep_fences.get(parent_session_key)
+            if current is expected:
+                self._manager._identity_sweep_fences.pop(parent_session_key, None)
 
     def _owe_teardown_sweep(
         self, parent_session_key: str, fence: AbstractSet[str], verb: str
@@ -1104,6 +1164,9 @@ class CancellationCoordinator(ManagerComponent):
             fence = self._manager._teardown_store_fences.get(parent_session_key)
             if fence is not None:
                 fence.add(agent_id)
+            tentative = self._manager._identity_sweep_fences.get(parent_session_key)
+            if tentative is not None:
+                tentative.add(agent_id)
             for key, held in self._manager._teardown_store_sweeps:
                 if key == parent_session_key:
                     held.add(agent_id)

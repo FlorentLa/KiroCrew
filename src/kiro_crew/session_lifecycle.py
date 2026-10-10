@@ -20,9 +20,10 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable, MutableMapping, Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import AbstractSet, Any, Literal, Protocol
 
 from kiro_crew.kiro_prerequisite import (
+    identity_component_dropped,
     identity_park_grace_remaining,
     identity_stamp_mismatch,
     mark_identity_parked,
@@ -511,6 +512,16 @@ class _ChildTeardownHandler(Protocol):
     def snapshot_teardown_children(self, parent_session_key: str) -> tuple[str, ...]: ...
 
     def has_live_or_queued_children(self, parent_session_key: str) -> bool: ...
+
+    async def has_pending_store_children(self, parent_session_key: str) -> bool: ...
+
+    def open_teardown_fence(self, parent_session_key: str) -> "AbstractSet[str] | None": ...
+
+    def has_fenced_children(self, parent_session_key: str) -> bool: ...
+
+    def release_teardown_fence(
+        self, parent_session_key: str, expected: "AbstractSet[str] | None" = None
+    ) -> None: ...
 
     async def cancel_for_teardown(
         self,
@@ -1696,25 +1707,44 @@ class SessionLifecycleService:
         # caller's own identity is not lost: the line's ``key`` carries it.
         await self._cancel_parent_children(key, teardown_children, verb="end_children_for")
 
-    def _parent_has_live_children(self, key: str) -> bool:
-        """Whether *key* owns a live or queued run, read synchronously and purely.
+    def _open_teardown_fence(self, key: str) -> "AbstractSet[str] | None":
+        """Open the teardown fence for *key* while the registry lock is held.
 
-        The deferral decision needs the live/queued answer WITHOUT the teardown:
-        :meth:`_snapshot_parent_children` arms the delivery gate, clears
-        ``pending_followups`` and cancels the follow-up watchers as it reads, so
-        calling it when the parent is being SPARED would discard exactly the
-        children's completions the sparing is meant to preserve. This asks the
-        same question with no side effect. Called under ``owner._lock`` for the
-        same no-drift reason the snapshot is.
+        Arms the admission path to record every child it accepts for this parent
+        from here on (``note_teardown_store_accept``), so the async retire-vs-defer
+        decision below sees a child that arrives between this point and its
+        off-loop store read instead of racing it. Takes no in-memory snapshot, so a
+        parent that is then spared keeps its children's completions.
+
+        Returns the fence handle so the async decision can release exactly this
+        fence if it defers, never a newer one a concurrent teardown opened.
+        """
+        handler = self._child_teardown
+        if handler is None or not key:
+            return None
+        return handler.open_teardown_fence(key)
+
+    async def _parent_has_sparable_child(self, key: str) -> bool:
+        """Whether *key* still owns a child the retirement must spare, read at the
+        async teardown under the fence opened by :meth:`_open_teardown_fence`.
+
+        True when a child is live or queued in memory, held only by the task store
+        (a durable-only or window-held row), OR admitted into the open fence since
+        it opened -- i.e. any child the retirement teardown would otherwise cancel.
+        A store read that FAILS raises, and the caller defers (fail-safe): a parent
+        with an accepted child read as childless would be retired and its child
+        cancelled.
         """
         handler = self._child_teardown
         if handler is None or not key:
             return False
-        try:
-            return handler.has_live_or_queued_children(key)
-        except Exception:
-            self._deps.logger.exception("Parent end %s: reading sub-agents failed", key)
-            return False
+        if handler.has_live_or_queued_children(key):
+            return True
+        if handler.has_fenced_children(key):
+            return True
+        # Off-loop (writer thread): pre-existing durable rows the fence did not
+        # record because they were accepted before it opened. Raises on failure.
+        return await handler.has_pending_store_children(key)
 
     def _snapshot_parent_children(self, key: str) -> tuple[str, ...]:
         """The runs *key* owns, read synchronously so the answer cannot drift.
@@ -2011,15 +2041,30 @@ class SessionLifecycleService:
         (``_retire_runtimes_after_sign_out``) keeps the cancel behaviour: on
         sign-out the parent and its children MUST be retired, or the children
         keep running on the signed-out account's in-memory credential. The
-        chat-turn caller passes ``bool(live)``: it defers only on a switch
-        between two real accounts, and an empty live fingerprint (an external
-        logout, which never reaches the sign-out handler) keeps the cancel
-        path for the same reason sign-out does.
+        chat-turn caller passes ``bool(live) and not identity_component_dropped``:
+        it defers only a whole switch between two real accounts; an empty live
+        fingerprint (an external logout, which never reaches the sign-out
+        handler) and a PARTIAL loss (a source present in the retire baseline but
+        gone from live) both keep the cancel path.
+
+        When ``spare_children`` is set the retire-vs-defer choice is NOT made
+        here under the registry lock: a candidate is left registered, its
+        teardown fence is opened (so a child the admission path accepts while the
+        decision runs is seen, not raced), and the choice is made at the ASYNC
+        teardown off the loop -- any child (live, queued, fenced or durable in the
+        store), or a failed store read, defers; a childless parent is retired
+        under a re-taken lock. One per-holder exception stays synchronous: a
+        parent whose OWN spawn stamp lost a component is retired and its children
+        cancelled (the fail-safe for an external logout the baseline missed).
         """
         owner = self._owner
         logger = self._deps.logger
         doomed: list[tuple[str, Any]] = []
         teardown_children_by_key: dict[str, tuple[str, ...]] = {}
+        # Candidates whose retire-vs-defer is resolved at the async teardown, which
+        # reads the store off the loop under the teardown fence: (key, session,
+        # fence) -- the fence handle is kept so a defer releases exactly its own.
+        maybe_spare: list[tuple[str, Any, "AbstractSet[str] | None"]] = []
         skipped = False
         waiting_on: list[str] = []
         # One sweep at a time: the drain below is not re-entrant (a second
@@ -2091,39 +2136,47 @@ class SessionLifecycleService:
                             waiting_on.append(f"{key} ({holder})")
                             continue
                         # An idle parent that ended its turn with ``spawn_run``
-                        # children still running passes the semaphore test above,
-                        # so retiring it here cancels those children as "provider
-                        # shutdown" every turn any chat takes while the sweep stays
-                        # incomplete. Treat live children the same way a mid-turn
-                        # session is treated: defer with ``retire_on_identity_change``
-                        # and leave the sweep incomplete, so the children outlive the
-                        # turn and the parent is recycled only once it is idle.
+                        # children still running passes the semaphore test above.
+                        # Whether to retire it (cancelling those children) or defer
+                        # it is NOT decided here under the lock: a durable-only child
+                        # lives in the task store, and reading the store on the loop
+                        # under this lock waits on the store's busy wait and freezes
+                        # the gateway. Instead the decision is made at the ASYNC
+                        # teardown, which reads the store off the loop under the
+                        # teardown fence -- the same ``_teardown_fence_lock`` the
+                        # admission path records a new child into
+                        # (``note_teardown_store_accept``), so a child admitted while
+                        # the decision runs is seen or ordered rather than raced.
                         #
-                        # The probe is the side-effect-free
-                        # ``_parent_has_live_children``, NOT ``_snapshot_parent_children``:
-                        # the snapshot arms the delivery gate, clears follow-ups and
-                        # cancels follow-up watchers, which would drop the completions
-                        # the sparing is meant to keep. A deferred parent is refused a
-                        # turn by session allocation (``_claim_turn`` sees
-                        # ``retire_on_identity_change``) and evicted by
-                        # ``_evict_stale_session``, which shuts the parent's provider
-                        # down WITHOUT ``_cancel_parent_children`` -- so the children
-                        # survive the eviction and their completions reach the successor
-                        # under the key.
+                        # The one case decided synchronously is a parent whose OWN
+                        # spawn stamp lost a credential component: that is the
+                        # identity its children loaded, so a component gone from it
+                        # means they may be running on a credential that is gone.
+                        # That parent is retired and its children cancelled, exactly
+                        # as the sign-out path does -- the fail-safe direction. An
+                        # unstamped parent (empty spawn identity) proves no drop, so
+                        # it takes the ordinary defer-at-teardown path.
                         #
-                        # Only when ``spare_children`` is set: the per-turn
-                        # identity-change sweep opts in, because it fires every turn and
-                        # cancelling live children each time is the regression. That
-                        # caller passes ``bool(live)``, so it defers only on a switch
-                        # between two real accounts; an empty live fingerprint (an
-                        # external logout) and the sign-out path both leave it False --
-                        # there the parent AND its children must be retired, or the
-                        # children keep running on a credential that is gone.
-                        if spare_children and self._parent_has_live_children(key):
-                            sess.retire_on_identity_change = True
-                            invalidated_keys.append(key)
-                            skipped = True
-                            waiting_on.append(f"{key} (subagents)")
+                        # ``spare_children`` is the per-turn identity-change opt-in
+                        # (it fires every turn, so cancelling live children each turn
+                        # is the regression). The sign-out path and an empty live
+                        # fingerprint leave it False and keep the retire-and-cancel
+                        # path, because there the account is gone.
+                        spawn_source_dropped = identity_component_dropped(
+                            spawn_identity_of(sess.provider), fingerprint
+                        )
+                        if spare_children and not spawn_source_dropped:
+                            # Defer the COMMIT to the async teardown. Open the fence
+                            # now (synchronously, under the lock) so an admission
+                            # between here and the off-loop read is recorded, and keep
+                            # the session registered -- nothing irreversible happens
+                            # for it under the lock, so "defer" there is simply not
+                            # retiring, never a rollback. The in-memory snapshot is
+                            # NOT taken here: it arms the delivery gate and tears down
+                            # follow-ups, which the parent must keep if it is spared;
+                            # the async decision takes it only if it commits.
+                            opened_fence = self._open_teardown_fence(key)
+                            maybe_spare.append((key, sess, opened_fence))
                             continue
                         del owner._sessions[key]
                         owner._advance_session_generation(key)
@@ -2143,7 +2196,9 @@ class SessionLifecycleService:
                     # loop below: that loop awaits, and a replacement session can
                     # register under a retired key while it does. Recorded as one
                     # set so the awaited unlink cannot be cancelled between two
-                    # keys and leave the rest behind as fabricated crashes.
+                    # keys and leave the rest behind as fabricated crashes. The
+                    # spare_children candidates committed at the async teardown
+                    # below record their ends there, under their own lock hold.
                     await record_sessions_ended(retired_keys, end_reason=END_REASON_RETIRED)
                 # Drop the pointer to each identity-changed session's NATIVE
                 # conversation, the same reason a provider switch drops it: the
@@ -2164,6 +2219,118 @@ class SessionLifecycleService:
                 # disk and must not run under the registry lock.
                 for key in invalidated_keys:
                     owner._session_map.clear_sid(key)
+
+                # Resolve the deferred spare_children candidates HERE, still inside
+                # the permit barrier (no successor can register a sid) but off the
+                # registry lock, so the store read runs on the writer thread. For
+                # each, ask whether a child the retirement would cancel still
+                # exists -- live or queued in memory, held only by the store, or
+                # admitted into the fence since it opened under the lock above.
+                #
+                #   * A child exists (or the store read FAILS): DEFER. Flag the
+                #     session for retirement on its next turn, cancel nothing, drop
+                #     the fence, and leave the sweep incomplete so the next sweep
+                #     re-checks. Nothing irreversible happened for this key under
+                #     the lock, so a defer is simply not retiring -- no rollback.
+                #   * No child: COMMIT the retirement now. Re-take the registry lock
+                #     to unregister (a successor that registered under the key while
+                #     the store read ran is left alone -- the pop is guarded on the
+                #     session identity), then shut the provider down and run the
+                #     cancel, which stops nothing because there is no child.
+                committed_spare: list[str] = []
+                for key, sess, fence in maybe_spare:
+                    try:
+                        has_child = await self._parent_has_sparable_child(key)
+                    except Exception:
+                        self._deps.logger.warning(
+                            "Identity sweep: reading the children of %s failed; "
+                            "deferring its retirement",
+                            key,
+                            exc_info=True,
+                        )
+                        has_child = True
+                    if has_child:
+                        sess.retire_on_identity_change = True
+                        handler = self._child_teardown
+                        if handler is not None:
+                            handler.release_teardown_fence(key, fence)
+                        # Drop the old-account sid the same way a retired key does:
+                        # a deferred parent is evicted and cold-started on its next
+                        # turn, and reloading the previous account's conversation is
+                        # the signed-thinking rejection the sweep's sid drop prevents.
+                        # Inside the permit barrier, where the retired keys clear it.
+                        owner._session_map.clear_sid(key)
+                        skipped = True
+                        waiting_on.append(f"{key} (subagents)")
+                        continue
+                    # No child: commit the retirement under the lock.
+                    async with owner._lock:
+                        if owner._sessions.get(key) is not sess:
+                            # A successor registered under the key while the read
+                            # ran; it is not ours to retire. Leave it, drop our
+                            # fence, and let the next sweep handle the successor.
+                            handler = self._child_teardown
+                            if handler is not None:
+                                handler.release_teardown_fence(key, fence)
+                            skipped = True
+                            waiting_on.append(f"{key} (successor)")
+                            continue
+                        if sess.semaphore.locked():
+                            # A turn started on this parent during the off-loop read.
+                            # Selection and the pop were ONE lock hold before this
+                            # redesign; the read reopened that gap, and a turn from a
+                            # path that does not go through the dashboard gate (a channel
+                            # or cron) can take the semaphore in it. Retiring now would
+                            # ``provider.shutdown()`` a live turn, so defer instead and
+                            # let the next sweep catch it idle.
+                            sess.retire_on_identity_change = True
+                            handler = self._child_teardown
+                            if handler is not None:
+                                handler.release_teardown_fence(key, fence)
+                            owner._session_map.clear_sid(key)
+                            skipped = True
+                            waiting_on.append(f"{key} (busy)")
+                            continue
+                        # Re-check for a child under this lock, AFTER the off-loop
+                        # read: an ``/api/spawn`` admission for this parent can land
+                        # during that await -- registering a live run or recording a
+                        # row in the fence -- after ``_parent_has_sparable_child``
+                        # already read childless. Committing now would snapshot and
+                        # cancel that newly accepted child. The in-memory and fence
+                        # reads are synchronous and cheap, so repeat them here (the
+                        # store half cannot be re-read on the loop, but an admission
+                        # that only wrote a store row also recorded it in the fence
+                        # before the write, so the fence check covers it). A child
+                        # that appeared defers, exactly as a busy turn does.
+                        handler = self._child_teardown
+                        if handler is not None and (
+                            handler.has_live_or_queued_children(key)
+                            or handler.has_fenced_children(key)
+                        ):
+                            sess.retire_on_identity_change = True
+                            handler.release_teardown_fence(key, fence)
+                            owner._session_map.clear_sid(key)
+                            skipped = True
+                            waiting_on.append(f"{key} (subagents)")
+                            continue
+                        del owner._sessions[key]
+                        owner._advance_session_generation(key)
+                        owner._compact_cooldown_until.pop(key, None)
+                        self._suppress_replay.discard(key)
+                        self._origin_links.pop(key, None)
+                        self.state.stop_requests.pop(key, None)
+                        self._discard_replay_gap(key)
+                        self.state.orphaned_holders.pop(key, None)
+                        teardown_children_by_key[key] = self._snapshot_parent_children(key)
+                        committed_spare.append(key)
+                    owner._session_map.clear_sid(key)
+                    doomed.append((key, sess.provider))
+                # The spare_children candidates committed at the teardown record
+                # their ends here, as one awaited set, still inside the permit
+                # barrier. The keys retired under the lock above recorded theirs
+                # there; these two groups are the retire path's two commit points.
+                if committed_spare:
+                    await record_sessions_ended(committed_spare, end_reason=END_REASON_RETIRED)
 
         retired: list[str] = []
         for key, provider in doomed:
