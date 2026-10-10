@@ -1272,10 +1272,12 @@ PACKAGE_FIELDS: dict[str, Any] = {
 class TestTheRealPackagePath:
     """The reader against a real ``kind="dashboard"`` artifact and the write gate.
 
-    The gate (``artifact_store.dashboard_package``) is the package line's and arrives on
-    its own branch, so it is stood in here the way the template store is stood in above.
-    What these cases pin is this module's own half: the binding resolution, the
-    ``forbidden`` rule, and the Model -> ``TemplateManifest`` translation.
+    The gate (``artifact_store.dashboard_package``) is stood in the way the template
+    store is stood in above, so that each of this module's own branches can be reached
+    one at a time: what these cases pin is this module's half -- the binding
+    resolution, the ``forbidden`` rule, and the Model -> ``TemplateManifest``
+    translation. ``TestTheRealGateAndStore`` below runs the same path with the real gate
+    and a real store, which is what keeps the stand-in's shape honest.
     """
 
     def gate(
@@ -1325,9 +1327,15 @@ class TestTheRealPackagePath:
                 raise parse_raises
             return package
 
+        # The REAL exception class, not a stand-in for it: the reader distinguishes an
+        # incomplete lookup from every other failure by this type, so a fake one would
+        # make the stand-in disagree with production on exactly that branch.
+        from kiro_crew.artifact_store.dashboard_package import BindingLookupIncomplete
+
         gate = SimpleNamespace(
             parse_package=_parse,
             resolve_bound_slug=lambda bound, **_kw: resolved,
+            BindingLookupIncomplete=BindingLookupIncomplete,
         )
         monkeypatch.setitem(sys.modules, "kiro_crew.artifact_store.dashboard_package", gate)
 
@@ -1388,9 +1396,11 @@ class TestTheRealPackagePath:
     def test_a_package_whose_content_will_not_parse_is_an_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """What the binding scan cannot report. It SKIPS a package it cannot parse
-        because it answers "which slug" and has no way to say why, so only a read of a
-        named slug can tell corrupt from absent."""
+        """The read of a named slug is where a broken package gets its sentence.
+
+        The binding scan finds the record -- it matches on the envelope, which is
+        readable when the layout is not -- and answers "which slug". This read is what
+        turns that slug into a reason, so the state is ``error`` and names it."""
         from kiro_crew import dashboard_package
 
         self.gate(monkeypatch, parse_raises=ValueError("model.types[0]: bad type"))
@@ -1522,17 +1532,118 @@ class TestTheRealPackagePath:
         on its ``FieldType``, which supersedes the table; until then this is what names
         a type added upstream with no row here.
 
-        SKIPPED while the gate is on the package line's branch, because there is no
-        catalogue to compare against -- and a skip that says so is honest where a
-        frozen copy of the five names would be a third spelling.
+        The catalogue is imported PLAINLY. A pin whose import can skip is a pin that
+        reports green on a build where the gate module failed to load, which is the one
+        build where the two spellings are most likely to have drifted.
+        """
+        from kiro_crew import dashboard_package
+        from kiro_crew.artifact_store import dashboard_package as gate
+
+        assert set(gate.data_type_catalog()) == set(dashboard_package._PACKAGE_TYPE_TO_MANIFEST)
+
+
+class TestTheRealGateAndStore:
+    """``read_package_model`` against the real gate and a real artifact store.
+
+    The stand-in above can only show what this module does with an answer it is GIVEN.
+    What decides the behaviour below is which answer the real ``resolve_bound_slug``
+    gives, so these two cases take the stand-in away.
+    """
+
+    def _store(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
+        from kiro_crew import artifacts
+
+        store = artifacts.ArtifactStore(root=tmp_path / "artifacts")
+        monkeypatch.setattr(artifacts, "get_default_store", lambda: store, raising=False)
+        return store
+
+    def _package(self, bound_to: str) -> dict[str, Any]:
+        return {
+            "kind": "dashboard",
+            "bound_to": bound_to,
+            "model": {"types": {"for_you": {"type": "text", "source": {"agentic": True}}}},
+            "view": {"blocks": [{"id": "fy", "type": "stat", "fields": ["for_you"]}]},
+            "theme": {"tokens": {"--panel-bg": "oklch(21% 0 0)"}},
+        }
+
+    def test_a_stored_package_is_the_model_the_write_path_validates_against(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        from kiro_crew import dashboard_package
+
+        store = self._store(monkeypatch, tmp_path)
+        art = store.create(
+            name="Atlas", kind="dashboard", content=json.dumps(self._package("crewmate:atlas"))
+        )
+        got = dashboard_package.read_package_model("atlas")
+        assert got.state == dashboard_package.STATE_LIVE
+        assert got.model is not None
+        assert got.model.manifest.id == art.slug
+        # The declared SHAPE, which is the thing a fall-through gets wrong.
+        assert got.model.manifest.fields["for_you"].type == "string"
+
+    def test_a_package_the_validator_rejects_is_an_error_and_not_a_fall_through(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        """The composite answer for a package that is PRESENT and broken.
+
+        Reported ``empty``, this read falls through to the template instance store and
+        hands back a builtin page's Model -- so ``dashboard_write`` would validate
+        ``for_you`` against whatever that page declares and could replace the stored
+        text cell with an array. ``error`` is the answer that stops the write, and
+        getting it requires the binding scan to FIND the record rather than skip it.
         """
         from kiro_crew import dashboard_package
 
-        gate = pytest.importorskip(
-            "kiro_crew.artifact_store.dashboard_package",
-            reason="the package write gate is not on this branch yet",
+        store = self._store(monkeypatch, tmp_path)
+        art = store.create(
+            name="Atlas", kind="dashboard", content=json.dumps(self._package("crewmate:atlas"))
         )
-        assert set(gate.data_type_catalog()) == set(dashboard_package._PACKAGE_TYPE_TO_MANIFEST)
+        # Damaged after the write, because the gate refuses this content on the way in:
+        # the records this guards against are the ones it never saw in this shape -- an
+        # older schema, or a write that did not finish.
+        drifted = self._package("crewmate:atlas")
+        drifted["model"] = {"types": {"for_you": {"type": "sparkline"}}}
+        (tmp_path / "artifacts" / art.slug / "current.html").write_text(
+            json.dumps(drifted), encoding="utf-8"
+        )
+
+        got = dashboard_package.read_package_model("atlas")
+        assert got.state == dashboard_package.STATE_ERROR, got.state_reason
+        assert got.model is None
+        assert art.slug in got.state_reason
+        assert "sparkline" in got.state_reason
+
+    def test_a_lookup_that_could_not_see_every_package_is_an_error_too(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        """The same harm by a second route, so the composite answer is pinned for both.
+
+        A package found and broken, and a package the scan could not even reach, are
+        different facts with ONE correct answer here: not ``empty``. ``empty`` falls
+        through to the template instance store and hands back a builtin page's Model,
+        and ``dashboard_write`` checked against that Model replaces a cell with a value
+        of the wrong shape.
+        """
+        from kiro_crew import dashboard_package
+
+        store = self._store(monkeypatch, tmp_path)
+        store.create(
+            name="Atlas", kind="dashboard", content=json.dumps(self._package("crewmate:atlas"))
+        )
+        store.create(
+            name="Newer", kind="dashboard", content=json.dumps(self._package("crewmate:newer"))
+        )
+        # The newest-first cap lowered rather than storing 257 packages: what decides
+        # the answer is the cap against the library size.
+        from kiro_crew.artifact_store import dashboard_package as gate
+
+        monkeypatch.setattr(gate, "MAX_BINDING_SCAN", 1)
+
+        got = dashboard_package.read_package_model("atlas")
+        assert got.state == dashboard_package.STATE_ERROR, got.state_reason
+        assert got.model is None
+        assert "cannot be located" in got.state_reason
 
 
 def test_a_written_value_reaches_a_page_that_declares_an_agentic_array():

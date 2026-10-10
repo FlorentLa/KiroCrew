@@ -621,3 +621,124 @@ class TestRejectInvalid:
         assert len(deep.encode("utf-8")) < dp.MAX_PACKAGE_BYTES
         with pytest.raises(ArtifactValidationError, match="nests deeper"):
             store.create(name="Deep", kind="dashboard", content=deep)
+
+
+class TestTheBindingLookup:
+    """``resolve_bound_slug``: which stored package is bound to a member.
+
+    The one entry point the data line reads, so what it does with a record it cannot
+    fully validate decides what the caller upstream believes. Answering ``None`` for a
+    package that IS present reads as "this member has no package", and the write path
+    acts on that by validating against a DIFFERENT Model -- so a record whose envelope
+    names the binding has to be found even when the layout inside it does not parse.
+    """
+
+    def _corrupt(self, store: ArtifactStore, tmp_path: Path, *, bound_to: str = BOUND) -> str:
+        """A stored dashboard record whose envelope is readable and whose model is not.
+
+        Written through the store and then damaged on disk, because the write gate
+        refuses an invalid package by design: the records this guards against are the
+        ones the gate never saw in this shape -- a package stored under an older schema,
+        or a write that did not finish.
+        """
+        art = store.create(name="Drifted", kind="dashboard", content=content(bound_to=bound_to))
+        damaged = dict(package(bound_to=bound_to))
+        damaged["model"] = {"types": {"open_prs": {"type": "sparkline"}}}
+        (tmp_path / "artifacts" / art.slug / "current.html").write_text(
+            json.dumps(damaged), encoding="utf-8"
+        )
+        # The premise of every case below: this content really is past the validator.
+        with pytest.raises(ArtifactValidationError):
+            dp.parse_package(store.get(art.slug).content or "")
+        return art.slug
+
+    def test_a_stored_package_is_found_by_its_binding(self, store, saved) -> None:
+        assert dp.resolve_bound_slug(BOUND, store=store) == saved.slug
+
+    def test_a_binding_nothing_is_stored_for_is_none(self, store, saved) -> None:
+        assert dp.resolve_bound_slug("crewmate:someone-else", store=store) is None
+
+    def test_a_package_whose_model_will_not_parse_is_still_found(self, store, tmp_path) -> None:
+        """The defect this case exists for.
+
+        A corrupt package skipped here reaches the caller as "no binding", which falls
+        through to the builtin Model and lets a write replace a stored cell with a value
+        of the wrong SHAPE -- a text cell overwritten by an array. The binding lives in
+        the envelope, one level above the layout, so it is readable in exactly the case
+        the layout is not.
+        """
+        slug = self._corrupt(store, tmp_path)
+        assert dp.resolve_bound_slug(BOUND, store=store) == slug
+
+    def _shredded(self, store: ArtifactStore, tmp_path: Path) -> str:
+        """A stored dashboard record with no readable envelope at all."""
+        art = store.create(
+            name="Shredded", kind="dashboard", content=content(bound_to="session:member-atlas")
+        )
+        (tmp_path / "artifacts" / art.slug / "current.html").write_text(
+            "\x00 not json", encoding="utf-8"
+        )
+        return art.slug
+
+    def test_a_record_with_no_readable_envelope_refuses_to_say_absent(
+        self, store, tmp_path
+    ) -> None:
+        """``None`` is a CLAIM, and this is the case that cannot support it.
+
+        A record whose envelope will not decode may BE the one bound here -- that is
+        exactly what could not be read. Answering ``None`` reports it as "no package",
+        the caller falls through to a builtin Model, and a write checked against that
+        Model replaces a cell with a value of the wrong shape.
+        """
+        self._shredded(store, tmp_path)
+        with pytest.raises(dp.BindingLookupIncomplete, match="could not be read"):
+            dp.resolve_bound_slug("session:member-atlas", store=store)
+
+    def test_an_unreadable_record_never_hides_a_package_that_is_found(
+        self, store, tmp_path, saved
+    ) -> None:
+        # A match returns the moment it is seen, so refusing on unreadable records does
+        # not turn a successful lookup into an error.
+        self._shredded(store, tmp_path)
+        assert dp.resolve_bound_slug(BOUND, store=store) == saved.slug
+
+    def test_a_scan_the_cap_cut_short_refuses_to_say_absent(
+        self, store, tmp_path, monkeypatch, saved
+    ) -> None:
+        """The second way "absent" goes unproven: the newest-first cap.
+
+        The cap is lowered rather than storing 257 packages, because what is under test
+        is the arithmetic between the cap and the library size, not the write path.
+        """
+        store.create(name="Newer", kind="dashboard", content=content(bound_to="crewmate:newer"))
+        monkeypatch.setattr(dp, "MAX_BINDING_SCAN", 1)
+        with pytest.raises(dp.BindingLookupIncomplete, match="dashboard artifacts are stored"):
+            dp.resolve_bound_slug(BOUND, store=store)
+
+    def test_a_package_inside_the_cap_is_still_found(self, store, monkeypatch, saved) -> None:
+        # The limit of the previous case: a cap that is not exceeded says nothing, and
+        # the lookup answers normally.
+        monkeypatch.setattr(dp, "MAX_BINDING_SCAN", 1)
+        assert dp.resolve_bound_slug(BOUND, store=store) == saved.slug
+
+    def test_a_read_this_process_is_not_allowed_refuses_to_say_absent(
+        self, store, saved, monkeypatch
+    ) -> None:
+        """The third way: an ``OSError`` on one artifact file.
+
+        Raised from ``get`` rather than by changing a mode bit, so the case runs the
+        same whether or not the suite is root.
+        """
+
+        def _denied(_slug: str, **_kw):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(store, "get", _denied)
+        with pytest.raises(dp.BindingLookupIncomplete, match="could not be read"):
+            dp.resolve_bound_slug(BOUND, store=store)
+
+    def test_a_corrupt_package_bound_elsewhere_is_not_claimed(self, store, tmp_path, saved) -> None:
+        # Reading the envelope loosens what counts as readable, not what counts as a
+        # match: the binding still has to be the one asked for.
+        self._corrupt(store, tmp_path, bound_to="session:member-atlas")
+        assert dp.resolve_bound_slug(BOUND, store=store) == saved.slug

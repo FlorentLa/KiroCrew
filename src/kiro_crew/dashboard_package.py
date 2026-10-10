@@ -247,12 +247,25 @@ def read_package_model(member: str) -> PackageRead:
 
 def _from_package(member: str) -> PackageRead:
     """Read the ``kind="dashboard"`` artifact bound to *member*."""
-    from kiro_crew.artifact_store.dashboard_package import parse_package, resolve_bound_slug
+    from kiro_crew.artifact_store.dashboard_package import (
+        BindingLookupIncomplete,
+        parse_package,
+        resolve_bound_slug,
+    )
     from kiro_crew.artifacts import ArtifactError, get_default_store
 
     bound_to = f"{_CREWMATE_SCOPE}{member}"
     try:
         slug = resolve_bound_slug(bound_to)
+    except BindingLookupIncomplete as exc:
+        # The scan could not see every stored package, so "no package" is unproven.
+        # ERROR rather than EMPTY, and the difference is the whole point: EMPTY falls
+        # through to the template instance store below, which hands back a BUILTIN
+        # page's Model, and a write checked against that can replace a cell with a
+        # value of the wrong shape.
+        return PackageRead(
+            None, STATE_ERROR, f"{member}'s dashboard package cannot be located: {exc}"
+        )
     except (ArtifactError, ValueError) as exc:
         # A binding this reader cannot even spell is content, not IO: an agent
         # given a 500 for a member name learns nothing it can act on.
