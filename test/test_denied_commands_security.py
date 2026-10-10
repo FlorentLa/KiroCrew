@@ -8865,6 +8865,65 @@ class TestSandboxEscapeSshSelf:
     def test_other_hosts_and_mentions_stay_allowed(self, cmd):
         assert _denied_by(cmd) is None, cmd
 
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # The remote command's own flags are data for the far host: ``gh``'s
+            # ``-R owner/repo`` is not ssh's remote forward.
+            "ssh far-host.example.com gh issue list -R kirodotdev/KiroCrew",
+            "ssh 10.96.206.36 gh issue list -R kirodotdev/KiroCrew --limit 30",
+            "ssh -F /dev/null -o BatchMode=yes far-host.example.com gh pr view -R o/r",
+            "ssh far-host.example.com ls -J x",
+            # A display title cut mid-quote leaves the remote command unquoted.
+            "ssh -o BatchMode=yes far-host.example.com '~/bin/gh issue list -R o/r --search \"a",
+        ],
+    )
+    def test_remote_command_flags_are_not_ssh_options(self, cmd):
+        assert _denied_by(cmd) is None, cmd
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # Options between the destination and the remote command are still
+            # ssh's own, and a later local command is still walked.
+            "ssh far-host.example.com -R 2222:localhost:22 id",
+            "ssh far-host.example.com -R 2222",
+            "ssh far-host.example.com -J localhost id",
+            "ssh far-host.example.com -o proxycommand='nc 127.0.0.1 22' id",
+            "ssh far-host.example.com uptime; ssh localhost id",
+            "ssh far-host.example.com uptime && ssh -R 2222 far2.example.com",
+            "ssh far-host.example.com uptime | ssh localhost id",
+            "ssh far-host.example.com uptime\nssh localhost id",
+            # A word that can expand to nothing is not the remote command: bash
+            # drops it and ssh reads the option behind it.
+            "ssh far-host.example.com $(true) -o hostname=127.0.0.1",
+            "ssh far-host.example.com $EMPTY -R 2222",
+            "ssh far-host.example.com `true` -J localhost id",
+            "ssh far-host.example.com *.nomatch -R 2222",
+            "ssh far-host.example.com {,} -R 2222",
+            "ssh far-host.example.com $( true ) -o hostname=127.0.0.1",
+            "ssh far-host.example.com $(printf '\\n') -o hostname=127.0.0.1",
+            "ssh far-host.example.com `printf ''` -R 2222",
+            "ssh far-host.example.com +(zz) -R 2222",
+            # ...and neither can one in the destination slot, which would make
+            # the literal word after it look like the remote command.
+            "ssh $EMPTY far-host.example.com -R 2222:localhost:22",
+            "ssh $(true) far-host.example.com -J localhost id",
+            'ssh "$@" far-host.example.com -R 2222',
+        ],
+    )
+    def test_options_before_the_remote_command_stay_checked(self, cmd):
+        assert _denied_by(cmd) == self._RULE, cmd
+
+    def test_an_expanded_command_does_not_change_the_next_verdict(self):
+        # The expansion flag belongs to one evaluation: a refused expanded
+        # command, or a nested value judged inside it, leaves the next
+        # literal command free to stop at its remote command.
+        assert _denied_by("ssh far.example.com $(printf '') -R 2222") == self._RULE
+        nested = "ssh -o proxycommand=\"ssh far.example.com $(printf '') -R 2222 nc %h %p\" t.example.com"
+        assert _denied_by(nested) == self._RULE
+        assert _denied_by("ssh far.example.com gh issue list -R o/r") is None
+
     def test_floor_spawns_no_dns_resolver_thread(self):
         # With the own-host cache pinned by the autouse fixture, evaluating a
         # representative allow case through the floor must NOT spawn the real

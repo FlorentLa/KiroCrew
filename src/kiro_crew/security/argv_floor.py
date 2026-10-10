@@ -99,6 +99,7 @@ from .shell_normalizer import (
     _PYTHON_PROGRAM_RE,
     _REDIRECT_START_RE,
     _SHELL_WRAPPER_CHARS,
+    _TEXT_HAS_EXPANSION,
     _argv_programs,
     _backtick_closer,
     _cut_at_operator,
@@ -109,6 +110,7 @@ from .shell_normalizer import (
     _dequote_token,
     _ends_argv,
     _glob_could_expand_to,
+    _inherits_expansion_flag,
     _is_mint_verb,
     _is_self_program,
     _iter_shell_chars,
@@ -2953,6 +2955,7 @@ def _function_call_binds_self(text: str) -> bool:
     return False
 
 
+@_inherits_expansion_flag
 def _is_ssh_to_self(text_lower: str) -> bool:
     """True if *text_lower* opens an ssh/scp/sftp/rsync channel to THIS host.
 
@@ -2998,6 +3001,10 @@ def _is_ssh_to_self(text_lower: str) -> bool:
     the shell-builtin export spellings (``declare -x``/``typeset -x``), which
     are not leading-assignment syntax and so are not modeled by the walk.
     """
+    # Without an expansion character the words bash hands ssh are exactly the
+    # walk's tokens, so it may stop where ssh stops reading options (see
+    # ``_inherits_expansion_flag``).
+    stops_at_remote_command = not _TEXT_HAS_EXPANSION.get()
     # Collapse empty expansions in the SOURCE so the gate and tokenization both
     # read the spliced-out spelling (``s$()sh localhost`` -> ``ssh localhost``).
     text_lower = _EMPTY_EXPANSION_RE.sub("", text_lower)
@@ -3410,6 +3417,17 @@ def _is_ssh_to_self(text_lower: str) -> bool:
                     forward_value_letter = ""
                     option_shadow = False
                     value_shadow = False
+                elif (
+                    stops_at_remote_command
+                    and verb == "ssh"
+                    and not positional_pending
+                    and not value_shadow
+                    and stripped
+                ):
+                    # ssh stops option parsing at the first operand after the
+                    # destination: the remote command, sent to the far host as
+                    # data (``ssh far gh issue list -R o/r`` asks for no ``-R``).
+                    break
                 else:
                     # An operand, or the value of the preceding option.  Check
                     # it either way (fail-closed — see the docstring); only an

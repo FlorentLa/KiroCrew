@@ -217,7 +217,15 @@ def _url_payload_command(n: int) -> str:
 #: subcommand. It is a security-deciding predicate, so it cannot leave the package,
 #: and no dead code remains to offset it. Its first word is split on space and tab
 #: only, the way bash splits, so a Unicode space cannot pose as a word break.
-_PACKAGE_LINE_BUDGET = 28_665
+#:
+#: Raised again, from 28,665, for the ssh self-target walk's stop at the remote
+#: command: ssh parses no option after the first operand that follows the
+#: destination, so the walk ends there instead of reading the remote command's
+#: own flags (``gh ... -R owner/repo``) as ssh's remote forward. One branch,
+#: plus, in ``shell_normalizer.py``, the expansion character set and the
+#: decorator that records whether the submitted text carries one: bash can drop
+#: such a word before exec, so the walk never stops early on that text.
+_PACKAGE_LINE_BUDGET = 28_715
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second

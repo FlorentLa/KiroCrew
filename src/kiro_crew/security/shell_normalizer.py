@@ -19,6 +19,8 @@ tiers depend on the reader, never the reverse.
 from __future__ import annotations
 
 import bisect
+import contextvars
+import functools
 import os
 import re
 import shlex
@@ -85,6 +87,36 @@ def _debracket(text: str) -> str:
 # glob in the program name (``kiro[c]rew``) is resolved by the shell BEFORE exec, so
 # it has to be tested for expandability rather than compared literally.
 _GLOB_CHARS_RE = re.compile(r"[\[\]?*{}]")
+
+# A word carrying one of these can expand to NO word before exec (an empty
+# substitution or variable, an unmatched glob or extglob under nullglob, ``{,}``).
+_EXPANSION_CHARS: frozenset[str] = frozenset("*?[$`{(")
+# Whether the text an ``inherits_expansion_flag`` caller was FIRST handed
+# carried one of them.
+_TEXT_HAS_EXPANSION: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "kirocrew_text_has_expansion", default=False
+)
+
+
+def _inherits_expansion_flag(fn: "Callable[[str], bool]") -> "Callable[[str], bool]":
+    """Record whether the text as SUBMITTED carries an expansion character.
+
+    A floor that splices expansions into literal-looking tokens before reading
+    them, and recurses on values derived from that spliced text, reads the flag
+    from ``_TEXT_HAS_EXPANSION``: it is taken at the outermost call and
+    inherited by every nested one.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(text_lower: str) -> bool:
+        flag = _TEXT_HAS_EXPANSION.get() or bool(_EXPANSION_CHARS.intersection(text_lower))
+        token = _TEXT_HAS_EXPANSION.set(flag)
+        try:
+            return fn(text_lower)
+        finally:
+            _TEXT_HAS_EXPANSION.reset(token)
+
+    return wrapper
 
 
 # Characters a shell uses to WRAP a program name rather than to spell it: the
