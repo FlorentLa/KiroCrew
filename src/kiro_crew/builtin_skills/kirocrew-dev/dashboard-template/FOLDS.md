@@ -18,7 +18,11 @@ type it, and never let this file guess on your behalf.
 
 A `session` fold answers about ONE conversation. A `slot` fold answers about a
 workstream that outlived several conversations and is folded over every log the
-slot ran under.
+slot ran under. A `tree` fold answers about a whole FLEET: it is keyed by a tree
+root and folded over the logs of every slot the tree reaches, so it is the kind a
+block binding a tree names. It is read on a page load and on a refetch rather
+than pushed, because its value is stale when any member's log grows and no bus
+scope covers that.
 
 ## Which fold answers what
 
@@ -39,6 +43,7 @@ slot ran under.
 | `agentic` | slot | Which dashboard fields this crewmate filled itself, with what value, of what declared type and when |
 | `mistakes` | slot | Which dashboard writes of this crewmate's were refused, grouped by reason and field, how often, and what worked instead |
 | `workstreams` | slot | Every workstream this crewmate is running: each board's goal and counts, each task's result, and what each task cost its own worker session |
+| `worktree` | tree | The shape of a fleet: every work board the tree reaches, which board each one hangs under, and which boards are its roots |
 
 ## `status`
 
@@ -305,3 +310,21 @@ Moved by: `background/completed`, `session/opened`, `subagent/completed`, `subag
 | `spenders_omitted` | `int` | no |
 | `unattributed` | `dict` | no |
 | `units_omitted` | `int` | no |
+
+## `worktree`
+
+The shape of a fleet: every work board the tree reaches, which board each one hangs under, and which boards are its roots.
+
+Moved by: `work/recorded`.
+
+| Field | Type | Optional |
+|---|---|---|
+| `boards` | `list` | no |
+| `cycles` | `int` | no |
+| `dropped` | `int` | no |
+| `goal_chars` | `int` | no |
+| `limit` | `int` | no |
+| `owner_limit` | `int` | no |
+| `root` | `str` | no |
+| `roots` | `list` | no |
+| `unresolved` | `int` | no |

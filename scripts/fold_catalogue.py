@@ -117,11 +117,37 @@ _ANSWERS: dict[str, str] = {
         "Every workstream this crewmate is running: each board's goal and counts, each "
         "task's result, and what each task cost its own worker session"
     ),
+    "worktree": (
+        "The shape of a fleet: every work board the tree reaches, which board each one "
+        "hangs under, and which boards are its roots"
+    ),
 }
 
 
 class CatalogueError(Exception):
     """The catalogue cannot be built, or the committed one has drifted."""
+
+
+#: The three key kinds a row's ``mode`` may report, most specific first. Checked in this
+#: order rather than as ``slot else session``: the tree set is the newest and smallest,
+#: and a two-way test would have reported a tree fold as ``session`` -- an answer a
+#: template author would act on by keying a whole fleet's tree to one conversation.
+_MODES: tuple[tuple[str, str], ...] = (
+    ("tree", "TREE_PROJECTION_NAMES"),
+    ("slot", "SLOT_PROJECTION_NAMES"),
+    ("session", "SESSION_FOLD_NAMES"),
+)
+
+
+def _mode(name: str) -> str:
+    """Which key kind *name* is folded by, read off the kernel's own sets."""
+    for mode, attribute in _MODES:
+        if name in getattr(proj, attribute):
+            return mode
+    raise CatalogueError(
+        f"{name} is registered but in none of the kernel's key-kind sets, so no reader "
+        "can resolve a key to fold it by"
+    )
 
 
 def _rendered(name: str) -> dict[str, Any]:
@@ -178,8 +204,10 @@ def catalogue() -> dict[str, Any]:
                 # A session-keyed fold answers about ONE conversation. A slot-keyed one
                 # answers about a workstream that outlived several, and is folded over
                 # every log the slot ran under -- so serving it under one session's id
-                # reports a part as the whole.
-                "mode": "session" if name in proj.SESSION_FOLD_NAMES else "slot",
+                # reports a part as the whole. A TREE-keyed one answers about a whole
+                # fleet and is folded over the logs of every slot the tree reaches, so
+                # serving it under one slot reports one board as the tree.
+                "mode": _mode(name),
                 "advertised": name not in proj.INTERNAL_PROJECTION_NAMES,
                 # ``None`` means every entry moves this fold -- whether the registry
                 # leaves ``affects`` unset or spells out the whole vocabulary, which is
@@ -223,7 +251,11 @@ def render_markdown(doc: dict[str, Any]) -> str:
         "",
         "A `session` fold answers about ONE conversation. A `slot` fold answers about a",
         "workstream that outlived several conversations and is folded over every log the",
-        "slot ran under.",
+        "slot ran under. A `tree` fold answers about a whole FLEET: it is keyed by a tree",
+        "root and folded over the logs of every slot the tree reaches, so it is the kind a",
+        "block binding a tree names. It is read on a page load and on a refetch rather",
+        "than pushed, because its value is stale when any member's log grows and no bus",
+        "scope covers that.",
         "",
         "## Which fold answers what",
         "",
@@ -333,7 +365,7 @@ def selftest() -> int:
 
     for fold in doc["folds"]:
         assert fold["fields"], f"{fold['name']} rendered no fields"
-        assert fold["mode"] in ("session", "slot"), fold
+        assert fold["mode"] in {mode for mode, _ in _MODES}, fold
         for row in fold["fields"]:
             assert row["type"] != "NoneType", f"{fold['name']}.{row['name']} typed NoneType"
 
@@ -347,6 +379,12 @@ def selftest() -> int:
     # empty list -- an empty list would read as "no entry moves it".
     status = next(fold for fold in doc["folds"] if fold["name"] == "status")
     assert status["affects"] is None, status
+
+    # The tree-keyed fold is the only one whose mode is neither of the original two, and
+    # a regression to ``session`` or ``slot`` is the silent one: it reads as a complete
+    # answer and sends a template author to key a whole fleet's tree by one conversation.
+    tree_names = [fold["name"] for fold in doc["folds"] if fold["mode"] == "tree"]
+    assert tree_names == list(proj.TREE_PROJECTION_NAMES), tree_names
 
     # Planted drift: one renamed field must change both renderings.
     mutated = json.loads(json.dumps(doc))
