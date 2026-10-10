@@ -153,6 +153,16 @@ def test_json_wrapped_tool_input_is_unwrapped():
     assert found.program == "git log"
 
 
+def test_rebase_continue_is_an_editor_command_but_a_plain_rebase_is_not():
+    found = classify_interactive_command("git rebase --continue")
+    assert found.risk == INTERACTIVE_EDITOR
+    assert found.program == "git rebase --continue"
+    assert found.side_effecting
+    assert classify_interactive_command("git rebase origin/main") == NOT_INTERACTIVE
+    # The hint it offers must not itself be flagged, or the agent loops on it.
+    assert classify_interactive_command(found.hint) == NOT_INTERACTIVE
+
+
 def test_env_assignments_and_wrappers_are_skipped():
     assert classify_interactive_command("FOO=1 env BAR=2 nohup python").risk == INTERACTIVE_REPL
     assert classify_interactive_command("timeout 30 python").risk == INTERACTIVE_REPL

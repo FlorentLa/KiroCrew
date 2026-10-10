@@ -1069,6 +1069,14 @@ def _classify_segment(segment: str, *, last: bool) -> InteractiveClassification:
                 "non-interactive rebase (no -i), or GIT_SEQUENCE_EDITOR=true with a scripted todo",
                 side_effecting=True,
             )
+        if sub == "rebase" and _has_flag(rest, "--continue"):
+            return InteractiveClassification(
+                INTERACTIVE_EDITOR,
+                "git rebase --continue",
+                "rebase --continue opens an editor for the commit message",
+                "git -c core.editor=true rebase --continue",
+                side_effecting=True,
+            )
         if sub == "add" and (
             _has_flag(rest, "-p") or _has_flag(rest, "--patch") or _has_flag(rest, "-i")
         ):
