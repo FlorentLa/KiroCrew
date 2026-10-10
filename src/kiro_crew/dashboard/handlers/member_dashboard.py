@@ -337,7 +337,7 @@ async def _package_body(
             redact=_page_safe,
             reread=_reread_model,
             locale=locale,
-            display_seam=_package_render("display_values"),
+            display_seam=_package_render(_RENDER_DISPLAY),
         )
     # SUBSCRIBED BEFORE THE VALUES ARE READ, and only when it is not already: a reused
     # page holds values the bus has kept current, and resubscribing would empty that
@@ -378,7 +378,7 @@ def _page_theme(request: web.Request) -> str:
     default name, which that build also never uses.
     """
     asked = request.query.get("theme", "")
-    module_themes = _package_render_value("THEMES")
+    module_themes = _package_render_value(_RENDER_THEMES)
     themes = tuple(module_themes) if isinstance(module_themes, (list, tuple)) else ("light",)
     return asked if asked in themes else str(themes[0])
 
@@ -582,6 +582,18 @@ _CREWMATE_BINDING: Final[str] = "crewmate:"
 #: output a refill carries beside the raw values, so the page does not fall back to a
 #: second set of formatting rules.
 _PACKAGE_RENDER_MODULE: Final[str] = "kiro_crew.dashboard_package_render"
+
+#: The names this controller asks that module for, as constants rather than literals at
+#: the call sites.
+#:
+#: Not tidiness: the seam test READS these and resolves them against the real module, so
+#: a rename on either side of the seam is one failing assertion. Spelled at the call site
+#: and spelled again in the test, the test would be pinning "the renderer exports
+#: ``render_dashboard``" while the controller quietly asked for something else -- which is
+#: the same silent empty page, one layer further out.
+_RENDER_DOCUMENT: Final[str] = "render_dashboard"
+_RENDER_DISPLAY: Final[str] = "display_values"
+_RENDER_THEMES: Final[str] = "THEMES"
 
 #: Directives a minted package document MUST declare before this gateway serves it.
 #:
@@ -805,7 +817,7 @@ def _minted_package_page(
             sorted(set(unknown)),
         )
         return None
-    render = _package_render("render_dashboard")
+    render = _package_render(_RENDER_DOCUMENT)
     if render is None:
         return None
     try:
@@ -886,7 +898,7 @@ def arm_block_push(
         redact=_page_safe,
         reread=_reread_model,
         locale=locale,
-        display_seam=_package_render("display_values"),
+        display_seam=_package_render(_RENDER_DISPLAY),
     )
     return page
 

@@ -886,9 +886,9 @@ async def test_the_seam_resolves_against_the_REAL_renderer():
 
     module = importlib.import_module(routes._PACKAGE_RENDER_MODULE)
     assert module.__name__ == "kiro_crew.dashboard_package_render"
-    for name in ("render_dashboard", "display_values"):
+    for name in (routes._RENDER_DOCUMENT, routes._RENDER_DISPLAY):
         assert routes._package_render(name) is not None, f"the seam does not resolve {name!r}"
-    assert routes._package_render_value("THEMES") == ("light", "dark")
+    assert routes._package_render_value(routes._RENDER_THEMES) == ("light", "dark")
     # The signature, not just the name: a renderer that took different keywords would
     # resolve here and raise inside the gate, which logs and returns None -- the same
     # silent empty page by another route.
@@ -896,6 +896,46 @@ async def test_the_seam_resolves_against_the_REAL_renderer():
 
     signature = inspect.signature(module.render_dashboard)
     assert list(signature.parameters) == ["package", "read", "theme", "title"]
+
+
+async def test_the_seam_survives_a_rename_on_the_merged_tree():
+    """THE DURABLE PIN: skips where the renderer is absent, asserts where it is present.
+
+    The conductor's shape, and it is the right one because it does not depend on which
+    base this branch sits on. Today the branch is based on the renderer line, so this
+    ASSERTS rather than skips -- but rebased back onto the package line it would skip
+    with a reason instead of erroring, and on the merged tree it asserts. That is the
+    property a string pin and a fake module both lack: a rename of ``render_dashboard``
+    leaves the constant matching and the fake's attribute present, and the merged tree
+    then serves an empty page.
+
+    It calls the function as well as resolving it. A name that resolves but takes
+    different arguments raises inside the gate, which logs and returns ``None`` -- the
+    same silent empty page, one layer further in.
+    """
+    pytest.importorskip(
+        routes._PACKAGE_RENDER_MODULE,
+        reason=(
+            "the package renderer is not on this tree, so the seam cannot be checked "
+            "here; this test asserts on any tree that carries it, which is where the "
+            "break would land"
+        ),
+    )
+    # THE NAMES ARE READ FROM THE CONTROLLER, never spelled here. Spelled here, this
+    # would pin "the renderer exports render_dashboard" while the controller quietly
+    # asked for something else -- the same silent empty page, one layer further out.
+    for name in (routes._RENDER_DOCUMENT, routes._RENDER_DISPLAY):
+        assert routes._package_render(name) is not None, (
+            f"the seam resolves nothing for {name!r} on a tree that HAS the renderer: "
+            "a v3 dashboard would serve with no document and read as an empty page"
+        )
+    assert routes._package_render_value(routes._RENDER_THEMES)
+    render = routes._package_render(routes._RENDER_DOCUMENT)
+    document = render(package(), {"fields": {}, "missing": [], "stale": False}, theme="dark")
+    assert isinstance(document, str) and document
+    assert "default-src 'none'" in document
+    # Through the controller's own gate, so this covers the call AND the refusal path.
+    assert routes._csp_problems(document) == []
 
 
 async def test_the_first_load_really_renders_a_document(store, saved):
@@ -944,15 +984,16 @@ async def test_a_build_whose_renderer_is_missing_says_so_out_loud(monkeypatch, c
     assert not [r for r in caplog.records if "no package renderer" in r.getMessage()]
 
 
-async def test_the_renderer_seam_is_the_module_the_renderer_actually_lands_in(monkeypatch):
-    """Named once, so the merge is one line -- and named CORRECTLY, so it is not zero.
+async def test_the_resolution_helper_hands_back_a_callable_or_none(monkeypatch):
+    """The RESOLUTION HELPER, not the seam. It hands back a callable or ``None``.
 
-    A seam pointing at a module that never arrives resolves to None forever and the
-    first load silently serves no document, which is indistinguishable from a build
-    that has not merged the renderer yet.
+    DELIBERATELY NOT A SEAM PIN, and renamed to say so: a fake module cannot see the
+    renderer renaming a function, because the fake has whatever attribute the test gave
+    it. Read as a seam check this would be worse than nothing -- it would look like
+    coverage of exactly the break it cannot detect. The seam is pinned against the real
+    module in ``test_the_seam_resolves_against_the_REAL_renderer`` and
+    ``test_the_seam_survives_a_rename_on_the_merged_tree``.
     """
-    assert routes._PACKAGE_RENDER_MODULE == "kiro_crew.dashboard_package_render"
-    # The two names this controller asks that module for.
     import types
 
     fake = types.ModuleType(routes._PACKAGE_RENDER_MODULE)
