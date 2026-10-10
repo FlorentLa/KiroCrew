@@ -209,6 +209,16 @@ def format_approval_timeout_card(timeout_secs: float) -> str:
     )
 
 
+#: Row-level kind on the error row a turn that hit the ceiling leaves, so the
+#: dashboard can offer a link to the setting beside Resume. The prose stays
+#: English and names the setting itself, for surfaces that render no link.
+TURN_TIMEOUT_KIND = "turn_timeout"
+
+#: The Settings label of ``agent.chat_turn_timeout_secs`` (Settings → Chat →
+#: Advanced), as the English catalog renders it.
+TURN_TIME_LIMIT_SETTING = "Turn Time Limit"
+
+
 def format_turn_timeout_card(timeout_secs: float) -> str:
     """User-facing text for a turn that hit the ceiling."""
     if timeout_secs >= 3600:
@@ -218,7 +228,8 @@ def format_turn_timeout_card(timeout_secs: float) -> str:
     return (
         f"⏱️ This turn hit the {limit} limit and was stopped. Work already "
         "written to disk is still there — nothing was rolled back. Send a "
-        "message to continue from where it stopped."
+        "message to continue from where it stopped. To allow longer turns, raise "
+        f"{TURN_TIME_LIMIT_SETTING} in Settings → Chat → Advanced."
     )
 
 
@@ -273,7 +284,12 @@ def finish_turn_task(
         try:
             # slot.append persists the card AND broadcasts it once; do not also
             # broadcast_ws here or the UI renders a duplicate.
-            slot.append("error", format_turn_timeout_card(timeout_secs), "msg msg-err")
+            slot.append(
+                "error",
+                format_turn_timeout_card(timeout_secs),
+                "msg msg-err",
+                meta={"kind": TURN_TIMEOUT_KIND},
+            )
             state.push_slots_update()
         except Exception:
             logger.debug("Failed to render turn-timeout card", exc_info=True)
