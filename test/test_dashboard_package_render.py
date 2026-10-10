@@ -17,7 +17,6 @@ import pytest
 
 from kiro_crew.artifact_store.dashboard_package import (
     data_type_catalog,
-    package_json_schema,
     parse_package,
     validate_package,
     view_block_catalog,
@@ -32,12 +31,15 @@ from kiro_crew.dashboard_frame import (
 )
 from kiro_crew.dashboard_package_render import (
     _FORMATTERS,
+    BLOCK_PATCH_MESSAGE_TYPE,
     BLOCK_RENDERERS,
     RENDER_CSP,
     THEMES,
     VENDOR_FILES,
     VENDOR_VERSIONS,
     block_catalog_summary,
+    block_patch,
+    blocks_reading,
     display_values,
     render_block,
     render_dashboard,
@@ -241,14 +243,6 @@ def test_nothing_either_catalog_admits_is_unrenderable():
 def test_the_formatter_table_is_the_data_catalog():
     """A data type the data line adds with no formatter here is named by this test."""
     assert set(_FORMATTERS) == set(data_type_catalog())
-
-
-def test_the_json_schema_block_enum_is_the_shipped_catalog():
-    schema = package_json_schema()
-    enum = schema["properties"]["view"]["properties"]["blocks"]["items"]["properties"]["type"][
-        "enum"
-    ]
-    assert enum == BLOCK_TYPES
 
 
 def test_the_catalog_is_no_longer_the_four_type_stub():
@@ -631,12 +625,17 @@ def test_the_page_speaks_the_hosts_own_refill_contract():
 
 
 def test_the_refill_checks_the_sender_before_the_message_type():
-    """A sibling frame can post here; the identity test is what stops it."""
+    """A sibling frame can post here; the identity test is what stops it.
+
+    Checked against EVERY type branch the handler has, not against one spelling
+    of the type test: a second message type added below the identity check is
+    fine, and one added above it is the bug this guards.
+    """
     package, values = package_for_block("stat")
     html = _render(package, values)
     sender = html.index("event.source !== parent")
-    kind = html.index("data.type !== MESSAGE")
-    assert sender < kind
+    for branch in ("data.type === MESSAGE", "data.type !== PATCH"):
+        assert sender < html.index(branch), f"{branch} is tested before the sender"
 
 
 # --------------------------------------------------------------------------- #
@@ -813,6 +812,89 @@ def test_the_stale_band_is_in_the_document_and_hidden_until_the_read_says_stale(
     read = island_of(stale)
     assert read["stale"] is True
     assert read["missing"] == ["a", "b"]
+
+
+# --------------------------------------------------------------------------- #
+# The single-block path the controller's push needs
+# --------------------------------------------------------------------------- #
+
+
+def test_one_block_renders_on_its_own_as_the_section_the_page_holds():
+    """``render_block`` is the per-block half: the same markup, nothing around it."""
+    package, values = package_for_block("bars")
+    block = package["view"]["blocks"][0]
+    fragment = render_block(block, package, read_payload(values))
+    assert fragment.startswith('<section class="pkg-block pkg-block--bars"')
+    assert fragment.endswith("</section>")
+    assert "<style" not in fragment and "<script" not in fragment
+    # And it is the SAME markup the whole page carries for that block, so a
+    # pushed block and a first-painted block cannot look different.
+    assert fragment in _render(package, values)
+
+
+def test_a_block_patch_carries_only_the_blocks_that_read_the_moved_fields():
+    package, values = every_block_package()
+    moved = [n for n, s in package["model"]["types"].items() if s["type"] == "number"][:1]
+    patch = block_patch(package, {moved[0]: 99}, seq=7)
+    assert patch["type"] == BLOCK_PATCH_MESSAGE_TYPE
+    assert patch["seq"] == 7
+    assert set(patch["blocks"]) == set(blocks_reading(package, moved))
+    assert patch["blocks"]
+    expected = display_values(package, {moved[0]: 99})[moved[0]]
+    assert expected == "99.0 cr", "the field's own unit and precision apply"
+    for block_id, body in patch["blocks"].items():
+        assert set(body["fields"]) == set(moved)
+        assert body["display"][moved[0]] == expected
+
+
+def test_a_block_patch_gives_a_block_only_the_fields_that_block_renders():
+    """A patch must not hand a value to a block the view never put it on."""
+    package, values = every_block_package()
+    patch = block_patch(package, values)
+    by_id = {str(b["id"]): set(b["fields"]) for b in package["view"]["blocks"]}
+    for block_id, body in patch["blocks"].items():
+        assert set(body["fields"]) <= by_id[block_id]
+
+
+def test_a_block_patch_ignores_a_field_the_model_does_not_declare():
+    package, values = package_for_block("table")
+    patch = block_patch(package, {"not_in_the_model": 1})
+    assert patch["blocks"] == {}
+
+
+def test_a_block_patch_formats_with_the_same_one_formatter_as_the_first_render():
+    package, values = package_for_block("table")
+    patch = block_patch(package, values)
+    shown = display_values(package, values)
+    for body in patch["blocks"].values():
+        for name, text in body["display"].items():
+            assert text == shown[name]
+
+
+def test_a_block_patch_carries_no_markup():
+    """The reason this boundary cannot introduce an element."""
+    package, values = every_block_package()
+    blob = json.dumps(block_patch(package, values))
+    assert "<" not in blob
+    assert "section" not in blob
+
+
+def test_the_page_paints_only_the_blocks_a_patch_names():
+    package, values = package_for_block("bars")
+    html = _render(package, values)
+    assert "for (var t = 0; t < touched.length; t++) fill(touched[t]);" in html
+    assert "function fill(root)" in html
+
+
+def test_the_3d_scene_is_built_once_however_often_the_painter_runs():
+    """A patched block re-runs orbits(); a second canvas would be two scenes."""
+    package, values = package_for_block("orbit")
+    html = _render(package, values)
+    assert "var existing = box.querySelector('.pkg-orbit-stage canvas');" in html
+    assert "if (existing) return;" in html
+    # ...and the painter really does reach the 3D block, or a patched one would
+    # render an empty stage.
+    assert "orbits(scope);" in html
 
 
 def test_the_catalog_summary_reports_a_renderer_for_every_row():

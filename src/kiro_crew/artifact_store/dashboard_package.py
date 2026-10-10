@@ -255,8 +255,7 @@ _COMMON_BLOCK_KEYS: Mapping[str, Callable[[Any], Any]] = {
     "caption": _a_label,
 }
 
-#: The block types a view may place. Owned by the display line (CREW-21660), and
-#: no longer a stub: every entry has a renderer in
+#: The block types a view may place. Every entry has a renderer in
 #: :mod:`kiro_crew.dashboard_package_render`, and every type in its ``accepts``
 #: has a rendering inside that block.
 #:
@@ -373,10 +372,10 @@ def view_block_catalog() -> Mapping[str, BlockType]:
 
     Same contract as :func:`data_type_catalog`, for the other half of the
     package, and the same single point of truth: validation, the JSON Schema and
-    the renderer's dispatch table all read THIS function. The display line owns
-    it (CREW-21660) and :mod:`kiro_crew.dashboard_package_render` is the other
-    half -- a type here with no renderer, or a renderer with no type here, is a
-    test failure rather than a surprise on somebody's dashboard.
+    the renderer's dispatch table all read THIS function.
+    :mod:`kiro_crew.dashboard_package_render` is the other half -- a type here
+    with no renderer, or a renderer with no type here, is a test failure rather
+    than a surprise on somebody's dashboard.
     """
     return {b.name: b for b in _BLOCK_TYPES}
 
