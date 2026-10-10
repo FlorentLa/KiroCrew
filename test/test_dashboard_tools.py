@@ -225,8 +225,43 @@ class TestAnAgentWrittenPageCannotBeStaged:
         assert "template_id" in instance.AUTHORED_PAGE_REFUSAL
 
     def test_only_a_built_in_source_is_renderable(self) -> None:
-        """The set behind the adopt-time half of the same rule. ONE value."""
+        """The set behind the adopt-time half of the same rule. ONE value.
+
+        KEPT AT ONE VALUE BY DECISION, re-taken for v3's dashboard PACKAGE and recorded
+        here because this is the test a reviewer reads as the security decision.
+
+        The v3 package page genuinely has the three properties a page needs before this
+        gateway will execute it: the document is MINTED here from a package that carries
+        no markup key at all, every block's type is re-checked at the render site
+        against a CLOSED catalogue, and the composed document must declare CSP
+        ``default-src 'none'`` or it is refused. So the page is earned -- but it is
+        earned at its OWN gate, ``member_dashboard._minted_package_page``, and not here.
+
+        Adding ``"package"`` to this set would not reach that page. This set is what
+        ``_trusted_page`` and ``instance._check`` ask about a stored TEMPLATE INSTANCE,
+        and ``_trusted_page`` answers by loading markup from the template catalog by the
+        record's ``template_id``; a package has no catalog directory, so it can never
+        arrive here. What widening WOULD do is let ``instance.edit`` commit a record
+        labelled ``package`` on the template path -- a loosening of the adopt gate in
+        exchange for nothing the package page needs.
+        """
         assert instance.RENDERABLE_SOURCES == frozenset({catalog.BUILTIN_SOURCE})
+
+    def test_a_package_source_is_not_renderable(self) -> None:
+        """The other half of the state above, pinned so whoever changes it has to say why.
+
+        ``"package"`` is a fourth value in ``manifest.SOURCES`` -- the data line added it
+        so a synthesized package manifest is not indistinguishable from a user template
+        at that gate. It is deliberately NOT renderable: a v3 page is served by the
+        controller's own minted-document gate and never by this one, so a package source
+        arriving on the template execution path is a record something else wrote.
+        """
+        from kiro_crew.dashboard_templates import manifest as manifest_mod
+
+        assert "package" not in instance.RENDERABLE_SOURCES
+        # Pinned against the vocabulary rather than against a literal, so a rename of
+        # the source value cannot leave this test passing about a string nobody uses.
+        assert instance.RENDERABLE_SOURCES < manifest_mod.SOURCES | {"package"}
 
     def test_a_user_sourced_record_is_refused_at_adopt_as_well(self) -> None:
         """Belt and braces, on the path that writes a version rather than stages one.

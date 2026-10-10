@@ -22,8 +22,10 @@ withholds.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
-from typing import Any, Callable, Mapping
+from dataclasses import dataclass
+from typing import Any, Callable, Final, Mapping
 
 from aiohttp import web
 
@@ -240,13 +242,33 @@ async def api_member_dashboard(request: web.Request) -> web.Response:
         if rendered is not None:
             body["rendered_html"] = rendered
         return web.json_response(body)
+    # THE V3 PACKAGE PAGE, served from this route rather than one of its own. A crewmate
+    # has one dashboard and the tab asks one route for it; a second route would be a
+    # second place to get the member resolution, the owner gate and the redaction right,
+    # which is the same reason the preview is served from here. A crewmate with no
+    # package falls straight through and the body below is byte-identical to before.
+    packaged = await _run(lambda: _read_package(slug))
+    if packaged.model is not None and packaged.package is not None:
+        return await _package_body(request, slug, _member, packaged, locale)
     try:
         record = await _run(lambda: instance.read(slug))
     except Exception as exc:
         return _refusal(exc)
     renderable = True
     if record.state == instance.STATE_EMPTY:
-        fallback = await _run(lambda: instance.default_instance(slug))
+        # THE BUILTIN FALLBACK IS SCOPED BY SOURCE, and the source is the condition.
+        #
+        # v3 has NO DEFAULT PAGE: a dashboard exists once the agent writes a layout,
+        # and until then the frame's own empty state is the answer. So a crewmate whose
+        # dashboard comes from a PACKAGE never gets a shipped template composed under
+        # it -- not when the package serves (that returned above) and not when it is
+        # bound but unreadable, which is this branch. Falling back there would hand that
+        # crewmate a page they did not compose, carrying their own fold values, and
+        # nothing on it would say it is not theirs.
+        #
+        # A crewmate bound to the TEMPLATE REGISTRY is unchanged: goal-board, standup
+        # and office are a live feature and this item does not touch them.
+        fallback = None if packaged.bound else await _run(lambda: instance.default_instance(slug))
         if fallback is not None:
             record = fallback
         else:
@@ -273,6 +295,83 @@ async def api_member_dashboard(request: web.Request) -> web.Response:
         if rendered is not None:
             body["rendered_html"] = rendered
     return web.json_response(body)
+
+
+async def _package_body(
+    request: web.Request,
+    slug: str,
+    member: str,
+    packaged: _Packaged,
+    locale: str,
+) -> web.Response:
+    """THE FIRST LOAD of a v3 package page: the whole page, and the push armed.
+
+    The order is load-bearing. The push is armed BEFORE the values are read, so a fold
+    that moves during the read produces a patch the browser will see as a version it
+    does not hold and answer with a refetch. Reading first and arming after would lose
+    that move silently, which is the one failure a version number cannot report.
+
+    The body is ADDITIVE beside the v2 shape, so a reader can tell the two apart by one
+    key: ``package`` is present and carries the artifact slug, its version -- which is
+    the ``layout`` a patch is compared against -- and ``push_version``, the counter the
+    page starts from. ``blocks`` is every block's values, which IS the whole page in
+    data; ``rendered_html`` is the minted document when this build carries the renderer.
+    """
+    package, model = packaged.package, packaged.model
+    assert package is not None  # the caller checked both halves
+    page = arm_block_push(request, slug, member, model)
+    if page is None:
+        # Nothing to push to (no hub). The page is still served in full: a body with no
+        # live push is a page that refreshes on its own, not a refusal.
+        from kiro_crew.dashboard.handlers import member_dashboard_push as push
+
+        page = push.LivePage(
+            slug, member, model, state=None, loop=None, redact=_page_safe, reread=_reread_model
+        )
+    await _run(page.subscribe)
+    blocks, missing = page.blocks()
+    body: dict[str, Any] = {
+        "state": "live",
+        "instance_version": int(getattr(model, "version", 0) or 0),
+        "package": {
+            "slug": str(getattr(model, "slug", "") or ""),
+            "version": int(getattr(model, "version", 0) or 0),
+            "layout_fingerprint": str(model.layout_fingerprint),
+            "bound_to": str(model.bound_to),
+        },
+        "push_version": page.version,
+        "push_frame": _push_frame_type(),
+        "blocks": blocks,
+        "missing": missing,
+    }
+    rendered = await _run(
+        lambda: _minted_package_page(
+            slug,
+            package,
+            {
+                "blocks": blocks,
+                "missing": missing,
+                "version": page.version,
+                "layout": int(getattr(model, "version", 0) or 0),
+            },
+            locale,
+        )
+    )
+    if rendered is not None:
+        body["rendered_html"] = rendered
+    return web.json_response(body)
+
+
+def _push_frame_type() -> str:
+    """The WS message type a patch for this page arrives as.
+
+    Carried in the body so the frontend reads the name from the server rather than
+    holding a second copy of it -- the seam with the page is the shape, not a constant
+    spelled in two languages.
+    """
+    from kiro_crew.dashboard.handlers import member_dashboard_push as push
+
+    return push.BLOCK_FRAME
 
 
 #: Any key whose VALUE is a worker's session key, dropped from a value on its way to a
@@ -428,6 +527,251 @@ def _preview_record(slug: str) -> Any | None:
         state_reason="staged for preview; no version written",
         updated_ms=preview.staged_ms,
     )
+
+
+#: The scope prefix a crewmate's dashboard package is bound with.
+#:
+#: ``bound_to`` is ``crewmate:<slug>`` or ``session:<slot key>``, and the controller is
+#: keyed by SLUG -- the slug it already validated and already proved derives from
+#: exactly one crew name. So the binding this route may serve is this one string and
+#: nothing else: a session-bound package names a slot, and a crewmate reaching it would
+#: be reaching past its own page.
+_CREWMATE_BINDING: Final[str] = "crewmate:"
+
+#: The content-security policy a minted package document must declare before this
+#: gateway will serve it as a page. See :func:`_minted_package_page`.
+_PACKAGE_CSP: Final[str] = "default-src 'none'"
+
+#: D1's package renderer, named ONCE so the merge is one line.
+#:
+#: ``module:function``, resolved lazily through :func:`_package_renderer`, because the
+#: renderer lands on the display line's other branch and this controller must build,
+#: import and serve a package page without it. Assumed signature:
+#:
+#: ``render_package_page(package: Mapping[str, Any], payload: Mapping[str, Any], *,
+#: locale: str = "") -> str``
+#:
+#: where *package* is the canonical package (``model``, ``view``, ``theme``) and
+#: *payload* is ``{"blocks": {...}, "missing": [...], "version": int, "layout": int}`` --
+#: the same shape a push carries, so the document's first paint and its refills are one
+#: contract. A build without it serves the package body WITHOUT ``rendered_html``, which
+#: the frame draws as its own empty state.
+_PACKAGE_RENDERER: Final[str] = (
+    "kiro_crew.artifact_store.dashboard_package_render:render_package_page"
+)
+
+
+def _package_renderer() -> Callable[..., str] | None:
+    """D1's renderer, or ``None`` on a build that does not carry it yet."""
+    module_name, _, attr = _PACKAGE_RENDERER.partition(":")
+    try:
+        module = importlib.import_module(module_name)
+    except Exception:
+        logger.debug("dashboard: no package renderer at %s", _PACKAGE_RENDERER)
+        return None
+    fn = getattr(module, attr, None)
+    return fn if callable(fn) else None
+
+
+@dataclass(frozen=True)
+class _Packaged:
+    """What asking "does this crewmate's dashboard come from a package?" answered.
+
+    THREE states, not two, and the third is the one that matters: no package bound here
+    (``bound`` False), a package this route can serve (``model`` set), and a package
+    bound here that cannot be read (``bound`` True, ``model`` None).
+
+    The third must not collapse into the first. A crewmate whose agent composed a
+    layout HAS a dashboard, and the answer to a package this gateway cannot read is the
+    frame's empty state -- never a shipped builtin page, which would show that crewmate
+    somebody else's dashboard and let them act on its numbers.
+    """
+
+    bound: bool
+    package: dict[str, Any] | None = None
+    model: Any = None
+
+
+def _read_package(slug: str) -> _Packaged:
+    """Whether a dashboard package is bound to *slug*, and it if it can be served.
+
+    ONE read serving both halves of a servable package: the Model drives the field
+    values and the push's subscriptions, and the raw package carries the view and the
+    theme the renderer composes from. ``read_dashboard_model`` answers only the first,
+    so a second read would be a second chance for the two to disagree about which
+    version they describe.
+
+    Resolved BY this crewmate's own binding, so a package that comes back is this
+    crewmate's by construction -- :func:`_owns_package` re-asks on the push path, where
+    the question is live because a rebind writes no version.
+    """
+    from kiro_crew.artifact_store import dashboard_package as pkg
+    from kiro_crew.artifacts import ArtifactError, get_default_store
+
+    try:
+        store = get_default_store()
+    except Exception:
+        # No artifact store on this build at all. NOT "bound": nothing was read, so
+        # there is no package to be loyal to, and a crewmate with a v2 template adopted
+        # must still be served it.
+        logger.debug("dashboard: this build has no artifact store to ask about %r", slug)
+        return _Packaged(bound=False)
+    try:
+        bound = pkg.resolve_bound_slug(f"{_CREWMATE_BINDING}{slug}", store=store)
+    except Exception:
+        # The store is there and the SCAN failed, so whether a package is bound here is
+        # unknown. Answered as bound, which suppresses the builtin fallback: the cost of
+        # that is the frame's empty state for a crewmate who may have a v2 template, and
+        # the cost of the other answer is handing a crewmate who composed a layout a
+        # shipped page full of their own fold values with nothing saying it is not
+        # theirs.
+        logger.warning("dashboard: the package scan for %r failed", slug, exc_info=True)
+        return _Packaged(bound=True)
+    if bound is None:
+        return _Packaged(bound=False)
+    try:
+        loaded = store.get(bound)
+        package = pkg.parse_package(loaded.content or "")
+    except (ArtifactError, OSError, ValueError):
+        # BOUND AND UNREADABLE. The binding scan already parsed this record, so getting
+        # here means the content changed under the read or the store failed -- and
+        # either way this crewmate's dashboard is the package, not a builtin.
+        logger.warning("dashboard: %r's package %r could not be read", slug, bound, exc_info=True)
+        return _Packaged(bound=True)
+    return _Packaged(
+        bound=True,
+        package=package,
+        model=pkg.model_of(package, slug=loaded.slug, version=loaded.version),
+    )
+
+
+def _owns_package(slug: str, model: Any) -> bool:
+    """Whether the package *model* is THIS crewmate's to be served and pushed.
+
+    THE OWNER CHECK, kept here with the redaction and never moved into the push module
+    or the page: the controller is the code that knows which slug this request resolved
+    to, and it is the code the owner gate already runs in front of.
+
+    One string comparison, because ``bound_to`` is one string. A package bound to
+    another crewmate, or to a session slot, is not this crewmate's -- and the second is
+    the case a looser check would miss, since a slot key and a member slug look alike.
+    """
+    return str(getattr(model, "bound_to", "") or "") == f"{_CREWMATE_BINDING}{slug}"
+
+
+def _minted_package_page(
+    slug: str, package: Mapping[str, Any], payload: Mapping[str, Any], locale: str = ""
+) -> str | None:
+    """The document this gateway will EXECUTE for a package page, or ``None`` to refuse.
+
+    THE GATE FOR A V3 PAGE, and it is deliberately not
+    ``instance.RENDERABLE_SOURCES``. That set decides whether a stored TEMPLATE
+    INSTANCE's provenance may become a page, and :func:`_trusted_page` answers it by
+    loading markup from the template catalog by ``template_id``. A package has no
+    catalog directory and carries no markup at all, so it can never reach that gate --
+    widening the set would loosen the instance adopt path and buy this page nothing.
+
+    What makes a package page safe to execute HERE, and not elsewhere:
+
+    * **The document is MINTED by this gateway.** Nothing executable comes out of the
+      artifact: a validated package holds ``kind``, ``bound_to``, ``model``, ``view``
+      and ``theme`` and has no key that could carry markup or script. The bytes are
+      composed by the renderer named in :data:`_PACKAGE_RENDERER`, which is a function
+      in this repository.
+    * **The block catalogue is CLOSED.** Every block's ``type`` is re-checked against
+      ``view_block_catalog()`` here, at the render site, rather than trusted from the
+      write path -- the same reason ``_trusted_page`` does not trust the record's own
+      ``source`` label. An agent chooses which blocks to place and never what a block
+      is made of.
+    * **CSP ``default-src 'none'``.** The composed document must declare it, checked on
+      the renderer's output rather than assumed of it, so a renderer that stops
+      declaring it refuses to be served instead of running with a network.
+
+    All three are properties of THIS page. None of them holds for an authored template,
+    which is why that gate stays at one value.
+    """
+    from kiro_crew.artifact_store.dashboard_package import view_block_catalog
+
+    catalogue = view_block_catalog()
+    blocks = package.get("view", {}).get("blocks", [])
+    unknown = [str(b.get("type")) for b in blocks if str(b.get("type")) not in catalogue]
+    if unknown:
+        logger.warning(
+            "dashboard: refusing to mint %r's page: block types %s are not in the catalogue",
+            slug,
+            sorted(set(unknown)),
+        )
+        return None
+    render = _package_renderer()
+    if render is None:
+        return None
+    try:
+        document = render(package, payload, locale=locale)
+    except Exception:
+        logger.warning("dashboard: could not mint %r's package page", slug, exc_info=True)
+        return None
+    if not isinstance(document, str) or _PACKAGE_CSP not in document:
+        logger.warning(
+            "dashboard: refusing to serve %r's package page: it does not declare %s",
+            slug,
+            _PACKAGE_CSP,
+        )
+        return None
+    # Redacted like a template's own text, and for the same reason: this is the one step
+    # that produces the document, and the theme's tokens and CSS are agent-authored.
+    return _template_text_safe(document)
+
+
+def arm_block_push(request: web.Request, slug: str, member: str, model: Any) -> Any:
+    """Arm -- or refresh -- the live push for this crewmate's package page.
+
+    Called from the read, so the whole page and the subscriptions behind its patches are
+    established by one request: a page armed anywhere else could be pushing to a browser
+    that never got a first load to apply patches to.
+
+    THE OWNER CHECK AND THE REDACTION ARE PASSED FROM HERE AND IMPLEMENTED HERE. The
+    push module gets ``_page_safe`` as the one function values cross on their way to a
+    socket, and ``_reread_model`` as the only way it can learn the package moved -- so a
+    binding this crewmate does not own closes the page rather than pushing from it.
+    """
+    from kiro_crew.dashboard.handlers import member_dashboard_push as push
+
+    if not _owns_package(slug, model):
+        push.close_page(slug)
+        return None
+    state = request.app.get("state")
+    if state is None:
+        # No hub in this application, so there is nobody to push to. Not an error: the
+        # route is registered standalone in tests and by the route-table check.
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # pragma: no cover - the route always runs on a loop
+        loop = None
+    page = push.open_page(
+        slug,
+        member,
+        model,
+        state=state,
+        loop=loop,
+        redact=_page_safe,
+        reread=_reread_model,
+    )
+    return page
+
+
+def _reread_model(slug: str) -> Any:
+    """The package Model bound to *slug* now, or ``None``. File IO; off the loop.
+
+    Handed to the push so the ONE question it may ask about ownership is asked through
+    the controller's own binding rule. It resolves BY the binding, so a package rebound
+    to another crewmate answers ``None`` here rather than coming back attached to a page
+    that is no longer its.
+    """
+    read = _read_package(slug)
+    if read.model is None:
+        return None
+    return read.model if _owns_package(slug, read.model) else None
 
 
 def _trusted_page(slug: str, record: Any) -> str | None:

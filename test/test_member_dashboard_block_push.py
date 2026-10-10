@@ -1,0 +1,607 @@
+"""The v3 dashboard's push protocol, one test per sentence of it -- negatives included.
+
+The five the brief fixes, and the two the conductor added:
+
+1. First load renders the WHOLE page.
+2. A fold pushes ONLY the blocks that subscribe to that fold.
+3. It goes over the EXISTING WebSocket -- the owner channel -- carrying a version.
+4. A version GAP, or a LAYOUT CHANGE, triggers a full refetch. Both, not just the gap.
+5. The owner check and the redaction stay in the CONTROLLER.
+6. A package-bound crewmate gets no builtin fallback; a registry-bound one is unchanged.
+7. ``instance.RENDERABLE_SOURCES`` stays at one value -- the v3 page earns execution at
+   its own gate, which is :func:`member_dashboard._minted_package_page`.
+
+The redaction cases assert over the WHOLE serialized payload rather than the one field a
+reader would think to look at, with a positive control proving the values that must
+survive DID: a per-field assertion passes just as happily on an empty payload.
+"""
+
+from __future__ import annotations
+
+import json
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+from kiro_crew.artifact_store import dashboard_package as dp
+from kiro_crew.artifacts import ArtifactStore
+from kiro_crew.dashboard.handlers import member_dashboard as routes
+from kiro_crew.dashboard.handlers import member_dashboard_push as push
+
+pytestmark = pytest.mark.asyncio
+
+MEMBER = "Fleet Conductor"
+SLUG = "fleet-conductor"
+BOUND = f"crewmate:{SLUG}"
+
+#: A secret in the shape the egress redactor recognises, so the assertion is about the
+#: controller's chokepoint rather than about a pattern invented here.
+SECRET = "ghp_" + "A" * 36
+
+
+def package(*, bound_to: str = BOUND, blocks: list[dict[str, Any]] | None = None) -> dict:
+    """A package with TWO blocks reading TWO DIFFERENT folds.
+
+    That split is the whole point of the fixture: a push for ``work`` must carry the
+    ``prs`` block and must NOT carry ``runs``, and a fixture whose blocks share a fold
+    could not tell a correct push from one that sends everything.
+    """
+    return {
+        "kind": "dashboard",
+        "bound_to": bound_to,
+        "model": {
+            "types": {
+                "open_prs": {
+                    "type": "number",
+                    "label": "Open PRs",
+                    "source": {"fold": "work", "path": "summary.open_prs"},
+                },
+                "note": {
+                    "type": "text",
+                    "label": "Note",
+                    "source": {"fold": "work", "path": "summary.note"},
+                },
+                "last_run": {
+                    "type": "timestamp",
+                    "label": "Last run",
+                    "source": {"fold": "panel", "path": "last_run"},
+                },
+            }
+        },
+        "view": {
+            "blocks": (
+                blocks
+                if blocks is not None
+                else [
+                    {"id": "prs", "type": "table", "fields": ["open_prs", "note"]},
+                    {"id": "runs", "type": "stat", "fields": ["last_run"]},
+                ]
+            )
+        },
+        "theme": {"tokens": {"--panel-bg": "oklch(21% 0 0)"}},
+    }
+
+
+class _Hub:
+    """The hub's one method this push uses, recording what it was handed."""
+
+    def __init__(self) -> None:
+        self.frames: list[tuple[str, dict[str, Any]]] = []
+
+    def broadcast_ws_owners(self, msg_type: str, data: dict[str, Any]) -> None:
+        # Serialized on the way in, exactly as the real hub does, so a payload that
+        # cannot be JSON would fail here rather than in production.
+        json.loads(json.dumps(data))
+        self.frames.append((msg_type, data))
+
+
+def _event(fold: str, value: dict[str, Any], *, revision: int = 1, seq: int = 1):
+    from kiro_crew.crew_log import bus as crew_log_bus
+
+    return crew_log_bus.FoldAdvanced(
+        scope=crew_log_bus.SCOPE_SLOT, key=SLUG, fold=fold, revision=revision, value=value, seq=seq
+    )
+
+
+WORK = {"summary": {"open_prs": 4, "note": f"token {SECRET} pasted"}}
+PANEL = {"last_run": "2026-10-09T23:00:00Z"}
+
+
+@pytest.fixture(autouse=True)
+def _env(tmp_path, _floor_monkeypatch):
+    """An isolated home, a tmp artifact store, and the member checks stubbed.
+
+    The member-identity and owner gates are the SIBLING routes' and are tested there;
+    what is stubbed is config loading, not the checks. Patched through
+    ``_floor_monkeypatch`` so a test body calling ``monkeypatch.undo()`` cannot hand the
+    rest of that test the real config loader.
+    """
+    _floor_monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+    cfg = SimpleNamespace(agents={MEMBER: SimpleNamespace(member_id="")})
+    _floor_monkeypatch.setattr(routes.KiroCrewConfig, "load", staticmethod(lambda: cfg))
+    _floor_monkeypatch.setattr(routes.members_mod, "member_slug", lambda name, config=None: SLUG)
+    _floor_monkeypatch.setattr(routes.members_mod, "validate_slug", lambda slug: slug)
+    _floor_monkeypatch.setattr(routes.members_mod, "is_dispatchable_member_name", bool)
+    _floor_monkeypatch.setattr(routes, "_member_names_for_slug", lambda cfg, slug: [MEMBER])
+    _floor_monkeypatch.setattr(routes, "_deny_app_caller", _none)
+    _floor_monkeypatch.setattr(routes, "_owner_only", _none)
+    _floor_monkeypatch.setattr(routes, "_write_session", lambda slug, member: "")
+    yield
+    push.close_all()
+
+
+async def _none(*_a, **_k):
+    return None
+
+
+@pytest.fixture
+def store(tmp_path, _floor_monkeypatch) -> ArtifactStore:
+    """The process-wide default store, pointed at a tmp root for this test."""
+    import kiro_crew.artifacts as artifacts_mod
+
+    live = ArtifactStore(root=tmp_path / "artifacts")
+    _floor_monkeypatch.setattr(artifacts_mod, "get_default_store", lambda: live)
+    return live
+
+
+@pytest.fixture
+def saved(store: ArtifactStore):
+    return store.create(name="Mate dashboard", kind="dashboard", content=json.dumps(package()))
+
+
+def _model(store: ArtifactStore, slug: str):
+    loaded = store.get(slug)
+    return dp.model_of(dp.parse_package(loaded.content or ""), slug=slug, version=loaded.version)
+
+
+def _page(model, hub: _Hub, *, reread=None) -> push.LivePage:
+    """A live page with no loop: the send is awaited directly by the test."""
+    return push.LivePage(
+        SLUG,
+        MEMBER,
+        model,
+        state=hub,
+        loop=None,
+        redact=routes._page_safe,
+        reread=reread if reread is not None else (lambda _slug: model),
+    )
+
+
+@asynccontextmanager
+async def _client(hub: _Hub | None = None):
+    """A started client that always closes.
+
+    An ``async with`` helper rather than a fixture, by this repo's convention: the
+    pinned pytest-asyncio does not collect async-generator fixtures declared with a
+    plain ``@pytest.fixture``. Closing is not tidiness -- a leaked TestClient costs two
+    descriptors and fails UNRELATED tests with EMFILE on a loaded runner.
+    """
+    app = web.Application()
+    if hub is not None:
+        app["state"] = hub
+    routes.register_member_dashboard_routes(app)
+    c = TestClient(TestServer(app))
+    await c.start_server()
+    try:
+        yield c
+    finally:
+        await c.close()
+
+
+def _q() -> str:
+    return f"/api/members/{SLUG}/dashboard?member={MEMBER.replace(' ', '+')}"
+
+
+# --------------------------------------------------------------------------
+# 1. first load renders the whole page
+# --------------------------------------------------------------------------
+
+
+async def test_the_first_load_carries_every_block(store, saved):
+    """Every block, not the ones some fold happened to move."""
+    hub = _Hub()
+    async with _client(hub) as client:
+        body = await (await client.get(_q())).json()
+    assert body["state"] == "live"
+    assert set(body["blocks"]) == {"prs", "runs"}
+    assert body["package"]["slug"] == saved.slug
+    assert body["package"]["version"] == saved.version
+    # The counter the browser starts from. Without it the FIRST patch has nothing to be
+    # compared against and a gap at version 1 would be undetectable.
+    assert body["push_version"] == 0
+    assert body["push_frame"] == push.BLOCK_FRAME
+
+
+async def test_the_first_load_arms_the_push_before_it_reads(store, saved):
+    """Armed by the read, so patches land on a page that got a full load to apply to."""
+    hub = _Hub()
+    async with _client(hub) as client:
+        assert (await client.get(_q())).status == 200
+    page = push.live_page(SLUG)
+    assert page is not None
+    assert page.member == MEMBER
+    assert page.folds() == frozenset({"work", "panel"})
+
+
+async def test_a_second_read_refreshes_one_page_rather_than_arming_a_second(store, saved):
+    """Two sets of subscriptions would write two counters the browser cannot tell apart."""
+    hub = _Hub()
+    async with _client(hub) as client:
+        await client.get(_q())
+        first = push.live_page(SLUG)
+        await client.get(_q())
+        second = push.live_page(SLUG)
+    assert first is second
+
+
+# --------------------------------------------------------------------------
+# 2. only the blocks that subscribe to the fold
+# --------------------------------------------------------------------------
+
+
+async def test_a_push_carries_only_the_blocks_that_subscribe_to_the_fold(store, saved):
+    hub = _Hub()
+    page = _page(_model(store, saved.slug), hub)
+    page.on_fold("work", _event("work", WORK))
+    assert await page.send("work") is True
+    _type, data = hub.frames[-1]
+    assert set(data["blocks"]) == {"prs"}, "a block reading another fold was pushed"
+    assert "runs" not in data["blocks"]
+    assert data["fold"] == "work"
+
+
+async def test_the_other_fold_pushes_the_other_block(store, saved):
+    """The positive control for the case above: the split is real, not an empty result."""
+    hub = _Hub()
+    page = _page(_model(store, saved.slug), hub)
+    page.on_fold("panel", _event("panel", PANEL))
+    assert await page.send("panel") is True
+    _type, data = hub.frames[-1]
+    assert set(data["blocks"]) == {"runs"}
+    assert data["blocks"]["runs"]["last_run"] == PANEL["last_run"]
+
+
+async def test_a_fold_no_block_subscribes_to_sends_nothing_and_spends_no_version(store, saved):
+    hub = _Hub()
+    page = _page(_model(store, saved.slug), hub)
+    assert await page.send("ledger") is False
+    assert hub.frames == []
+    assert page.version == 0
+
+
+async def test_a_field_whose_path_does_not_resolve_is_named_not_valued(store, saved):
+    """A missing value is NAMED so the page dims that cell; a None would read as zero."""
+    hub = _Hub()
+    page = _page(_model(store, saved.slug), hub)
+    page.on_fold("work", _event("work", {"summary": {"open_prs": 4}}))
+    await page.send("work")
+    _type, data = hub.frames[-1]
+    assert data["blocks"]["prs"] == {"open_prs": 4}
+    assert data["missing"] == ["note"]
+
+
+# --------------------------------------------------------------------------
+# 3. the existing WebSocket, with a version
+# --------------------------------------------------------------------------
+
+
+async def test_the_push_uses_the_owner_channel_and_adds_no_second_one(store, saved):
+    """One message TYPE on the hub's owner broadcast -- the one ``slot_projection`` uses."""
+    hub = _Hub()
+    page = _page(_model(store, saved.slug), hub)
+    page.on_fold("work", _event("work", WORK))
+    await page.send("work")
+    msg_type, _data = hub.frames[-1]
+    assert msg_type == push.BLOCK_FRAME == "dashboard_block_patch"
+    # An app token must never be handed this frame even if some later caller broadcasts
+    # the name literally rather than through the owner-only method.
+    from kiro_crew.dashboard import ws_event_scope
+
+    assert push.BLOCK_FRAME in ws_event_scope._OWNER_ONLY_EVENTS
+
+
+async def test_the_version_steps_by_exactly_one_per_frame(store, saved):
+    hub = _Hub()
+    page = _page(_model(store, saved.slug), hub)
+    for revision in (1, 2, 3):
+        page.on_fold("work", _event("work", WORK, revision=revision))
+        await page.send("work")
+    assert [data["version"] for _t, data in hub.frames] == [1, 2, 3]
+
+
+async def test_a_frame_names_the_layout_it_was_computed_under(store, saved):
+    hub = _Hub()
+    page = _page(_model(store, saved.slug), hub)
+    page.on_fold("work", _event("work", WORK))
+    await page.send("work")
+    _type, data = hub.frames[-1]
+    assert data["layout"] == saved.version
+
+
+async def test_an_older_revision_is_dropped_rather_than_pushed(store, saved):
+    """Ordered by REVISION, never by arrival: a seq can move down while a value moves on."""
+    hub = _Hub()
+    page = _page(_model(store, saved.slug), hub)
+    page.on_fold("work", _event("work", WORK, revision=5))
+    await page.send("work")
+    page.on_fold("work", _event("work", {"summary": {"open_prs": 999}}, revision=2))
+    await page.send("work")
+    assert hub.frames[-1][1]["blocks"]["prs"]["open_prs"] == 4
+
+
+# --------------------------------------------------------------------------
+# 4. a gap OR a layout change -> refetch. Both.
+# --------------------------------------------------------------------------
+
+
+async def test_a_layout_change_sends_a_refetch_carrying_no_values(store, saved):
+    """The block set may have moved, so values under the new layout must not be applied."""
+    hub = _Hub()
+    model = _model(store, saved.slug)
+    recomposed = store.update(
+        saved.slug,
+        content=json.dumps(package(blocks=[{"id": "prs", "type": "stat", "fields": ["open_prs"]}])),
+    )
+    assert recomposed.version != saved.version, "the fixture did not change the layout"
+    page = _page(model, hub, reread=lambda _slug: _model(store, saved.slug))
+    page.on_fold("work", _event("work", WORK))
+    assert await page.send("work") is True
+    _type, data = hub.frames[-1]
+    assert data["refetch"] is True
+    assert data["reason"] == push.REASON_LAYOUT
+    assert data["blocks"] == {}
+    assert data["layout"] == recomposed.version
+
+
+async def test_the_gap_a_restart_makes_is_a_gap_the_page_can_see(store, saved):
+    """The version the page holds and the one a fresh page sends cannot be confused.
+
+    A gateway restarted inside one interpreter arms a NEW page whose counter starts at
+    zero, so its first frame carries version 1 while the browser holds 7. The rule the
+    page applies is ``held + 1``, not ``> held``, which is why that reads as a gap and
+    refetches rather than being applied over newer values.
+    """
+    hub = _Hub()
+    model = _model(store, saved.slug)
+    old = _page(model, hub)
+    for revision in range(1, 8):
+        old.on_fold("work", _event("work", WORK, revision=revision))
+        await old.send("work")
+    assert hub.frames[-1][1]["version"] == 7
+    fresh = _page(model, hub)
+    fresh.on_fold("work", _event("work", WORK))
+    await fresh.send("work")
+    assert hub.frames[-1][1]["version"] == 1
+
+
+# --------------------------------------------------------------------------
+# 5. the owner check and the redaction stay in the controller
+# --------------------------------------------------------------------------
+
+
+async def test_a_package_this_member_does_not_own_is_not_pushed(store, tmp_path):
+    """The negative one. A package bound elsewhere arms nothing and sends nothing."""
+    other = store.create(
+        name="Someone else",
+        kind="dashboard",
+        content=json.dumps(package(bound_to="crewmate:other")),
+    )
+    hub = _Hub()
+    model = _model(store, other.slug)
+    request = SimpleNamespace(app={"state": hub})
+    assert routes.arm_block_push(request, SLUG, MEMBER, model) is None
+    assert push.live_page(SLUG) is None
+    assert hub.frames == []
+
+
+async def test_a_session_bound_package_is_not_a_members(store):
+    """A slot key and a member slug look alike, which is the case a loose check misses."""
+    model = _model(
+        store,
+        store.create(
+            name="Slot page",
+            kind="dashboard",
+            content=json.dumps(package(bound_to=f"session:{SLUG}")),
+        ).slug,
+    )
+    assert routes._owns_package(SLUG, model) is False
+
+
+async def test_a_rebind_stops_the_push_and_asks_for_a_refetch(store, saved):
+    """A rebind writes no version, so the layout check cannot see it: the re-read does."""
+    hub = _Hub()
+    page = _page(_model(store, saved.slug), hub, reread=lambda _slug: None)
+    page.on_fold("work", _event("work", WORK))
+    assert await page.send("work") is True
+    _type, data = hub.frames[-1]
+    assert data["refetch"] is True
+    assert data["reason"] == push.REASON_UNBOUND
+    assert data["blocks"] == {}
+    # And it is over for good: a closed page never sends another frame.
+    page.on_fold("work", _event("work", WORK, revision=9))
+    assert await page.send("work") is False
+    assert len(hub.frames) == 1
+
+
+async def test_a_redacted_value_is_redacted_in_the_whole_pushed_payload(store, saved):
+    """Asserted over the WHOLE serialized frame, not the one field a reader would check.
+
+    The same value can reappear on a block id, a key, or a sibling field, and a
+    per-field assertion would not see it.
+    """
+    hub = _Hub()
+    page = _page(_model(store, saved.slug), hub)
+    page.on_fold("work", _event("work", WORK))
+    await page.send("work")
+    _type, data = hub.frames[-1]
+    serialized = json.dumps(data)
+    assert SECRET not in serialized
+    # POSITIVE CONTROL: the values that must survive DID, so this is not passing on an
+    # empty payload or a frame that never went out.
+    assert data["blocks"]["prs"]["open_prs"] == 4
+    assert "token" in data["blocks"]["prs"]["note"]
+
+
+async def test_the_push_cannot_be_armed_without_the_controllers_redactor():
+    """Refused rather than defaulted: a default here would be a SECOND redactor."""
+    with pytest.raises(TypeError):
+        push.LivePage(
+            SLUG,
+            MEMBER,
+            SimpleNamespace(),
+            state=None,
+            loop=None,
+            redact=None,
+            reread=lambda s: None,
+        )
+
+
+async def test_the_controller_is_what_hands_the_push_its_redactor(store, saved):
+    hub = _Hub()
+    request = SimpleNamespace(app={"state": hub})
+    page = routes.arm_block_push(request, SLUG, MEMBER, _model(store, saved.slug))
+    assert page is not None
+    assert page._redact is routes._page_safe
+
+
+# --------------------------------------------------------------------------
+# 6. the builtin fallback is scoped by SOURCE (conductor's cycle-2 ruling)
+# --------------------------------------------------------------------------
+
+
+async def test_a_package_bound_member_gets_no_builtin_fallback(store, saved, monkeypatch):
+    """v3 has no default page, so a package-bound crewmate is never handed a shipped one.
+
+    The bound-but-unreadable case, which is the only one that can reach the fallback at
+    all: a servable package returns above it.
+    """
+    called: list[str] = []
+
+    def _default(slug: str):
+        called.append(slug)
+        raise AssertionError("a package-bound member must not be handed a builtin page")
+
+    monkeypatch.setattr(routes.instance, "default_instance", _default)
+    monkeypatch.setattr(routes, "_read_package", lambda slug: routes._Packaged(bound=True))
+    hub = _Hub()
+    async with _client(hub) as client:
+        body = await (await client.get(_q())).json()
+    assert called == []
+    assert body["state"] == "empty"
+    assert "rendered_html" not in body
+
+
+async def test_a_registry_bound_member_still_gets_the_default(store, monkeypatch):
+    """The other direction. The shipped templates are a live feature and stay one."""
+    fallback = SimpleNamespace(
+        state=routes.instance.STATE_EMPTY,
+        wire=lambda: {"instance_version": 0, "state": "empty", "html": "<p>x</p>", "manifest": {}},
+    )
+    seen: list[str] = []
+
+    def _default(slug: str):
+        seen.append(slug)
+        return fallback
+
+    monkeypatch.setattr(routes.instance, "default_instance", _default)
+    monkeypatch.setattr(routes, "_render", lambda *a, **k: "<html>composed</html>")
+    async with _client() as client:
+        body = await (await client.get(_q())).json()
+    assert seen == [SLUG], "the registry fallback stopped being offered"
+    assert body["rendered_html"] == "<html>composed</html>"
+
+
+async def test_the_read_tells_bound_and_unreadable_from_not_bound(store, saved, monkeypatch):
+    """THREE states, and the third is the one the ruling turns on.
+
+    The third is reached the way it is reached in production: the binding scan parses
+    the record and matches it, and the read AFTER that one fails -- the content changed
+    under the read, or the store faulted between the two.
+    """
+    assert routes._read_package("nobody") == routes._Packaged(bound=False)
+    answered = routes._read_package(SLUG)
+    assert answered.bound is True and answered.model is not None
+
+    real = dp.parse_package
+    calls: list[int] = []
+
+    def _fails_after_the_scan(content: str):
+        calls.append(1)
+        if len(calls) == 1:
+            return real(content)
+        raise ValueError("the content moved under the read")
+
+    monkeypatch.setattr(dp, "parse_package", _fails_after_the_scan)
+    broken = routes._read_package(SLUG)
+    assert len(calls) == 2, "the fixture did not reach the read after the scan"
+    assert broken.bound is True, "a package bound here read as absent"
+    assert broken.model is None
+
+
+async def test_a_failed_package_scan_suppresses_the_fallback_rather_than_guessing(
+    store, saved, monkeypatch
+):
+    """An unknown answer must not hand a crewmate a page they did not compose."""
+    monkeypatch.setattr(dp, "resolve_bound_slug", _raise)
+    answered = routes._read_package(SLUG)
+    assert answered.bound is True
+    assert answered.model is None
+
+
+def _raise(*_a, **_k):
+    raise ValueError("not a package")
+
+
+# --------------------------------------------------------------------------
+# 7. the v3 page earns execution at its OWN gate
+# --------------------------------------------------------------------------
+
+
+async def test_a_package_page_is_served_only_when_the_document_declares_the_csp(monkeypatch):
+    """Checked on the renderer's OUTPUT, not assumed of it."""
+    pkg = package()
+    payload = {"blocks": {}, "missing": [], "version": 0, "layout": 1}
+    monkeypatch.setattr(routes, "_package_renderer", lambda: lambda *a, **k: "<html>no csp</html>")
+    assert routes._minted_package_page(SLUG, pkg, payload) is None
+    monkeypatch.setattr(
+        routes,
+        "_package_renderer",
+        lambda: lambda *a, **k: "<meta content=\"default-src 'none'\"><b>page</b>",
+    )
+    assert routes._minted_package_page(SLUG, pkg, payload) is not None
+
+
+async def test_a_block_type_outside_the_closed_catalogue_is_not_rendered(monkeypatch):
+    """Re-checked at the RENDER site, like ``_trusted_page`` not trusting a stored label."""
+    rendered: list[str] = []
+    monkeypatch.setattr(
+        routes,
+        "_package_renderer",
+        lambda: lambda *a, **k: rendered.append("ran") or "default-src 'none'",
+    )
+    pkg = package()
+    pkg["view"]["blocks"] = [{"id": "prs", "type": "iframe", "fields": ["open_prs"]}]
+    assert routes._minted_package_page(SLUG, pkg, {}) is None
+    assert rendered == [], "the renderer ran for a block type nothing in the repo defines"
+
+
+async def test_a_package_page_never_reaches_the_template_execution_gate():
+    """Which is WHY ``instance.RENDERABLE_SOURCES`` stays at one value.
+
+    ``_trusted_page`` is the gate that set guards, and it answers by loading markup from
+    the template CATALOG by the record's ``template_id``. A package has no catalog
+    directory and carries no markup key at all, so widening the set would loosen the
+    template adopt path (``instance._check``) and buy this page nothing.
+    """
+    from kiro_crew.dashboard_templates import catalog
+    from kiro_crew.dashboard_templates import instance as instance_store
+
+    assert instance_store.RENDERABLE_SOURCES == frozenset({catalog.BUILTIN_SOURCE})
+    assert "package" not in instance_store.RENDERABLE_SOURCES
+    # The structural half of the claim: a validated package has no key that can carry
+    # markup or script, so there is no stored page for that gate to be asked about.
+    assert set(dp.validate_package(package())) == {"kind", "bound_to", "model", "view", "theme"}
