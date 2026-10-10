@@ -400,7 +400,8 @@ class LivePage:
                 "version": self._version,
                 "layout": self.layout,
                 "fold": fold,
-                # WHICH BLOCKS MOVED -- only the ones that read this fold.
+                # WHICH BLOCKS MOVED, and which of their fields. Names only: the values
+                # and their formatted strings live once, in `read`.
                 "blocks": blocks,
                 "missing": missing,
                 # WHAT THE DOCUMENT IS GIVEN. The page's own listener takes `read` and
@@ -446,38 +447,45 @@ class LivePage:
 
     def blocks(
         self, *, folds: frozenset[str] | None = None
-    ) -> tuple[dict[str, dict[str, Any]], list[str]]:
-        """``(blocks, missing)`` for this page, redacted. The ONE place values come from.
+    ) -> tuple[dict[str, list[str]], list[str]]:
+        """``(blocks, missing)`` -- WHICH blocks moved and which of their fields.
 
         *folds* ``None`` is the whole page, which is what the first load serves. A set
         selects only the blocks that read one of those folds -- :meth:`DashboardModel.
         block_folds` is that lookup, and a block reading none of them is absent from the
         result rather than present and empty.
 
-        A field whose path does not resolve is NAMED in ``missing`` instead of carried
-        as a value: the page dims that cell, and a ``None`` would render as a zero.
+        NAMES, NOT VALUES, and that is the whole point. Every value on this page lives
+        once, in :meth:`read`, where it is redacted and formatted by the renderer's own
+        ``display_values``. A copy here would be a second home for the same number --
+        and an UNFORMATTED one, so whoever read it would show a bare ``1200000000``
+        where the first load showed ``1.2 GB``. One home, one spelling of the format
+        rules, and that spelling is the renderer's.
 
-        Every value crosses the controller's redactor on the way out, in ONE call over
-        the whole mapping rather than per field -- the redactor is recursive and covers
-        keys as well, and a per-field call would be a per-field chance to forget one.
+        Safe to carry as keys: a block id and a field name are both matched against a
+        restricted grammar by the package gate (``[a-z][a-z0-9_-]{0,63}``), so nothing
+        here is agent free text and nothing here needs redacting.
+
+        A field whose path does not resolve is NAMED in ``missing``: the page dims that
+        cell, and it deliberately gets no value and no display string -- an empty string
+        would render as a filled cell holding nothing, which is worse than dimmed.
         """
         model = self.model
         cells = self._snapshot()
-        out: dict[str, dict[str, Any]] = {}
+        out: dict[str, list[str]] = {}
         missing: list[str] = []
         for block_id in getattr(model, "subscriptions", {}):
             if folds is not None and not (model.block_folds(block_id) & folds):
                 continue
-            values: dict[str, Any] = {}
+            names: list[str] = []
             for name in model.subscriptions[block_id]:
-                resolved = self._value_of(name, cells)
-                if resolved is MISSING:
+                if self._value_of(name, cells) is MISSING:
                     if name not in missing:
                         missing.append(name)
                     continue
-                values[name] = resolved
-            out[block_id] = values
-        return self._redact(out), missing
+                names.append(name)
+            out[block_id] = names
+        return out, missing
 
     def read(self) -> dict[str, Any]:
         """This page's whole read, in the shape the DOCUMENT accepts. Redacted.
@@ -495,10 +503,20 @@ class LivePage:
         fields and the saving is real; until then sending everything is the correct
         answer rather than the cheap one.
 
-        ``display`` is added when the renderer is on this build: it is that module's own
-        formatter, and a page that does not get it falls back to a plain ``String(value)``
-        -- an unformatted number a reader can SEE is unformatted, rather than one
-        formatted by a second set of rules that drifted from the renderer's.
+        ``display`` is the renderer's OWN formatter over these same values, so there is
+        exactly one spelling of "a number with a unit and a precision" and it is not in
+        page JS. A build without the renderer sends no ``display`` and the page falls
+        back to a plain ``String(value)`` -- an unformatted number a reader can SEE is
+        unformatted, rather than one formatted by a second set of rules that drifted.
+
+        ORDER IS LOAD-BEARING: ``display`` is computed from the REDACTED fields, never
+        from the raw ones. A string formatted before the redactor ran would carry
+        exactly what the redactor exists to mask, past a reader who was looking at the
+        masked value right beside it. The redaction still happens in ONE call over the
+        whole mapping, so the property that there is a single chokepoint is kept.
+
+        A field in ``missing`` gets neither a value nor a display string, because
+        ``display_values`` only formats names present in ``fields``.
         """
         model = self.model
         cells = self._snapshot()

@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 
 import pytest
 from aiohttp import web
@@ -294,7 +294,8 @@ async def test_the_other_fold_pushes_the_other_block(store, saved):
     assert await page.send("panel") is True
     _type, data = hub.frames[-1]
     assert set(data["blocks"]) == {"runs"}
-    assert data["blocks"]["runs"]["last_run"] == PANEL["last_run"]
+    assert data["blocks"]["runs"] == ["last_run"]
+    assert data["read"]["fields"]["last_run"] == PANEL["last_run"]
 
 
 async def test_a_fold_under_a_key_kind_this_page_cannot_reach_is_reported_not_dropped(
@@ -337,9 +338,9 @@ async def test_a_second_read_keeps_the_live_subscriptions_and_their_values(store
         # Above whatever revision the subscribe-time baseline recorded, so this value is
         # the newer one rather than being dropped as an older arrival.
         page.on_fold("work", _event("work", WORK, revision=10_000))
-        assert page.blocks()[0]["prs"]["open_prs"] == 4, "the fixture never cached a value"
+        assert page.read()["fields"]["open_prs"] == 4, "the fixture never cached a value"
         body = await (await client.get(_q())).json()
-    assert body["blocks"]["prs"]["open_prs"] == 4, "the second read resubscribed and lost it"
+    assert body["read"]["fields"]["open_prs"] == 4, "the second read resubscribed and lost it"
 
 
 async def test_a_fold_no_block_subscribes_to_sends_nothing_and_spends_no_version(store, saved):
@@ -357,7 +358,8 @@ async def test_a_field_whose_path_does_not_resolve_is_named_not_valued(store, sa
     page.on_fold("work", _event("work", {"summary": {"open_prs": 4}}))
     await page.send("work")
     _type, data = hub.frames[-1]
-    assert data["blocks"]["prs"] == {"open_prs": 4}
+    assert data["blocks"]["prs"] == ["open_prs"]
+    assert data["read"]["fields"] == {"open_prs": 4}
     assert data["missing"] == ["note"]
 
 
@@ -419,6 +421,74 @@ async def test_the_read_is_complete_even_though_the_push_is_partial(store, saved
     # The field only the OTHER block reads is still in the read, with its value.
     assert data["read"]["fields"]["last_run"] == PANEL["last_run"]
     assert data["read"]["stale"] is False
+
+
+async def test_the_display_strings_are_formatted_from_the_REDACTED_values(store, saved):
+    """The order constraint, pinned on what the formatter was HANDED.
+
+    A string formatted before the redactor ran would carry exactly what the redactor
+    exists to mask, and it would sit beside the masked raw value where a reader is least
+    likely to question it. So this asserts the seam SAW redacted input, not merely that
+    the output happens to look clean -- the output could be clean by luck for one
+    formatter and not for the next one.
+    """
+    hub = _Hub()
+    model = _model(store, saved.slug)
+    seen: list[Mapping[str, Any]] = []
+
+    def _formatter(package, fields):
+        seen.append(dict(fields))
+        return {name: f"[{value}]" for name, value in fields.items()}
+
+    page = push.LivePage(
+        SLUG,
+        MEMBER,
+        model,
+        state=hub,
+        loop=None,
+        redact=routes._page_safe,
+        reread=lambda _slug: model,
+        display_seam=_formatter,
+    )
+    page.on_fold("work", _event("work", WORK))
+    await page.send("work")
+    _type, data = hub.frames[-1]
+    # WHAT THE FORMATTER WAS GIVEN.
+    assert seen, "the formatter was never called"
+    assert SECRET not in json.dumps(seen), "the formatter was handed the raw value"
+    # AND THE WHOLE FRAME, which is where a display string formatted too early lands.
+    assert SECRET not in json.dumps(data)
+    assert SECRET not in json.dumps(data["read"]["display"])
+    # POSITIVE CONTROL: the values that must survive DID, raw and formatted, so none of
+    # the above is passing on an empty payload or a frame that never went out.
+    assert data["read"]["fields"]["open_prs"] == 4
+    assert data["read"]["display"]["open_prs"] == "[4]"
+    assert "token" in data["read"]["display"]["note"]
+    assert "REDACTED" in data["read"]["display"]["note"]
+
+
+async def test_a_missing_field_gets_no_display_string_either(store, saved):
+    """The page dims that cell. An empty string would render as a filled cell."""
+    hub = _Hub()
+    model = _model(store, saved.slug)
+    page = push.LivePage(
+        SLUG,
+        MEMBER,
+        model,
+        state=hub,
+        loop=None,
+        redact=routes._page_safe,
+        reread=lambda _slug: model,
+        display_seam=lambda package, fields: {n: str(v) for n, v in fields.items()},
+    )
+    # `panel` never moved, so `last_run` does not resolve.
+    page.on_fold("work", _event("work", WORK))
+    read = page.read()
+    assert "last_run" in read["missing"]
+    assert "last_run" not in read["fields"]
+    assert "last_run" not in read["display"], "a dimmed cell was given a string to show"
+    # Positive control: the resolved field DID get one.
+    assert read["display"]["open_prs"] == "4"
 
 
 async def test_the_read_carries_the_renderers_own_formatting_when_it_is_there(store, saved):
@@ -493,7 +563,7 @@ async def test_an_older_revision_is_dropped_rather_than_pushed(store, saved):
     await page.send("work")
     page.on_fold("work", _event("work", {"summary": {"open_prs": 999}}, revision=2))
     await page.send("work")
-    assert hub.frames[-1][1]["blocks"]["prs"]["open_prs"] == 4
+    assert hub.frames[-1][1]["read"]["fields"]["open_prs"] == 4
 
 
 # --------------------------------------------------------------------------
@@ -610,8 +680,7 @@ async def test_a_redacted_value_is_redacted_in_the_whole_pushed_payload(store, s
     assert SECRET not in json.dumps(data["read"])
     # POSITIVE CONTROL: the values that must survive DID, so this is not passing on an
     # empty payload or a frame that never went out.
-    assert data["blocks"]["prs"]["open_prs"] == 4
-    assert "token" in data["blocks"]["prs"]["note"]
+    assert data["blocks"]["prs"] == ["open_prs", "note"]
     assert data["read"]["fields"]["open_prs"] == 4
 
 
