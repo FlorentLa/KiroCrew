@@ -7996,8 +7996,12 @@ def read_tree_projection(root: str, name: str) -> Projection:
     COLD every time, and that is the posture the key kind earns rather than an omission:
     a warm cell would be invalidated by growth in ANY member's log, including a member
     the cell did not know existed, and there is no publisher for that event. So this fold
-    is lazy, has no bus scope, and is served on a page load and on a refetch -- which the
+    is lazy, has no bus scope, and belongs on a page load and on a refetch -- which the
     controller contract already covers, since a gap triggers a full refetch anyway.
+
+    No production caller reaches it yet. The per-session route REFUSES a tree-keyed name
+    rather than folding the one unit it addresses, and this read ships gated, with the
+    first dashboard consumer that can bound the walk and check each unit it reaches.
     """
     return projection_of(fold_tree_checkpoint(require_name(name), root))
 

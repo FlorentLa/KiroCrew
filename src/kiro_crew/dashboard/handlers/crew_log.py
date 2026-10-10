@@ -163,15 +163,6 @@ def _tree_keyed_refusal(name: str) -> web.Response:
     )
 
 
-def _unkeyed_refusal(name: str) -> web.Response:
-    """The answer for a registered fold that is in no key-kind set."""
-    return _bad_request(
-        f"projection {name!r} is registered but belongs to no key kind, so this route "
-        "cannot tell which units it is folded over",
-        "unknown_projection",
-    )
-
-
 def _seq_param(request: web.Request, name: str) -> int | None:
     """A positive-int query parameter, ``None`` when absent, or raise ValueError."""
     raw = request.query.get(name)
@@ -381,15 +372,13 @@ async def api_session_crew_log_projection(request: web.Request) -> web.Response:
             # per-unit read above, so a caller holding a slot key reaches its own
             # record either way.
             result = await asyncio.to_thread(_read_slot_fold, unit_id, name)
-        elif name in projections.SESSION_FOLD_NAMES:
-            result = await asyncio.to_thread(projections.read_projection, unit_id, name)
         else:
-            # A registered name in NO key-kind set. It cannot reach here while every
-            # fold is in exactly one set -- an import-time guard requires that -- so
-            # this is the branch that keeps a fold added to the registry and to no set
-            # from falling through to the one-session read and answering as though it
-            # were session-keyed.
-            return _unkeyed_refusal(name)
+            # SESSION-keyed, which is what is LEFT: a registered name that is not the
+            # owner-served slot fold, not tree-keyed and not slot-keyed. Every
+            # registered fold is in exactly one key-kind set -- an import-time guard in
+            # the projection module requires that -- so the three branches above
+            # account for the other two kinds and nothing unkeyed reaches here.
+            result = await asyncio.to_thread(projections.read_projection, unit_id, name)
     except CrewLogError as exc:
         return _crew_log_refusal(exc)
     # ``session_id`` is what the CALLER asked about, not the unit the fold read:
