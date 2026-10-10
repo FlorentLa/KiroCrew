@@ -120,6 +120,8 @@ class LivePage:
         reread: Callable[[str], Any],
         locale: str = "",
         display_seam: Callable[..., Any] | None = None,
+        patch_seam: Callable[..., Any] | None = None,
+        package: Mapping[str, Any] | None = None,
     ) -> None:
         if not callable(redact):
             # Refused rather than defaulted. A default would be a second redactor, and
@@ -128,6 +130,12 @@ class LivePage:
         self.slug = slug
         self.member = member
         self.model = model
+        #: The canonical package the Model was projected from. Kept beside it rather
+        #: than re-read, and REPLACED TOGETHER WITH IT on every re-read, because
+        #: ``block_patch`` narrows per block off ``package["view"]`` while the Model
+        #: answers which fields exist -- two halves of one layout that must not come
+        #: from two different versions of it.
+        self.package: Mapping[str, Any] = package or {}
         #: The reader's UI language as the first load resolved it. Carried because a
         #: push has no request to ask, and the document picks its own words by it.
         self.locale = locale
@@ -136,6 +144,7 @@ class LivePage:
         self._redact = redact
         self._reread = reread
         self._display_seam = display_seam
+        self._patch_seam = patch_seam
         self._lock = threading.Lock()
         self._cells: dict[str, _Cell] = {}
         self._disposers: list[Callable[[], None]] = []
@@ -374,7 +383,8 @@ class LivePage:
         """
         if self._closed:
             return False
-        fresh = await asyncio.to_thread(self._reread, self.slug)
+        reread = await asyncio.to_thread(self._reread, self.slug)
+        fresh_package, fresh = reread if reread is not None else ({}, None)
         if fresh is None or str(getattr(fresh, "bound_to", "")) != self.binding:
             # The package is gone, or bound somewhere else now. A rebind writes no
             # version (the package line's ruling), so it is invisible to the layout
@@ -385,10 +395,13 @@ class LivePage:
         if int(getattr(fresh, "version", 0) or 0) != self.layout or str(
             getattr(fresh, "layout_fingerprint", "")
         ) != str(self.model.layout_fingerprint):
-            self.model = fresh
+            # BOTH, together. The package is what `block_patch` narrows against and the
+            # Model is what says which fields exist; replacing one and keeping the other
+            # would patch a new layout's blocks with an old layout's field set.
+            self.model, self.package = fresh, fresh_package
             return self._refetch(REASON_LAYOUT)
-        blocks, missing = self.blocks(folds=frozenset({fold}))
-        if not blocks:
+        patch = self.patch(fold)
+        if patch is None or not patch.get("blocks"):
             # NOTHING SUBSCRIBES, so nothing is sent and the counter does not move. A
             # frame here would spend a version on a page that has nothing to apply.
             return False
@@ -400,19 +413,87 @@ class LivePage:
                 "version": self._version,
                 "layout": self.layout,
                 "fold": fold,
-                # WHICH BLOCKS MOVED, and which of their fields. Names only: the values
-                # and their formatted strings live once, in `read`.
-                "blocks": blocks,
-                "missing": missing,
-                # WHAT THE DOCUMENT IS GIVEN. The page's own listener takes `read` and
-                # nothing else, so this is the half that actually refills it; `blocks`
-                # says which parts of it changed.
-                "read": self.read(),
+                # WHICH BLOCKS MOVED, and which of their fields. Derived FROM the patch
+                # rather than computed beside it, so the frame cannot name one set of
+                # blocks while the payload carries another.
+                "blocks": {
+                    block_id: sorted(entry.get("fields", {}))
+                    for block_id, entry in patch["blocks"].items()
+                },
+                "missing": list(patch.get("missing", ())),
+                # WHAT D3 FORWARDS INTO THE IFRAME, VERBATIM. Built by the renderer's
+                # own `block_patch`, which is also the half the document has a listener
+                # for -- so the narrowing, the formatting and the message type all live
+                # in Python and no payload is constructed in TS.
+                "patch": patch,
                 "refetch": False,
                 "reason": "",
             }
         )
         return True
+
+    def patch(self, fold: str) -> dict[str, Any] | None:
+        """The renderer's block-patch payload for the blocks *fold* moved, or ``None``.
+
+        ``None`` means this build cannot patch -- no renderer, so no document to patch
+        either, and the first load already served without one. Reported rather than
+        worked around: the only workaround is to re-send the whole read, and the page's
+        own full-paint listener re-initialises every block, which appends a second
+        canvas to a 3D block and leaves two scenes animating over each other. That is
+        the bug ``block_patch`` and its idempotent painters exist to avoid, and shipping
+        a path that reintroduces it would be worse than not pushing at all.
+
+        REDACTED VALUES GO IN, so the formatted strings ``block_patch`` builds with
+        ``display_values`` come out of already-masked input. The redaction is still the
+        controller's and still one call over the whole mapping.
+
+        The NARROWING is the renderer's too: ``block_patch`` keeps only the fields each
+        block actually renders, so a patch cannot put a value on a block the view never
+        placed it on. Passing the moved field names and letting it resolve the blocks
+        itself keeps that rule in one place rather than re-deriving it here.
+        """
+        build = self._patch_seam
+        if build is None:
+            return None
+        package = self.package
+        if not package:
+            return None
+        moved, missing, seq, stale = self._moved(fold)
+        if not moved:
+            return None
+        try:
+            return build(
+                package,
+                self._redact(moved),
+                seq=seq,
+                stale=stale,
+                missing=missing,
+            )
+        except Exception:
+            logger.warning("dashboard push: %r's block patch could not be built", self.slug)
+            return None
+
+    def _moved(self, fold: str) -> tuple[dict[str, Any], list[str], int, bool]:
+        """``(values, missing, seq, stale)`` for the fields *fold* feeds.
+
+        Only this fold's fields, because only they moved. ``missing`` and ``stale``
+        describe the WHOLE page rather than this fold, because the page's band is about
+        the page: a cell left unresolved by another fold is still older than the record.
+        """
+        cells = self._snapshot()
+        moved: dict[str, Any] = {}
+        seq = 0
+        for name, spec in self.model.fields.items():
+            source = spec.get("source") if isinstance(spec, Mapping) else None
+            if not isinstance(source, Mapping) or str(source.get("fold") or "") != fold:
+                continue
+            resolved = self._value_of(name, cells)
+            if resolved is MISSING:
+                continue
+            moved[name] = resolved
+            seq = max(seq, self._seq_of(name, cells))
+        whole = self.read()
+        return moved, list(whole.get("missing", ())), seq, bool(whole.get("stale"))
 
     def _refetch(self, reason: str) -> bool:
         """Ask the page to read the whole thing again. Carries no values, by design."""
@@ -426,7 +507,7 @@ class LivePage:
                 "fold": "",
                 "blocks": {},
                 "missing": [],
-                "read": {},
+                "patch": {},
                 "refetch": True,
                 "reason": reason,
             }
@@ -673,6 +754,8 @@ def open_page(
     reread: Callable[[str], Any],
     locale: str = "",
     display_seam: Callable[..., Any] | None = None,
+    patch_seam: Callable[..., Any] | None = None,
+    package: Mapping[str, Any] | None = None,
 ) -> LivePage:
     """Arm -- or refresh -- the live push for one crewmate's package page.
 
@@ -697,6 +780,11 @@ def open_page(
         )
         if reusable and existing is not None:
             existing.bind(state, loop)
+            if package:
+                # Same layout by fingerprint, so this is the same package -- but the
+                # read that produced it is the newer one, and a page armed before the
+                # controller had a package at all would otherwise keep an empty one.
+                existing.package = package
             _PAGES.move_to_end(slug)
             return existing
         page = LivePage(
@@ -709,6 +797,8 @@ def open_page(
             reread=reread,
             locale=locale,
             display_seam=display_seam,
+            patch_seam=patch_seam,
+            package=package,
         )
         if existing is not None:
             existing.close()

@@ -158,8 +158,15 @@ def _model(store: ArtifactStore, slug: str):
     return dp.model_of(dp.parse_package(loaded.content or ""), slug=slug, version=loaded.version)
 
 
-def _page(model, hub: _Hub, *, reread=None) -> push.LivePage:
-    """A live page with no loop: the send is awaited directly by the test."""
+def _page(model, hub: _Hub, *, reread=None, pkg=None) -> push.LivePage:
+    """A live page with no loop: the send is awaited directly by the test.
+
+    Wired with the REAL ``block_patch`` and ``display_values``. The branch is based on
+    the renderer line, so there is no reason to stub the two functions whose narrowing
+    and formatting the frame's whole payload comes out of -- a stub would pin this
+    controller against a payload shape nothing else in the repo builds.
+    """
+    canonical = pkg if pkg is not None else dp.validate_package(package())
     return push.LivePage(
         SLUG,
         MEMBER,
@@ -167,7 +174,10 @@ def _page(model, hub: _Hub, *, reread=None) -> push.LivePage:
         state=hub,
         loop=None,
         redact=routes._page_safe,
-        reread=reread if reread is not None else (lambda _slug: model),
+        reread=reread if reread is not None else (lambda _slug: (canonical, model)),
+        package=canonical,
+        display_seam=routes._package_render(routes._RENDER_DISPLAY),
+        patch_seam=routes._package_render(routes._RENDER_PATCH),
     )
 
 
@@ -295,7 +305,7 @@ async def test_the_other_fold_pushes_the_other_block(store, saved):
     _type, data = hub.frames[-1]
     assert set(data["blocks"]) == {"runs"}
     assert data["blocks"]["runs"] == ["last_run"]
-    assert data["read"]["fields"]["last_run"] == PANEL["last_run"]
+    assert data["patch"]["blocks"]["runs"]["fields"]["last_run"] == PANEL["last_run"]
 
 
 async def test_a_fold_under_a_key_kind_this_page_cannot_reach_is_reported_not_dropped(
@@ -359,8 +369,9 @@ async def test_a_field_whose_path_does_not_resolve_is_named_not_valued(store, sa
     await page.send("work")
     _type, data = hub.frames[-1]
     assert data["blocks"]["prs"] == ["open_prs"]
-    assert data["read"]["fields"] == {"open_prs": 4}
-    assert data["missing"] == ["note"]
+    assert data["patch"]["blocks"]["prs"]["fields"] == {"open_prs": 4}
+    # The band is the PAGE's: `note` did not resolve here and `last_run` never moved.
+    assert data["missing"] == ["last_run", "note"]
 
 
 # --------------------------------------------------------------------------
@@ -383,33 +394,37 @@ async def test_the_push_uses_the_owner_channel_and_adds_no_second_one(store, sav
     assert push.BLOCK_FRAME in ws_event_scope._OWNER_ONLY_EVENTS
 
 
-async def test_the_frame_carries_the_read_the_document_will_be_given(store, saved):
-    """The page's own listener takes ``read`` and nothing else, so the frame carries it.
+async def test_the_frame_carries_the_renderers_own_block_patch(store, saved):
+    """``patch`` is built by the renderer's ``block_patch`` and forwarded verbatim.
 
-    ``dashboard_frame.read_payload`` builds it -- the same builder the v2 page and the
-    renderer's data island use, so a first paint and a refill cannot describe one read
-    differently.
+    Its ``type`` is the message the DOCUMENT has a listener for, so the narrowing, the
+    formatting and the wire type all come out of one Python function and the frontend
+    constructs no payload at all.
     """
-    from kiro_crew import dashboard_frame
+    from kiro_crew import dashboard_package_render as render
 
     hub = _Hub()
     page = _page(_model(store, saved.slug), hub)
     page.on_fold("work", _event("work", WORK))
     await page.send("work")
     _type, data = hub.frames[-1]
-    assert set(data["read"]) >= set(dashboard_frame.read_payload({}))
-    assert data["read"]["fields"]["open_prs"] == 4
-    assert data["read"]["agentic"] == []
-    assert data["read"]["stale"] is True, "panel never moved, so its field is unresolved"
-    assert "last_run" in data["read"]["missing"]
+    patch = data["patch"]
+    assert patch["type"] == render.BLOCK_PATCH_MESSAGE_TYPE
+    assert set(patch["blocks"]) == {"prs"}
+    assert patch["blocks"]["prs"]["fields"]["open_prs"] == 4
+    assert patch["blocks"]["prs"]["display"]["open_prs"] == "4"
+    assert patch["stale"] is True, "panel never moved, so its field is unresolved"
+    assert "last_run" in patch["missing"]
+    # The what-moved signal agrees with the payload, because it is derived FROM it.
+    assert data["blocks"] == {"prs": sorted(patch["blocks"]["prs"]["fields"])}
 
 
-async def test_the_read_is_complete_even_though_the_push_is_partial(store, saved):
-    """Forced by the document: its listener REPLACES what it holds.
+async def test_a_patch_cannot_put_a_value_on_a_block_the_view_never_placed_it_on(store, saved):
+    """The narrowing is the renderer's, and it is per BLOCK rather than per fold.
 
-    ``read = data.read`` in the page's message handler, so a read restricted to the
-    pushed blocks would blank every cell outside them. Which blocks moved is carried
-    separately in ``blocks``; narrowing the read needs the page to merge first.
+    Both blocks have values cached here, and the fold that moved feeds only ``prs``. So
+    the patch carries ``prs`` and the field ``runs`` renders is absent from the payload
+    entirely -- not merely absent from ``runs``, which is not in the patch at all.
     """
     hub = _Hub()
     page = _page(_model(store, saved.slug), hub)
@@ -417,10 +432,12 @@ async def test_the_read_is_complete_even_though_the_push_is_partial(store, saved
     page.on_fold("panel", _event("panel", PANEL))
     await page.send("work")
     _type, data = hub.frames[-1]
-    assert set(data["blocks"]) == {"prs"}, "the push stopped being partial"
-    # The field only the OTHER block reads is still in the read, with its value.
-    assert data["read"]["fields"]["last_run"] == PANEL["last_run"]
-    assert data["read"]["stale"] is False
+    assert set(data["patch"]["blocks"]) == {"prs"}, "the push stopped being partial"
+    assert set(data["patch"]["blocks"]["prs"]["fields"]) == {"open_prs", "note"}
+    assert PANEL["last_run"] not in json.dumps(data["patch"])
+    # And the page-wide band is still the page's: nothing is unresolved now.
+    assert data["patch"]["stale"] is False
+    assert data["patch"]["missing"] == []
 
 
 async def test_the_display_strings_are_formatted_from_the_REDACTED_values(store, saved):
@@ -434,11 +451,17 @@ async def test_the_display_strings_are_formatted_from_the_REDACTED_values(store,
     """
     hub = _Hub()
     model = _model(store, saved.slug)
+    canonical = dp.validate_package(package())
     seen: list[Mapping[str, Any]] = []
+    real_patch = routes._package_render(routes._RENDER_PATCH)
 
-    def _formatter(package, fields):
+    def _formatter(package_arg, fields):
         seen.append(dict(fields))
         return {name: f"[{value}]" for name, value in fields.items()}
+
+    def _recording_patch(package_arg, fields, **kwargs):
+        seen.append(dict(fields))
+        return real_patch(package_arg, fields, **kwargs)
 
     page = push.LivePage(
         SLUG,
@@ -447,24 +470,28 @@ async def test_the_display_strings_are_formatted_from_the_REDACTED_values(store,
         state=hub,
         loop=None,
         redact=routes._page_safe,
-        reread=lambda _slug: model,
+        reread=lambda _slug: (canonical, model),
+        package=canonical,
         display_seam=_formatter,
+        patch_seam=_recording_patch,
     )
     page.on_fold("work", _event("work", WORK))
     await page.send("work")
     _type, data = hub.frames[-1]
-    # WHAT THE FORMATTER WAS GIVEN.
-    assert seen, "the formatter was never called"
-    assert SECRET not in json.dumps(seen), "the formatter was handed the raw value"
+    # WHAT THE TWO SEAMS WERE GIVEN. `block_patch` formats internally, so the values
+    # handed to IT are the ones that decide whether a display string can leak.
+    assert seen, "neither seam was called"
+    assert SECRET not in json.dumps(seen, default=str), "a seam was handed the raw value"
     # AND THE WHOLE FRAME, which is where a display string formatted too early lands.
     assert SECRET not in json.dumps(data)
-    assert SECRET not in json.dumps(data["read"]["display"])
+    cell = data["patch"]["blocks"]["prs"]
+    assert SECRET not in json.dumps(cell["display"])
     # POSITIVE CONTROL: the values that must survive DID, raw and formatted, so none of
     # the above is passing on an empty payload or a frame that never went out.
-    assert data["read"]["fields"]["open_prs"] == 4
-    assert data["read"]["display"]["open_prs"] == "[4]"
-    assert "token" in data["read"]["display"]["note"]
-    assert "REDACTED" in data["read"]["display"]["note"]
+    assert cell["fields"]["open_prs"] == 4
+    assert cell["display"]["open_prs"] == "4"
+    assert "token" in cell["fields"]["note"]
+    assert "REDACTED" in cell["fields"]["note"]
 
 
 async def test_a_missing_field_gets_no_display_string_either(store, saved):
@@ -478,8 +505,8 @@ async def test_a_missing_field_gets_no_display_string_either(store, saved):
         state=hub,
         loop=None,
         redact=routes._page_safe,
-        reread=lambda _slug: model,
-        display_seam=lambda package, fields: {n: str(v) for n, v in fields.items()},
+        reread=lambda _slug: ({}, model),
+        display_seam=lambda package_arg, fields: {n: str(v) for n, v in fields.items()},
     )
     # `panel` never moved, so `last_run` does not resolve.
     page.on_fold("work", _event("work", WORK))
@@ -495,7 +522,15 @@ async def test_the_read_carries_the_renderers_own_formatting_when_it_is_there(st
     """Through the controller's seam, so a build without the renderer sends no display."""
     hub = _Hub()
     model = _model(store, saved.slug)
-    bare = _page(model, hub)
+    bare = push.LivePage(
+        SLUG,
+        MEMBER,
+        model,
+        state=hub,
+        loop=None,
+        redact=routes._page_safe,
+        reread=lambda _slug: ({}, model),
+    )
     bare.on_fold("work", _event("work", WORK))
     assert "display" not in bare.read()
 
@@ -506,15 +541,15 @@ async def test_the_read_carries_the_renderers_own_formatting_when_it_is_there(st
         state=hub,
         loop=None,
         redact=routes._page_safe,
-        reread=lambda _slug: model,
-        display_seam=lambda package, fields: {k: f"<{v}>" for k, v in fields.items()},
+        reread=lambda _slug: ({}, model),
+        display_seam=lambda package_arg, fields: {k: f"<{v}>" for k, v in fields.items()},
     )
     page.on_fold("work", _event("work", WORK))
     assert page.read()["display"]["open_prs"] == "<4>"
 
 
-async def test_a_refetch_frame_carries_no_read_either(store, saved):
-    """No values means none of them -- not "none in blocks and all of them in read"."""
+async def test_a_refetch_frame_carries_no_patch_either(store, saved):
+    """No values means none of them -- not "none in blocks and all of them in a patch"."""
     hub = _Hub()
     page = _page(_model(store, saved.slug), hub, reread=lambda _slug: None)
     page.on_fold("work", _event("work", WORK))
@@ -522,7 +557,7 @@ async def test_a_refetch_frame_carries_no_read_either(store, saved):
     _type, data = hub.frames[-1]
     assert data["refetch"] is True
     assert data["blocks"] == {}
-    assert data["read"] == {}
+    assert data["patch"] == {}
 
 
 async def test_the_body_names_the_message_type_the_document_accepts(store, saved):
@@ -532,7 +567,12 @@ async def test_the_body_names_the_message_type_the_document_accepts(store, saved
     hub = _Hub()
     async with _client(hub) as client:
         body = await (await client.get(_q())).json()
+    from kiro_crew import dashboard_package_render as render
+
     assert body["page_message"] == dashboard_frame.DATA_MESSAGE_TYPE
+    # BOTH types, so the frontend holds neither constant. The patch one is the renderer's.
+    assert body["page_patch_message"] == render.BLOCK_PATCH_MESSAGE_TYPE
+    assert body["page_message"] != body["page_patch_message"]
     assert body["read"]["fields"] == body["read"]["fields"]  # present and serializable
     assert set(body["read"]) >= {"fields", "missing", "stale", "agentic"}
 
@@ -563,7 +603,7 @@ async def test_an_older_revision_is_dropped_rather_than_pushed(store, saved):
     await page.send("work")
     page.on_fold("work", _event("work", {"summary": {"open_prs": 999}}, revision=2))
     await page.send("work")
-    assert hub.frames[-1][1]["read"]["fields"]["open_prs"] == 4
+    assert hub.frames[-1][1]["patch"]["blocks"]["prs"]["fields"]["open_prs"] == 4
 
 
 # --------------------------------------------------------------------------
@@ -580,7 +620,9 @@ async def test_a_layout_change_sends_a_refetch_carrying_no_values(store, saved):
         content=json.dumps(package(blocks=[{"id": "prs", "type": "stat", "fields": ["open_prs"]}])),
     )
     assert recomposed.version != saved.version, "the fixture did not change the layout"
-    page = _page(model, hub, reread=lambda _slug: _model(store, saved.slug))
+    page = _page(
+        model, hub, reread=lambda _slug: (dp.validate_package(package()), _model(store, saved.slug))
+    )
     page.on_fold("work", _event("work", WORK))
     assert await page.send("work") is True
     _type, data = hub.frames[-1]
@@ -677,11 +719,11 @@ async def test_a_redacted_value_is_redacted_in_the_whole_pushed_payload(store, s
     # the `read` the document is actually given. The whole-payload assertion above is
     # what catches the second one; these name them so a reader can see it did.
     assert SECRET not in json.dumps(data["blocks"])
-    assert SECRET not in json.dumps(data["read"])
+    assert SECRET not in json.dumps(data["patch"])
     # POSITIVE CONTROL: the values that must survive DID, so this is not passing on an
     # empty payload or a frame that never went out.
-    assert data["blocks"]["prs"] == ["open_prs", "note"]
-    assert data["read"]["fields"]["open_prs"] == 4
+    assert data["blocks"]["prs"] == ["note", "open_prs"]
+    assert data["patch"]["blocks"]["prs"]["fields"]["open_prs"] == 4
 
 
 async def test_the_push_cannot_be_armed_without_the_controllers_redactor():

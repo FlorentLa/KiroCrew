@@ -322,7 +322,7 @@ async def _package_body(
     """
     package, model = packaged.package, packaged.model
     assert package is not None  # the caller checked both halves
-    page = arm_block_push(request, slug, member, model, locale=locale)
+    page = arm_block_push(request, slug, member, model, locale=locale, package=package)
     if page is None:
         # Nothing to push to (no hub). The page is still served in full: a body with no
         # live push is a page that refreshes on its own, not a refusal.
@@ -338,6 +338,8 @@ async def _package_body(
             reread=_reread_model,
             locale=locale,
             display_seam=_package_render(_RENDER_DISPLAY),
+            patch_seam=_package_render(_RENDER_PATCH),
+            package=package,
         )
     # SUBSCRIBED BEFORE THE VALUES ARE READ, and only when it is not already: a reused
     # page holds values the bus has kept current, and resubscribing would empty that
@@ -356,7 +358,11 @@ async def _package_body(
         },
         "push_version": page.version,
         "push_frame": _push_frame_type(),
+        # The TWO postMessage types the document listens for, read from the server so
+        # the frontend holds neither constant: the full-read one for a first paint or a
+        # refresh, and the block-patch one a push forwards verbatim.
         "page_message": _page_message_type(),
+        "page_patch_message": _page_patch_message_type(),
         "blocks": blocks,
         "missing": missing,
         "read": read,
@@ -395,6 +401,18 @@ def _page_message_type() -> str:
     from kiro_crew import dashboard_frame
 
     return dashboard_frame.DATA_MESSAGE_TYPE
+
+
+def _page_patch_message_type() -> str:
+    """The ``postMessage`` type a BLOCK PATCH arrives as, from the renderer.
+
+    Not read from the frame it travels in, because a patch frame only exists when the
+    renderer does: the type is that module's ``BLOCK_PATCH_MESSAGE_TYPE`` and a build
+    without the renderer answers an empty string, which is also a build whose dashboard
+    has no document to patch.
+    """
+    found = _package_render_value("BLOCK_PATCH_MESSAGE_TYPE")
+    return str(found) if isinstance(found, str) else ""
 
 
 def _push_frame_type() -> str:
@@ -594,6 +612,10 @@ _PACKAGE_RENDER_MODULE: Final[str] = "kiro_crew.dashboard_package_render"
 _RENDER_DOCUMENT: Final[str] = "render_dashboard"
 _RENDER_DISPLAY: Final[str] = "display_values"
 _RENDER_THEMES: Final[str] = "THEMES"
+#: The block-patch builder. It is also the half the DOCUMENT has a listener for, so the
+#: narrowing per block, the formatting and the message type all come from one function
+#: and D3 forwards its output into the iframe without constructing a payload.
+_RENDER_PATCH: Final[str] = "block_patch"
 
 #: Directives a minted package document MUST declare before this gateway serves it.
 #:
@@ -862,7 +884,13 @@ def _csp_problems(document: str) -> list[str]:
 
 
 def arm_block_push(
-    request: web.Request, slug: str, member: str, model: Any, *, locale: str = ""
+    request: web.Request,
+    slug: str,
+    member: str,
+    model: Any,
+    *,
+    locale: str = "",
+    package: Mapping[str, Any] | None = None,
 ) -> Any:
     """Arm -- or refresh -- the live push for this crewmate's package page.
 
@@ -899,22 +927,30 @@ def arm_block_push(
         reread=_reread_model,
         locale=locale,
         display_seam=_package_render(_RENDER_DISPLAY),
+        patch_seam=_package_render(_RENDER_PATCH),
+        package=package,
     )
     return page
 
 
-def _reread_model(slug: str) -> Any:
-    """The package Model bound to *slug* now, or ``None``. File IO; off the loop.
+def _reread_model(slug: str) -> tuple[Mapping[str, Any], Any] | None:
+    """``(package, model)`` bound to *slug* now, or ``None``. File IO; off the loop.
 
     Handed to the push so the ONE question it may ask about ownership is asked through
     the controller's own binding rule. It resolves BY the binding, so a package rebound
     to another crewmate answers ``None`` here rather than coming back attached to a page
     that is no longer its.
+
+    BOTH halves, because the push holds both: ``block_patch`` narrows per block off
+    ``package["view"]`` while the Model says which fields exist, and handing back only
+    the Model would let a page replace one and keep the other.
     """
     read = _read_package(slug)
-    if read.model is None:
+    if read.model is None or read.package is None:
         return None
-    return read.model if _owns_package(slug, read.model) else None
+    if not _owns_package(slug, read.model):
+        return None
+    return read.package, read.model
 
 
 def _trusted_page(slug: str, record: Any) -> str | None:
