@@ -42,6 +42,10 @@ interface Props {
    *  shared fallback set rather than to this machine's live values, because those
    *  would describe a model that is not answering. */
   levelsOverride?: string[]
+  /** Where a pick is written instead of this gateway's slot route. A crew
+   *  window passes the PEER's route (through the hub proxy): its slot key
+   *  names no session here. */
+  writeEffort?: (level: string) => Promise<{ reasoning_effort?: string; model?: string } | undefined>
 }
 
 /** Reasoning-effort picker: a stepped macOS-style slider over the model's
@@ -49,7 +53,7 @@ interface Props {
  *  the value snaps to the grid and persists to the slot. Reads the slot's
  *  live levels from /api/effort-levels (keyed by slot so a model switch is
  *  reflected on remount). */
-export default function ReasoningEffortDropdown({ slot, currentEffort, defaultEffort = '', embedded, levelsOverride }: Props) {
+export default function ReasoningEffortDropdown({ slot, currentEffort, defaultEffort = '', embedded, levelsOverride, writeEffort }: Props) {
   const { data: liveLevels = FALLBACK_LEVELS } = useQuery({
     queryKey: ['effort-levels', slot],
     queryFn: () => api.effortLevels(slot).then(data =>
@@ -105,7 +109,7 @@ export default function ReasoningEffortDropdown({ slot, currentEffort, defaultEf
     let normalizedModel: string | undefined
     return performSlotSwitch('reasoning_effort', slot, level,
       async () => {
-        const r = await api.chatSlotReasoningEffort(slot, level)
+        const r = await (writeEffort ? writeEffort(level) : api.chatSlotReasoningEffort(slot, level))
         normalizedModel = r?.model
         return r?.reasoning_effort ?? level
       },
@@ -114,7 +118,7 @@ export default function ReasoningEffortDropdown({ slot, currentEffort, defaultEf
         reasoning_effort: value,
         ...(normalizedModel ? { model: normalizedModel } : {}),
       })))
-  }, [slot, dispatch])
+  }, [slot, dispatch, writeEffort])
 
   const announcePersistFailure = useCallback((error: unknown, failedLevel: string) => {
     // A superseded request may still reject after a newer pick was staged or

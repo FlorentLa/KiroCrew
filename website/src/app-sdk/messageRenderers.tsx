@@ -402,6 +402,13 @@ export interface AssistantBubbleOptions {
    *  `messageTs`, which also versions this row's local image URLs, so a host
    *  passes it with the triple rather than on its own. */
   messageTs?: string
+  /** The bubble's own Regenerate action (its hover row), for the host that
+   *  can regenerate this reply. Absent: no Regenerate. */
+  onRegenerate?: () => void
+  /** The reply belongs to a session on ANOTHER machine (a crew window): its
+   *  file-change chips would open THIS machine's files, so none is drawn. The
+   *  text, footer and hover actions are unchanged. */
+  peerRow?: boolean
 }
 
 /**
@@ -484,8 +491,9 @@ export function renderAssistantBubble(
       variantIdx={m.variant_idx}
       turnStats={(m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined}
       decisionsStrip={decisionStripFieldOf(m)}
-      fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined}
-      fileChangesOmittedFiles={(m.meta as Record<string, unknown> | undefined)?.file_changes_omitted_files}
+      fileChanges={opts.peerRow ? undefined : (m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined}
+      fileChangesOmittedFiles={opts.peerRow ? undefined : (m.meta as Record<string, unknown> | undefined)?.file_changes_omitted_files}
+      onRegenerate={opts.onRegenerate}
       suppressSteerAck={opts.suppressSteerAck || turnHadPolicyBlock(ctx.messages, ctx.index)}
       bubbleClassName={bubbleClassName}
       onReplyInThread={isStreaming ? undefined : replyInThreadFor(m, ctx)}

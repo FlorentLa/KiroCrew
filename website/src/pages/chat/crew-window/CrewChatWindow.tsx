@@ -33,10 +33,12 @@ import { errMessage } from '../../../utils/thunkError'
 import type { ChatMessage } from '../../../types'
 import { closeCrewWindow, coverSiblings, markCrewWindowShown, readCrewDraft, subscribeCrewDraft, writeCrewDraft, type CrewWindowTarget } from './crewWindowStore'
 import { createCrewWindowRenderers, crewWindowSlot } from './crewWindowRenderers'
+import { useCrewWindowModelPicker, type PeerModelFields } from './crewWindowModelPicker'
 import { mergeRecoveredDraft } from '../../../utils/chatDrafts'
+import { useMessageQuote } from '../../../chat-core/composer/useMessageQuote'
 
 interface PeerApproval { origin?: string; request_id?: string; request_mid?: string }
-interface PeerSlot { key?: string; title?: string; running?: boolean; interrupted?: boolean; pending_approval_info?: PeerApproval | null }
+interface PeerSlot extends PeerModelFields { key?: string; title?: string; running?: boolean; interrupted?: boolean; agent?: string; pending_approval_info?: PeerApproval | null }
 interface PeerDetail { title?: string; running?: boolean; messages?: ChatMessage[] }
 
 /** How long a burst of peer frames waits before one transcript re-read. */
@@ -44,6 +46,17 @@ const REFETCH_THROTTLE_MS = 300
 /** How often an unmatched (or unreachable) crew's version is re-read. */
 const CAPS_RETRY_MS = 5000
 const NO_MESSAGES: ChatMessage[] = []
+
+/** A peer row without its decision record. The strip's verdict thumbs (on a
+ *  reply, a steered user row, a compaction notice) write THIS gateway's
+ *  decision records, so no peer row may draw one. */
+function withoutDecisionRecord(m: ChatMessage): ChatMessage {
+  if (m.decisions_strip === undefined && m.meta?.decisions_strip === undefined) return m
+  const { decisions_strip: _row, ...rest } = m
+  if (!m.meta) return rest
+  const { decisions_strip: _meta, ...meta } = m.meta
+  return { ...rest, meta }
+}
 
 export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { target: CrewWindowTarget; onClose?: () => void }) {
   const { instanceId, key } = target
@@ -128,9 +141,22 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
     setDraftState(value)
   }, [target])
   const [rewindTs, setRewindTs] = useState<string | null>(null)
+  // Quote, as in the local chat: a staged whole message rides the next send
+  // as its block plus `meta.quote`. Text only, so it works on the peer.
+  const messageQuote = useMessageQuote({ slot: crewWindowSlot(instanceId, key) })
   // A rewind's edit is held beside the draft, never in it, so the session's
   // own unsent text survives a close or a rejected rewind untouched.
   const [rewindText, setRewindText] = useState('')
+  // The held rewind edit as of now: the latest render's, or one staged since
+  // in the same tick. Read when a refusal lands or another edit arrives.
+  const heldRewind = useRef({ ts: rewindTs, text: rewindText })
+  heldRewind.current = { ts: rewindTs, text: rewindText }
+  /** Fold text into the session's ordinary draft (persisted), beside what is there. */
+  const recoverIntoDraft = useCallback((text: string) => {
+    const next = mergeRecoveredDraft(readCrewDraft(target), text)
+    writeCrewDraft(target, next)
+    setDraftState(next)
+  }, [target])
   // A failed send from an earlier mount of this session writes the store;
   // follow it so the reopened composer shows the recovered text.
   useEffect(() => subscribeCrewDraft(target, setDraftState), [target])
@@ -157,23 +183,26 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
     // switched while the send was in flight, so the text is never lost.
     onError: (_err, vars) => {
       if (!vars.message) return
-      if (vars.rewindTs) {
-        // Back into the rewind edit; the draft was never touched.
+      // Back into the rewind edit (ts and text together), unless a newer
+      // rewind edit is already held: then the refused text joins the ordinary
+      // draft, so neither edit is lost and no ts is paired with another
+      // row's text.
+      if (vars.rewindTs && !heldRewind.current.ts) {
+        heldRewind.current = { ts: vars.rewindTs, text: vars.message }
+        setRewindTs(vars.rewindTs)
         setRewindText(vars.message)
-        setRewindTs(cur => cur ?? vars.rewindTs ?? null)
         return
       }
-      const next = mergeRecoveredDraft(readCrewDraft(target), vars.message)
-      writeCrewDraft(target, next)
-      setDraftState(next)
+      recoverIntoDraft(vars.message)
     },
   })
   const send = () => {
-    const message = (rewindTs ? rewindText : draft).trim()
-    if (!message || action.isPending || !connected) return
+    const typed = (rewindTs ? rewindText : draft).trim()
+    if ((!typed && (rewindTs || !messageQuote.pendingQuote)) || action.isPending || !connected) return
+    const { quote, text: message } = rewindTs ? { quote: null, text: typed } : messageQuote.consume(typed)
     const req = rewindTs
       ? { path: slotPath + '/rewind', body: { ts: rewindTs, content: message } }
-      : { path: 'api/chat?ws=1', body: { message, slot: key } }
+      : { path: 'api/chat?ws=1', body: { message, slot: key, ...(quote ? { meta: { quote } } : {}) } }
     // Cleared at dispatch so text typed while the send is in flight is never
     // wiped by its success; a failure restores it only into an empty box.
     if (rewindTs) setRewindText('')
@@ -192,7 +221,7 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
   // row's own `meta.mid` rides in the id it hands back, and only the row the
   // peer reports pending (same id AND same mid) is answered, with that mid. A
   // stale card for a reused id makes no peer call.
-  const messages = useMemo(() => (detailQ.data?.messages ?? NO_MESSAGES).map(m => {
+  const messages = useMemo(() => (detailQ.data?.messages ?? NO_MESSAGES).map(withoutDecisionRecord).map(m => {
     const aid = m.meta?.approval_id
     if (m.role !== 'permission' || typeof aid !== 'string') return m
     const mid = typeof m.meta?.mid === 'string' ? m.meta.mid : ''
@@ -213,18 +242,54 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
   const title = slotQ.data?.title || detailQ.data?.title || key
   const loadError = detailQ.error ?? slotQ.error ?? instancesQ.error ?? capsQ.error
   const versionMismatch = capsQ.data && !capsQ.data.version_match ? capsQ.data : null
-  const rewindPending = action.isPending
+  const actionPending = action.isPending
+  const mutate = action.mutate
+  // Regenerate sits on the newest reply's own hover row, as in the local chat.
+  // Read at submit time, not render time: a row's editor can outlive the
+  // render whose closure it holds (the list keeps finished rows).
+  const rewindGate = useRef({ connected, running, actionPending })
+  rewindGate.current = { connected, running, actionPending }
+  const regenerateRow = !running && !slotQ.data?.interrupted && connected && !actionPending && lastTurn?.role === 'assistant' ? lastTurn : null
   const renderers = useMemo(() => createCrewWindowRenderers({
     instanceId,
     key,
     name,
     // A rewind replaces the conversation from that row on, so none is offered
-    // mid-turn, and none on a row the hub redacted (its text is not the
-    // peer's, so resending it would rewrite the session with the redaction).
-    canRewind: m => !running && !!m.ts && !m.content?.includes('[REDACTED'),
-    onRewind: m => { setRewindTs(m.ts || null); setRewindText(m.content || '') },
-    rewindDisabled: rewindPending,
-  }), [instanceId, key, name, running, rewindPending])
+    // mid-turn or while another action is in flight, and none on a row the
+    // hub redacted (its text is not the peer's, so resending it would rewrite
+    // the session with the redaction).
+    canRewind: m => connected && !running && !actionPending && !!m.ts && !m.content?.includes('[REDACTED'),
+    // Edit & Resend posts the rewind at once; a refusal lands the edit in the
+    // composer's rewind mode (see `onError`), so Send retries it. An earlier
+    // refused rewind is cleared first, as `send()` does, so a second refusal
+    // never pairs that row's ts with this row's text. Gated like `send()`: an
+    // editor opened while idle can be submitted after a turn started.
+    onRewind: (ts, content) => {
+      const message = content.trim()
+      if (!message) return
+      // The bubble's editor has already closed: hold the edit in the
+      // composer's rewind mode, so Send sends it once the peer is idle.
+      const gate = rewindGate.current
+      // A held edit this one replaces is kept in the ordinary draft.
+      const held = heldRewind.current
+      if (held.ts && held.text.trim()) recoverIntoDraft(held.text)
+      if (!gate.connected || gate.running || gate.actionPending) {
+        heldRewind.current = { ts, text: message }
+        setRewindTs(ts)
+        setRewindText(message)
+        return
+      }
+      heldRewind.current = { ts: null, text: '' }
+      setRewindTs(null)
+      setRewindText('')
+      mutate({ path: slotPath + '/rewind', body: { ts, content: message }, message, rewindTs: ts })
+    },
+    regenerateRow,
+    onRegenerate: () => mutate({ path: slotPath + '/regenerate' }),
+  }), [instanceId, key, name, running, actionPending, connected, slotPath, mutate, regenerateRow, recoverIntoDraft])
+  const picker = useCrewWindowModelPicker({
+    instanceId, slotKey: crewWindowSlot(instanceId, key), slotPath, slot: slotQ.data, caps: capsQ.data, enabled: versionOk, onWritten: settle,
+  })
   const rootRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     const root = rootRef.current
@@ -262,7 +327,7 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
         {/* Every code fence here is the peer's: copy only, never Edit or Run
             in THIS machine's terminal. */}
         <ReadOnlyCodeCtx.Provider value={true}>
-          <ChatMessageList messages={messages} running={running} renderers={renderers} onApprove={approve} />
+          <ChatMessageList messages={messages} running={running} renderers={renderers} onApprove={approve} onQuoteMessage={messageQuote.quoteMessage} />
         </ReadOnlyCodeCtx.Provider>
         <ChatFooter running={running && !approval?.request_id} stopping={false} state="" lastRole={messages[messages.length - 1]?.role ?? ''} />
         <div className="px-4 flex flex-col gap-3">
@@ -276,11 +341,6 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
               <Btn disabled={!connected || action.isPending} onClick={() => action.mutate({ path: slotPath + '/continue' })}>{i18nT('pages.chat.crewWindow.continue')}</Btn>
             </div>
           )}
-          {!running && !slotQ.data?.interrupted && lastTurn?.role === 'assistant' && (
-            <div>
-              <Btn disabled={!connected || action.isPending} onClick={() => action.mutate({ path: slotPath + '/regenerate' })}>{i18nT('pages.chat.crewWindow.regenerate')}</Btn>
-            </div>
-          )}
         </div>
       </div>
       {/* Glass pins its own root to position: relative, so a plain box places
@@ -290,6 +350,10 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
         <div className="px-4 flex flex-col gap-2">
           {/* No hand-off: the composer below may hold an unsent draft. */}
           {action.error && <ErrorNotice title={i18nT('pages.chat.crewWindow.action_failed', { name })} message={errMessage(action.error)} onDismiss={() => action.reset()} />}
+          {/* No hand-off: the composer below may hold an unsent draft. */}
+          {!!picker.error && <ErrorNotice title={i18nT('pages.chat.crewWindow.action_failed', { name })} message={errMessage(picker.error)} onDismiss={picker.clearError} />}
+          {/* No hand-off: same draft. The capability read retries in place. */}
+          {picker.effortCapsFailed && <ErrorNotice variant="inline" message={i18nT('pages.chatPage.effort_options_unavailable')} />}
           {!connected && <div className="text-muted">{i18nT('pages.chat.crewWindow.offline', { name })}</div>}
           {rewindTs && (
             <div className="flex items-center gap-2 text-muted">
@@ -319,11 +383,18 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
             typedCommandMenus={false}
             slotApprovalChrome={false}
             promptOptimizer={false}
+            // Model + effort write the PEER's slot. Attach, the agent picker
+            // and the approval-mode picker are not passed, so the composer
+            // does not draw them: each writes THIS gateway's state.
+            {...picker.chipProps}
+            pendingQuote={rewindTs ? null : messageQuote.pendingQuote}
+            onRemoveQuote={messageQuote.clearQuote}
           />
         </SlotProvider>
         </fieldset>
       </Glass>
       </div>
+      {picker.portal}
       </div>
     </div>
   )
