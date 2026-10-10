@@ -70,10 +70,13 @@ describe('AssistantMessage', () => {
     ['regenerate', 'Done.', { onRegenerate: vi.fn() }],
   ])('swaps Copy for More without growing a %s footer', (_case, content, extra) => {
     const base = render(<AssistantMessage content={content} isStreaming={false} slotRunning={false} {...extra} />)
-    const baseButtons = base.container.querySelectorAll('[data-role="assistant"] > .opacity-0 button').length
+    // The Copy control's format caret is part of Copy (a split button), so it
+    // leaves with Copy and is not counted as a separate peer.
+    const peers = '[data-role="assistant"] > .opacity-0 button:not([data-testid="copy-format-trigger"])'
+    const baseButtons = base.container.querySelectorAll(peers).length
     cleanup()
     const voiced = render(<AssistantMessage content={content} isStreaming={false} slotRunning={false} onSpeak={vi.fn()} {...extra} />)
-    const voicedButtons = voiced.container.querySelectorAll('[data-role="assistant"] > .opacity-0 button').length
+    const voicedButtons = voiced.container.querySelectorAll(peers).length
     expect(voicedButtons).toBe(baseButtons)
     expect(screen.queryByTitle('Copy')).not.toBeInTheDocument()
     expect(screen.getByTestId('assistant-more-actions')).toBeInTheDocument()

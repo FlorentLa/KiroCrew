@@ -1,10 +1,11 @@
 import { useState, useMemo, useEffect, memo, useRef, useId, type ReactNode } from 'react'
 import { motion } from 'framer-motion'
-import { Copy, Check, Volume2, Code, Eye, ClipboardList, CheckCircle, RefreshCw, ChevronLeft, ChevronRight, GitFork, Loader2, Link2, Compass, Clock, MessageSquare, Pin, PinOff, MoreHorizontal, Share2, X, Quote } from 'lucide-react'
+import { Copy, Check, Volume2, Code, Eye, ClipboardList, CheckCircle, RefreshCw, ChevronLeft, ChevronRight, GitFork, Loader2, Link2, Compass, Clock, MessageSquare, Pin, PinOff, MoreHorizontal, Share2, X, Quote, ChevronDown } from 'lucide-react'
 import { lazy, Suspense } from 'react'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from '../../components/ui/dropdown-menu'
 import MessageContextMenu, { type MessageMenuItem } from './MessageContextMenu'
-import { copyToClipboard } from '../../utils/clipboard'
+import { copyRichToClipboard, copyToClipboard } from '../../utils/clipboard'
+import { markdownToCleanHtml } from '../../components/markdown/richTextClipboard'
 import { stripKeepVisibleMarker } from '../../app-sdk/protocol/keepVisibleMarker'
 import { copySessionLink } from '../../utils/shareUrl'
 import { ICON_ACTION_ROW_CLS } from '../../utils/touchActions'
@@ -421,9 +422,16 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
   // With Quote offered, Copy link and Pin fold into More as well. Same order
   // inside the menu as UserMessage's: Quote, Copy link, Pin.
   const linkPinInMenu = quoteOffered
-  const copyMessage = () => {
+  // Markdown is the default (the row button's click, "Copy text"); rich text
+  // writes clean semantic HTML for editors such as Outlook, with the same
+  // Markdown as its plain-text flavour.
+  const copyMessage = (format: 'markdown' | 'rich' = 'markdown') => {
     const stripped = stripKeepVisibleMarker(steerCleaned)
-    copyToClipboard(stripped === steerCleaned ? stripped : stripped.trimEnd()).then((ok) => {
+    const markdown = stripped === steerCleaned ? stripped : stripped.trimEnd()
+    const write = format === 'rich'
+      ? copyRichToClipboard(markdownToCleanHtml(markdown), markdown)
+      : copyToClipboard(markdown)
+    write.then((ok) => {
       if (ok) {
         setCopyFailed(false)
         flashCopy(setCopied)(true)
@@ -475,6 +483,18 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
               <span className="flex items-center gap-2">
                 {copyOutcomeIcon(copied, <Copy className="lucide-inline shrink-0" />)}
                 <span>{copyOutcomeLabel(copied, i18nT('pages.chat.assistantMessage.copy_text'))}</span>
+              </span>
+            </DropdownMenuItem>
+          )}
+          {copyInMenu && (
+            <DropdownMenuItem
+              data-testid="copy-rich-menu-item"
+              className="[@media(hover:none)]:min-h-10"
+              onSelect={() => copyMessage('rich')}
+            >
+              <span className="flex items-center gap-2">
+                <Copy className="lucide-inline shrink-0" />
+                <span>{i18nT('pages.chat.assistantMessage.copy_as_rich_text')}</span>
               </span>
             </DropdownMenuItem>
           )}
@@ -556,7 +576,8 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
     { id: 'quote', label: i18nT('pages.chat.assistantMessage.quote_message'), icon: <Quote size={14} />, onSelect: quoteShown },
     // Same words as the More menu's item ("Copy text"), so one message never
     // offers the same action under two names (UX review).
-    { id: 'copy', label: i18nT('pages.chat.assistantMessage.copy_text'), icon: <Copy size={14} />, onSelect: copyMessage, separatorBefore: true },
+    { id: 'copy', label: i18nT('pages.chat.assistantMessage.copy_text'), icon: <Copy size={14} />, onSelect: () => copyMessage(), separatorBefore: true },
+    { id: 'copy-rich', label: i18nT('pages.chat.assistantMessage.copy_as_rich_text'), icon: <Copy size={14} />, onSelect: () => copyMessage('rich') },
     // A refused write from a menu that has closed leaves no icon to flip, so it
     // also raises the row's ErrorNotice (the same surface Copy uses).
     ...(messageTs && slotKey ? [{ id: 'copy-link', label: i18nT('pages.chat.assistantMessage.copy_link_to_message'), icon: <Link2 size={14} />, onSelect: () => { copySessionLink(slotKey, slotTitle, messageTs, mode).then(ok => { flashCopy(setLinkCopied)(ok); if (!ok) setCopyFailed(true) }, () => { flashCopy(setLinkCopied)(false); setCopyFailed(true) }) } }] : []),
@@ -691,7 +712,26 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
             window, where both draw, Fork follows Copy so Copy stays second. */}
         {quoteOffered && (regenButton ?? forkButton)}
         {quoteRow && <button className="text-muted hover:text-text p-0.5 rounded transition-colors" data-testid="quote-message" title={i18nT('pages.chat.assistantMessage.quote_message')} aria-label={i18nT('pages.chat.assistantMessage.quote_message')} onClick={quoteShown}><Quote size={14} /></button>}
-        {!copyInMenu && <button className="text-muted hover:text-text p-0.5 rounded transition-colors" title={i18nT('pages.chat.assistantMessage.copy')} aria-label={copyOutcomeLabel(copied, i18nT('pages.chat.assistantMessage.copy'))} onClick={copyMessage}>{copyOutcomeIcon(copied, <Copy size={14} />)}</button>}
+        {/* One Copy control: a click copies Markdown, as it always has; the
+            attached caret opens the format menu (the split-button pattern), so
+            the everyday copy stays one click away. Radix returns focus to the
+            caret when the menu closes. */}
+        {!copyInMenu && <>
+          <button className="text-muted hover:text-text p-0.5 rounded transition-colors" title={i18nT('pages.chat.assistantMessage.copy')} aria-label={copyOutcomeLabel(copied, i18nT('pages.chat.assistantMessage.copy'))} onClick={() => copyMessage()}>{copyOutcomeIcon(copied, <Copy size={14} />)}</button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button className="text-muted hover:text-text py-0.5 -ml-0.5 rounded transition-colors" data-testid="copy-format-trigger" title={i18nT('pages.chat.assistantMessage.copy_options')} aria-label={i18nT('pages.chat.assistantMessage.copy_options')}><ChevronDown size={12} aria-hidden="true" /></button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" className="min-w-[180px]" aria-label={i18nT('pages.chat.assistantMessage.copy_options')}>
+              <DropdownMenuItem className="[@media(hover:none)]:min-h-10" data-testid="copy-as-rich-text" onSelect={() => copyMessage('rich')}>
+                <span>{i18nT('pages.chat.assistantMessage.copy_as_rich_text')}</span>
+              </DropdownMenuItem>
+              <DropdownMenuItem className="[@media(hover:none)]:min-h-10" data-testid="copy-as-markdown" onSelect={() => copyMessage()}>
+                <span>{i18nT('pages.chat.assistantMessage.copy_as_markdown')}</span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </>}
         {quoteOffered && regenButton && forkButton}
         {!linkPinInMenu && messageTs && slotKey && <button className="text-muted hover:text-text p-0.5 rounded transition-colors" title={i18nT('pages.chat.assistantMessage.copy_link_to_message')} aria-label={copyOutcomeLabel(linkCopied, i18nT('pages.chat.assistantMessage.copy_link_to_message'))} onClick={() => { copySessionLink(slotKey, slotTitle, messageTs, mode).then(ok => { flashCopy(setLinkCopied)(ok); if (!ok) setCopyFailed(true) }, () => { flashCopy(setLinkCopied)(false); setCopyFailed(true) }) }}>{copyOutcomeIcon(linkCopied, <Link2 size={14} />)}</button>}
         {!linkPinInMenu && messageTs && onTogglePin && <button className="text-muted hover:text-text p-0.5 rounded transition-colors" title={pinned ? i18nT('pages.chat.assistantMessage.unpin_message') : i18nT('pages.chat.assistantMessage.pin_message')} aria-label={pinned ? i18nT('pages.chat.assistantMessage.unpin_message') : i18nT('pages.chat.assistantMessage.pin_message')} aria-pressed={!!pinned} onClick={onTogglePin}>{pinned ? <PinOff size={14} /> : <Pin size={14} />}</button>}

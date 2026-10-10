@@ -23,7 +23,10 @@ const LONG = 'A completed reply that is comfortably longer than twenty character
 const openMore = () => fireEvent.pointerDown(screen.getByTestId('assistant-more-actions'), { button: 0, ctrlKey: false, pointerType: 'mouse' })
 
 describe('AssistantMessage row with Quote offered', () => {
-  const rowLabels = () => Array.from(screen.getByTestId('assistant-more-actions').parentElement!.querySelectorAll(':scope > button')).map(b => b.getAttribute('aria-label'))
+  // The Copy control's format caret is that control's own second half (a split
+  // button), not a peer action, so the seat order below is read without it.
+  const rowButtons = () => Array.from(screen.getByTestId('assistant-more-actions').parentElement!.querySelectorAll(':scope > button:not([data-testid="copy-format-trigger"])'))
+  const rowLabels = () => rowButtons().map(b => b.getAttribute('aria-label'))
 
   it('seats Quote, keeps Copy right after it, and folds Link, Pin and Raw into More', () => {
     const onQuote = vi.fn()
@@ -33,6 +36,7 @@ describe('AssistantMessage row with Quote offered', () => {
     expect(screen.getAllByRole('button').length).toBeLessThanOrEqual(before)
     // The everyday row is exactly Quote + Copy + More.
     expect(rowLabels()).toEqual(['Quote message', 'Copy', 'More actions'])
+    expect(screen.getByLabelText('Copy').nextElementSibling).toBe(screen.getByTestId('copy-format-trigger'))
     expect(screen.queryByTestId('toggle-raw-view')).not.toBeInTheDocument()
     openMore()
     expect(screen.getAllByRole('menuitem').map(i => i.textContent)).toEqual(['Quote message', 'Copy link to message', 'Pin message', 'Show raw markdown'])
@@ -60,14 +64,14 @@ describe('AssistantMessage row with Quote offered', () => {
 
   it('in a loaded window Fork takes the seat and Copy follows it', () => {
     render(<AssistantMessage content="Reply text long enough for the raw toggle." isStreaming={false} slotRunning={false} onSpeak={() => {}} onFork={() => {}} forkIndex={1} onQuoteMessage={() => {}} />)
-    const row = Array.from(screen.getByTestId('assistant-more-actions').parentElement!.querySelectorAll(':scope > button'))
+    const row = rowButtons()
     expect(row[0]).toBe(screen.getByTestId('fork-from-here'))
     expect(rowLabels().slice(1)).toEqual(['Copy', 'More actions'])
   })
 
   it('on the newest reply of a loaded window Regenerate holds the seat, Copy is second, Fork follows', () => {
     render(<AssistantMessage content="Reply text long enough for the raw toggle." isStreaming={false} slotRunning={false} onRegenerate={() => {}} onFork={() => {}} forkIndex={1} onQuoteMessage={() => {}} />)
-    const row = Array.from(screen.getByTestId('assistant-more-actions').parentElement!.querySelectorAll(':scope > button'))
+    const row = rowButtons()
     expect(rowLabels().slice(0, 2)).toEqual(['Regenerate response', 'Copy'])
     expect(row[2]).toBe(screen.getByTestId('fork-from-here'))
     expect(rowLabels()[3]).toBe('More actions')
@@ -150,11 +154,11 @@ describe('AssistantMessage context menu', () => {
     expect(screen.queryByTestId('message-context-menu')).not.toBeInTheDocument()
   })
 
-  it('opens on right-click: Quote first, then Copy, Copy link, Pin', () => {
+  it('opens on right-click: Quote first, then Copy, Copy as rich text, Copy link, Pin', () => {
     const onQuote = vi.fn()
     render(<AssistantMessage content={LONG} isStreaming={false} slotRunning={false} messageTs="t1" slotKey="chat-1" onTogglePin={() => {}} onQuoteMessage={onQuote} />)
     fireEvent.contextMenu(screen.getByTestId('message-bubble'))
-    expect(screen.getAllByRole('menuitem').map(i => i.textContent)).toEqual(['Quote message', 'Copy text', 'Copy link to message', 'Pin message', 'Show raw markdown'])
+    expect(screen.getAllByRole('menuitem').map(i => i.textContent)).toEqual(['Quote message', 'Copy text', 'Copy as rich text', 'Copy link to message', 'Pin message', 'Show raw markdown'])
     fireEvent.click(screen.getByTestId('message-context-copy'))
     expect(copyToClipboard).toHaveBeenCalledWith(LONG)
   })
