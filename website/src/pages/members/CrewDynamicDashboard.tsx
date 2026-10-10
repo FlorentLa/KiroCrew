@@ -94,6 +94,12 @@ const READY_TIMEOUT_MS = 6000
  */
 export const DASHBOARD_FALLBACK_REFETCH_MS = 60_000
 
+function isNoPreview(error: unknown): boolean {
+  const e = error as { status?: unknown; body?: unknown } | null
+  if (e?.status !== 404 || typeof e.body !== 'string') return false
+  try { return (JSON.parse(e.body) as { code?: unknown }).code === 'no_preview' } catch { return false }
+}
+
 interface Loaded {
   html: string
   manifest: DashboardManifest
@@ -122,12 +128,16 @@ interface Loaded {
  *    can see that, so the held `Loaded` is re-mounted and the new html is dropped
  *    until the next read brings a different one.
  */
-export default function CrewDynamicDashboard({ slug, member, displayName, onAct }: {
+export default function CrewDynamicDashboard({ slug, member, displayName, onAct, preview = false }: {
   slug: string
   member: string
   displayName: string
   /** Put a reply the page offered into the chat box. Absent: the page's options do nothing. */
   onAct?: (text: string) => void
+  /** Render the STAGED page instead of the adopted one. Its own cache entry, so the
+   *  live tab never shows a page nobody applied; still under the `member-dashboard`
+   *  prefix, so the frame that says the page changed refetches it too. */
+  preview?: boolean
 }) {
   const frameRef = useRef<HTMLIFrameElement | null>(null)
   const onActRef = useRef(onAct)
@@ -154,9 +164,9 @@ export default function CrewDynamicDashboard({ slug, member, displayName, onAct 
   // UI language re-reads the page in the new one.
   const { resolved: locale } = useLanguage()
 
-  const { data, isLoading, isError, refetch } = useQuery({
-    queryKey: ['member-dashboard', slug, member, locale],
-    queryFn: () => api.memberDashboard(slug, member, locale),
+  const { data, isLoading, isError, error, refetch } = useQuery({
+    queryKey: ['member-dashboard', slug, member, locale, preview ? 'preview' : 'live'],
+    queryFn: () => (preview ? api.memberDashboard(slug, member, locale, true) : api.memberDashboard(slug, member, locale)),
     enabled: Boolean(slug) && Boolean(member),
     // THE FALLBACK, not the mechanism. Liveness comes from the two WS frames
     // `handleDashboardMoved` listens for; this is what covers the gap when one is
@@ -348,6 +358,16 @@ export default function CrewDynamicDashboard({ slug, member, displayName, onAct 
       <div className="p-4 space-y-1.5" data-testid="crew-dashboard-loading" aria-hidden>
         <div className="h-3 rounded bg-bg-hover animate-pulse" />
         <div className="h-3 w-2/3 rounded bg-bg-hover animate-pulse" />
+      </div>
+    )
+  }
+
+  // 404 `no_preview`: the staged page was applied or expired. Nothing is broken
+  // and a retry reads the same answer, so no error styling and no Retry.
+  if (isError && preview && isNoPreview(error)) {
+    return (
+      <div className="p-4 text-sm text-muted" data-testid="crew-dashboard-preview-gone">
+        {i18nT('pages.chat.dashboardPreviewPanel.gone')}
       </div>
     )
   }

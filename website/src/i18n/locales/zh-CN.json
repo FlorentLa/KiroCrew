@@ -11428,6 +11428,15 @@
       "messageContextMenu": {
         "copy_link_text": "复制链接文本",
         "copy_link_address": "复制链接地址"
+      },
+      "dashboardPreviewPanel": {
+        "tab_title": "仪表板预览",
+        "badge": "预览，尚未应用",
+        "hint": "目前没有任何更改。若想保留，请在聊天中告诉智能体。",
+        "open_in_browser": "在浏览器中打开",
+        "no_member": "找不到此预览所属的队友。",
+        "roster_failed": "无法加载队友列表，因此无法显示预览。",
+        "gone": "此预览已不再暂存。它已被应用或已过期。"
       }
     },
     "chatPage": {

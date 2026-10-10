@@ -14,6 +14,7 @@ import ActivityViewer from './ActivityViewer'
 // Loaded with its tab, not the shell: the panel (attention cards, tile lists,
 // the session card frame) is only mounted once a Dashboard tab exists.
 const CommandCenterPanel = lazy(() => import('./command-center/CommandCenterPanel'))
+const DashboardPreviewPanel = lazy(() => import('./DashboardPreviewPanel'))
 import DiffPanel from '../../components/DiffPanel'
 import DetailPanel from '../../components/DetailPanel'
 import MarkdownPanel, { type MarkdownPanelHandle } from '../../components/MarkdownPanel'
@@ -51,6 +52,7 @@ import { useAppSelector } from '../../store'
 import { selectSlotSubagents, selectSlotToolLog } from '../../store/chatSlice'
 import { mcpAppKey } from '../../store/chatSlice'
 import McpAppFrame from '../../components/McpAppFrame'
+import { dashboardPreviewSlugFromRef } from '../../utils/dashboardPreview'
 import type { ExtractedLink } from '../../utils/extractChatLinks'
 import type { PullRequestLink } from '../../utils/pullRequestLinks'
 import type { ChatPin } from '../../api/pins'
@@ -1828,6 +1830,9 @@ function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDi
     )
   }
   if (tab.kind === 'artifact') {
+    // A crewmate's staged dashboard rides the artifact tab (see `dashboardPreviewRef`).
+    const previewSlug = dashboardPreviewSlugFromRef(tab.artifactSlug)
+    if (previewSlug) return <Suspense fallback={null}><DashboardPreviewPanel slug={previewSlug} /></Suspense>
     return (
       <ArtifactPanel
         embedded
