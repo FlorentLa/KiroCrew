@@ -171,6 +171,31 @@ class LivePage:
             folds.add(AGENTIC_FOLD)
         return frozenset(folds)
 
+    def bus_key(self, scope: str) -> str:
+        """The bus key this page subscribes with under *scope*, or ``""`` to skip it.
+
+        THE ONE PLACE A KEY KIND IS DECIDED, and the extension point for a third one.
+        ``dashboard_feed.scope_for`` answers which scope a fold is keyed by, off the
+        projection kernel's own sets; this answers what the key then IS, which only
+        this page knows.
+
+        Today exactly one kind is reachable. A package's binding is ``crewmate:<slug>``
+        or ``session:<slot key>``, so a page always has a SLOT key -- the crewmate's own
+        slug -- and never a session UNIT id, which is what ``SCOPE_SESSION`` is keyed by.
+        A session fold is therefore not something this page can subscribe to at all, and
+        saying so is better than guessing a key and never receiving an event.
+
+        A THIRD KEY KIND (D4's registered tree fold) lands here: give its scope a row
+        and the subscription path above takes it unchanged. Until it has one, a fold
+        under it is reported unavailable rather than silently never delivered -- which
+        is the difference this method exists to make.
+        """
+        from kiro_crew.crew_log import bus as crew_log_bus
+
+        if scope == crew_log_bus.SCOPE_SLOT:
+            return self.slug
+        return ""
+
     def subscribe(self) -> list[str]:
         """Subscribe to this page's folds; return the ones that could not be.
 
@@ -187,11 +212,11 @@ class LivePage:
         unavailable: list[str] = []
         for fold in sorted(self.folds()):
             scope = scope_for(fold)
-            if scope != crew_log_bus.SCOPE_SLOT:
-                # A package reads SLOT folds: its binding names a crewmate or a slot,
-                # never one session unit, so there is no session key to subscribe with.
-                # Reported rather than raised -- the fields it feeds read as missing,
-                # which is the honest rendering of a value this page cannot reach.
+            key = self.bus_key(scope)
+            if not scope or not key:
+                # A fold this page cannot reach. Reported rather than raised -- the
+                # fields it feeds read as missing, which is the honest rendering, and
+                # one unreachable fold must not deny the page the others.
                 unavailable.append(fold)
                 continue
             with self._lock:
@@ -202,7 +227,7 @@ class LivePage:
                         crew_log_bus.FOLD_ADVANCED,
                         self._callback(fold),
                         scope=scope,
-                        key=self.slug,
+                        key=key,
                         fold=fold,
                         baseline=True,
                     )
@@ -216,6 +241,22 @@ class LivePage:
                 )
                 unavailable.append(fold)
         return unavailable
+
+    def ensure_subscribed(self) -> list[str]:
+        """Subscribe only if this page is not subscribed already.
+
+        What the READ calls, because a reused page is the ordinary case: a tab that
+        polls would otherwise tear down its subscriptions and re-run a baseline file
+        read per fold per request, and -- worse -- serve its full load from a cache it
+        had just emptied. A page that is already subscribed holds values the bus has
+        been keeping current, which is the whole point of a live feed.
+
+        Retried when nothing is subscribed, which includes the case where every fold
+        was unavailable last time: the condition may have changed.
+        """
+        if self._disposers:
+            return []
+        return self.subscribe()
 
     def unsubscribe(self) -> None:
         """Drop every subscription and forget every cached value. Idempotent."""

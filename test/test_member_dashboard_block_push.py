@@ -265,6 +265,51 @@ async def test_the_other_fold_pushes_the_other_block(store, saved):
     assert data["blocks"]["runs"]["last_run"] == PANEL["last_run"]
 
 
+async def test_a_fold_under_a_key_kind_this_page_cannot_reach_is_reported_not_dropped(
+    store, saved, monkeypatch
+):
+    """The seam with D4's third key kind.
+
+    ``scope_for`` says which scope a fold is keyed by; ``bus_key`` says what the key IS,
+    and only a SLOT key exists for a package today. A scope with no row there must be
+    REPORTED unavailable rather than silently never delivered -- which is the whole
+    difference between a merge that adds one row and a push that quietly loses a fold.
+    """
+    model = _model(store, saved.slug)
+    page = _page(model, _Hub())
+    monkeypatch.setattr(push, "scope_for", lambda fold: "tree")
+    unavailable = page.subscribe()
+    assert sorted(unavailable) == ["panel", "work"]
+    assert page.bus_key("tree") == ""
+    # NAMED, and nothing was subscribed under a scope with no key: the alternative is a
+    # subscription that is registered and never delivers, which reads as a quiet page.
+    assert page._disposers == []
+
+
+async def test_a_slot_fold_is_keyed_by_the_crewmates_own_slug(store, saved):
+    """The positive control for the case above: one key kind IS reachable."""
+    from kiro_crew.crew_log import bus as crew_log_bus
+
+    page = _page(_model(store, saved.slug), _Hub())
+    assert page.bus_key(crew_log_bus.SCOPE_SLOT) == SLUG
+    assert page.bus_key(crew_log_bus.SCOPE_SESSION) == ""
+
+
+async def test_a_second_read_keeps_the_live_subscriptions_and_their_values(store, saved):
+    """A poll must not empty the cache it is about to serve the full load from."""
+    hub = _Hub()
+    async with _client(hub) as client:
+        await client.get(_q())
+        page = push.live_page(SLUG)
+        assert page is not None
+        # Above whatever revision the subscribe-time baseline recorded, so this value is
+        # the newer one rather than being dropped as an older arrival.
+        page.on_fold("work", _event("work", WORK, revision=10_000))
+        assert page.blocks()[0]["prs"]["open_prs"] == 4, "the fixture never cached a value"
+        body = await (await client.get(_q())).json()
+    assert body["blocks"]["prs"]["open_prs"] == 4, "the second read resubscribed and lost it"
+
+
 async def test_a_fold_no_block_subscribes_to_sends_nothing_and_spends_no_version(store, saved):
     hub = _Hub()
     page = _page(_model(store, saved.slug), hub)

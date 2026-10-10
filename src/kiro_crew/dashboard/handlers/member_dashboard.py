@@ -328,7 +328,10 @@ async def _package_body(
         page = push.LivePage(
             slug, member, model, state=None, loop=None, redact=_page_safe, reread=_reread_model
         )
-    await _run(page.subscribe)
+    # SUBSCRIBED BEFORE THE VALUES ARE READ, and only when it is not already: a reused
+    # page holds values the bus has kept current, and resubscribing would empty that
+    # cache and then serve the full load out of it.
+    await _run(page.ensure_subscribed)
     blocks, missing = page.blocks()
     body: dict[str, Any] = {
         "state": "live",
