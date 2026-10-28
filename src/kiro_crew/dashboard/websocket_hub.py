@@ -81,6 +81,27 @@ def fold_hello_payload(ws: Any = None) -> dict[str, Any]:
     return payload
 
 
+class _LazyFrame:
+    """One frame serialized on first use, then reused for every other socket.
+
+    The ``work`` ``slot_projection`` frame carries the whole board, which only a tab
+    that cannot apply deltas reads. Serializing it costs about as much as sending it,
+    so it is done only when such a tab is actually a target.
+    """
+
+    __slots__ = ("_msg_type", "_data", "_text")
+
+    def __init__(self, msg_type: str, data: Any) -> None:
+        self._msg_type = msg_type
+        self._data = data
+        self._text: "str | None" = None
+
+    def text(self) -> str:
+        if self._text is None:
+            self._text = json.dumps({"type": self._msg_type, "data": self._data})
+        return self._text
+
+
 def board_key(slot: str) -> str:
     """*slot* in the form a dashboard tab names its board by.
 
@@ -703,12 +724,14 @@ class WebSocketHub:
         """Send a typed message only to owner-authorized clients."""
         if not getattr(self._owner, "_owner_ws_clients", None):
             return
-        msg = json.dumps({"type": msg_type, "data": data})
         if msg_type == SLOT_FOLD_FRAME and self._any_fold_capable():
             slot = data.get("slot")
             if isinstance(slot, str) and slot:
-                self._send_slot_fold(msg, slot)
+                # Serialized only if some socket gets it: a watching tab set may not
+                # include this board, and a ``work`` frame carries the whole board.
+                self._send_slot_fold(_LazyFrame(msg_type, data), slot)
                 return
+        msg = json.dumps({"type": msg_type, "data": data})
         send_owners = self._owner_method("_send_ws_owners", self._send_ws_owners)
         send_owners(msg)
 
@@ -728,7 +751,9 @@ class WebSocketHub:
         is the ``slot_fold`` data, sent INSTEAD of it to each socket that declared
         :data:`FOLD_APPLY_CAPABILITY` and watches the board. ``None`` (or no such socket
         open) sends exactly what :meth:`broadcast_ws_owners` sends. Each frame is
-        serialized at most once.
+        serialized at most once, and only when a socket it goes to exists: with every
+        target applying deltas, the whole *legacy* value (1 MB+ on a large board) is
+        never serialized.
         """
         if not getattr(self._owner, "_owner_ws_clients", None):
             return
@@ -739,9 +764,8 @@ class WebSocketHub:
         if not apply_open:
             self.broadcast_ws_owners(SLOT_FOLD_FRAME, legacy)
             return
-        msg = json.dumps({"type": SLOT_FOLD_FRAME, "data": legacy})
         apply_msg = json.dumps({"type": SLOT_DELTA_FRAME, "data": delta})
-        self._send_slot_fold(msg, slot, apply_msg)
+        self._send_slot_fold(_LazyFrame(SLOT_FOLD_FRAME, legacy), slot, apply_msg)
 
     def set_fold_apply_capable(self, ws: web.WebSocketResponse, capable: bool) -> bool:
         """Record whether *ws* declared :data:`FOLD_APPLY_CAPABILITY`; returns the flag.
@@ -753,10 +777,13 @@ class WebSocketHub:
         ws[FOLD_APPLY_WS_FLAG] = flag
         return flag
 
-    def _send_slot_fold(self, msg: str, slot: str, apply_msg: "str | None" = None) -> None:
+    def _send_slot_fold(
+        self, msg: "str | _LazyFrame", slot: str, apply_msg: "str | None" = None
+    ) -> None:
         """Send one board's slot frame: every legacy owner socket, and each capable
         one that watches *slot* or one of its ancestors. A watching socket that applies
-        deltas gets *apply_msg* instead of *msg* when one is given."""
+        deltas gets *apply_msg* instead of *msg* when one is given. A :class:`_LazyFrame`
+        *msg* is serialized on the first socket that gets it, so never when none does."""
         dead: list[web.WebSocketResponse] = []
         spawn = self._owner_method("_spawn_ws_send", self._spawn_ws_send)
         remove = self._owner_method("_remove_ws", self._remove_ws)
@@ -777,7 +804,7 @@ class WebSocketHub:
                 if apply_msg is not None and ws.get(FOLD_APPLY_WS_FLAG, False):
                     spawn(ws, apply_msg)
                 else:
-                    spawn(ws, msg)
+                    spawn(ws, msg.text() if isinstance(msg, _LazyFrame) else msg)
             except Exception:
                 dead.append(ws)
         for ws in dead:

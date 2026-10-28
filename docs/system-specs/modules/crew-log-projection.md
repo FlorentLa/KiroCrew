@@ -1202,9 +1202,12 @@ subscribe.
 
 **The `work` fold also publishes a delta.**
 [`rfc-fold-delta-push`](../../request-for-change/rfc-fold-delta-push.md) section 4
-splits the work; PR (c+d), #24749, ships this part. A `work` `FoldAdvanced` also carries
-`kind` (`delta` or `snapshot_needed`), `base_revision` and `delta`, and STILL carries the
-whole `value`, so a receiver that ignores the new fields behaves as before. The delta
+splits the work. A `work` `FoldAdvanced` carries `kind` (`delta` or `snapshot_needed`),
+`base_revision` and `delta`, and `value=None`: the whole render does not ride on the
+event. A receiver rebuilds it with `fold_delta.value_after` on the value it holds, with
+`eager.published_value` / `eager.try_published_value` (the render recorded for that
+exact revision, inside or right after the publish), or with a snapshot read
+(`conductor_wake._read_board_items`, `DashboardFeed._resync_soon`). The delta
 base is a RENDER DIFF: eager holds the last published render per board (at most 64,
 narrowed to the boards delta-capable tabs watch while the dashboard exporter runs) and `fold_delta.diff_work` compares the new
 render with it item by item. The fold step and the memo cell are untouched. With no
@@ -1217,11 +1220,12 @@ base under the lock. The receivers on this path are the bus (each keyed subscrib
 gets a delta only on the revision it took last; any other is relabelled
 `snapshot_needed`), `conductor_wake` (restamps only the items a delta changed), the WS
 exporter (a `slot_fold` frame to a tab that declared `fold_delta.2` and watches the
-board, instead of its `slot_projection` frame), the browser, and the REST board read
-(`published_revision`). Moved to PR (e): change marks in the fold step and the memo
-cell in place of the held render (RFC section 2.1), the `DashboardFeed` delta apply,
-and value-less self-reads (`conductor_wake` reading its own board, receivers rebuilding
-the value with `value_after`). Until (e), `DashboardFeed` reads the whole `value`.
+board, instead of its `slot_projection` frame; every other tab gets the whole value from
+`eager.published_value`, serialized only when such a tab is a target), `DashboardFeed`
+(applies the delta on its cell, else takes the recorded render, else re-reads on its
+own thread), the browser, and the REST board read (`published_revision`). Change marks
+in the fold step and the memo cell in place of the held render (RFC section 2.1) are
+not built; eager still renders the board once per publish to diff it.
 
 **Why that needed a revision, and why `seq` could not be it.** A slot fold's `last_seq` is
 the NEWEST unit's own seq by contract, and conductor units are folded before worker units.
@@ -1268,8 +1272,11 @@ growth signal and still means "re-read this slot". `{slot, fold, revision, value
 an eager advance of the `work` fold sends. Every other slot fold's advance is sent as
 `{slot, fold, revision}` with no value: the client caches only `work` by fold, so it
 would drop any other value and re-read the board either way, and a frame with no value
-takes that same path as the growth signal. The bus event keeps the whole value for every
-fold, so in-process subscribers are unaffected. For a valued frame the client keeps the
+takes that same path as the growth signal. A `work` frame for a tab that does not apply
+deltas carries the render recorded for that revision; when none is recorded (an older or
+repeated revision) the frame is bare `{slot, fold, revision}` and the tab re-reads the
+board. On the bus, every fold but `work` keeps its whole value; a `work` event carries
+none (above). For a valued frame the client keeps the
 highest revision per (slot, fold), discards anything lower OR equal, and seeds its own
 cache from the value -- so the read is removed
 rather than made cheaper. The seed never moves a cached value backwards: a REST read

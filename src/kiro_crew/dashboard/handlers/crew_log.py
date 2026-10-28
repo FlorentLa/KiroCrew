@@ -1182,12 +1182,17 @@ class CrewLogPublisher:
         The event is read DEFENSIVELY -- a bus carries whatever a publisher sends, and a
         malformed one must cost this frame rather than the fan-out to the next subscriber.
         """
+        delta: "dict[str, Any] | None" = None
+        unpacked: "tuple[str, str, int, int, dict[str, Any] | None] | None"
         unpacked = self._unpack(event)
+        if unpacked is None:
+            unpacked, delta = self._unpack_delta(event)
         loop = self._loop
         if unpacked is None or loop is None:
             return
         key, fold, revision, _seq, value = unpacked
-        delta = self._delta_frame(event, key, fold, revision)
+        if delta is None:
+            delta = self._delta_frame(event, key, fold, revision)
         try:
             self._record_revision(key, fold, revision)
             loop.call_soon_threadsafe(self._push_fold, key, fold, revision, value, delta)
@@ -1224,6 +1229,40 @@ class CrewLogPublisher:
         if not key or not fold or revision <= 0 or not isinstance(value, dict):
             return None
         return key, fold, revision, seq, value
+
+    @classmethod
+    def _unpack_delta(
+        cls, event: Any
+    ) -> "tuple[tuple[str, str, int, int, dict[str, Any] | None] | None, dict[str, Any] | None]":
+        """``(unpacked, delta_frame)`` for a ``work`` event that carries no value.
+
+        A ``delta`` or ``snapshot_needed`` ``work`` event has no whole value on it.
+        A tab that applies deltas gets the ``slot_fold`` frame; a tab that cannot
+        (no capability, or ``fold_delta.1`` only) still needs the whole value in its
+        ``slot_projection`` frame. That value is the render the publisher recorded as
+        this publish's base, taken HERE, on the fold worker inside the publish, where
+        :func:`kiro_crew.crew_log.eager.published_value` is exactly this revision's.
+        It is a reference, not a copy or a render; the hub serializes it only when a
+        socket that needs it is a target. ``None`` (an older or repeated publish) makes
+        the legacy frame bare, which an old tab answers with a REST re-read.
+        """
+        key = str(getattr(event, "key", "") or "")
+        fold = str(getattr(event, "fold", "") or "")
+        revision = int(getattr(event, "revision", 0) or 0)
+        if not key or fold != WORK_FOLD or revision <= 0:
+            return None, None
+        delta = cls._delta_frame(event, key, fold, revision)
+        if delta is None:
+            return None, None
+        seq = int(getattr(event, "seq", 0) or 0)
+        whole: "dict[str, Any] | None" = None
+        try:
+            from kiro_crew.crew_log import eager
+
+            whole = eager.published_value(key, fold, revision)
+        except Exception:  # pragma: no cover - a lookup must never cost the frame
+            logger.debug("crew log published value lookup failed for %s/%s", key, fold)
+        return (key, fold, revision, seq, whole), delta
 
     @staticmethod
     def _delta_frame(event: Any, slot: str, fold: str, revision: int) -> "dict[str, Any] | None":
@@ -1306,7 +1345,7 @@ class CrewLogPublisher:
         slot: str,
         fold: str,
         revision: int,
-        value: "dict[str, Any]",
+        value: "dict[str, Any] | None",
         delta: "dict[str, Any] | None" = None,
     ) -> None:
         """Broadcast one slot fold's advance. On the loop.
@@ -1315,15 +1354,16 @@ class CrewLogPublisher:
         seeds into a cache by fold. Every other slot fold is sent without ``value``,
         which the browser reads as the growth signal and answers with the same
         invalidations it runs for a valued frame of that fold (see :data:`SLOT_FRAME`).
-        The bus event itself is untouched, so in-process subscribers still get the
-        whole value.
+        A ``work`` frame whose value is ``None`` (see :meth:`_unpack_delta`) is sent
+        bare too. The ``work`` value is serialized only for a socket that reads it
+        (:meth:`~kiro_crew.dashboard.websocket_hub.WebSocketHub.broadcast_slot_fold`).
 
         An empty room is still a broadcast, which costs the hub one membership check and
         keeps this path free of a second liveness rule to keep in step with
         :meth:`_watchers`.
         """
         data: dict[str, Any] = {"slot": slot, "fold": fold, "revision": int(revision)}
-        if fold == _WORK_FOLD:
+        if fold == _WORK_FOLD and value is not None:
             data["value"] = value
         broadcast_slot_fold = getattr(self._state, "broadcast_slot_fold", None)
         if delta is not None and callable(broadcast_slot_fold):

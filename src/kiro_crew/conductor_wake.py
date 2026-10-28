@@ -246,13 +246,14 @@ def _report_stamp(item: "dict[str, Any]") -> str:
     return f"{stamp}|{hashlib.sha256(blob.encode()).hexdigest()[:16]}"
 
 
-def _event_news(event: Any) -> "tuple[list[_Item], list[str] | None]":
+def _event_news(event: Any) -> "tuple[list[_Item] | None, list[str] | None]":
     """``(items, order)`` for :func:`_observe_board` out of one ``work`` event.
 
     A ``delta`` the bus handed over is on the revision this subscriber took last (the
     bus relabels any other as ``snapshot_needed``), so its changed items and its
     ``order`` are the whole news. Anything else is read whole from the value it carries,
-    and every event carries the whole value.
+    and an event carrying none (``snapshot_needed`` once the whole value stops riding
+    along) answers ``(None, None)``: read the board.
     """
     if getattr(event, "kind", "value") == "delta":
         ops = getattr(event, "delta", None)
@@ -262,7 +263,26 @@ def _event_news(event: Any) -> "tuple[list[_Item], list[str] | None]":
         if isinstance(changed, dict) and isinstance(order, list):
             ids = [item_id for item_id in order if isinstance(item_id, str)]
             return _board_items({"items": list(changed.values())}), ids
-    return _board_items(getattr(event, "value", None)), None
+    value = getattr(event, "value", None)
+    if getattr(event, "kind", "value") != "value" and not (isinstance(value, dict) and value):
+        return None, None
+    return _board_items(value), None
+
+
+def _read_board_items(board: str) -> "list[_Item] | None":
+    """*board*'s items read through the fold read path, or ``None`` if not ready. Blocking.
+
+    Never cold: a board with no warm cell and no savepoint is folded by one background
+    prime, whose publish reaches this module anyway.
+    """
+    from kiro_crew.crew_log import projection
+
+    try:
+        folded = projection.read_slot_projection(board, WORK_FOLD_NAME, cold=False)
+    except Exception:
+        logger.debug("conductor wake: could not read board %s for a snapshot", board)
+        return None
+    return _board_items(getattr(folded, "value", None))
 
 
 def _watched(svc: Any) -> "Callable[[str], bool]":
@@ -273,7 +293,7 @@ def _watched(svc: Any) -> "Callable[[str], bool]":
 async def _observe_board(
     svc: Any,
     board: str,
-    items: "list[_Item]",
+    items: "list[_Item] | None",
     order: "list[str] | None" = None,
 ) -> None:
     """Fold *board*'s latest stamps into the registry and fire for what moved.
@@ -302,14 +322,22 @@ async def _observe_board(
     runs the probe, counts against ``max_cycles``, and advances the quiet streak whose
     floor delivers a turn anyway.
 
-    TWO SHAPES OF NEWS. *items* with *order* ``None`` is the whole board. *items*
+    THREE SHAPES OF NEWS. *items* with *order* ``None`` is the whole board. *items*
     with an *order* is a ``work`` delta: only the changed items, and the ids the board
-    now holds (:meth:`_Registry.observe_delta`).
+    now holds (:meth:`_Registry.observe_delta`). *items* ``None`` is a
+    ``snapshot_needed`` that carried no whole value: the board is read here, off the
+    loop, and observed whole; a board that is not ready yet is skipped and the next
+    publish brings it.
     """
     _registry.sweep(_watched(svc))
     if not work_ledger_loop_id(svc, board):
         _drop(board)
         return
+    if items is None:
+        items = await asyncio.to_thread(_read_board_items, board)
+        if items is None:
+            return
+        order = None
     if order is not None:
         _first, reported = _registry.observe_delta(board, items, order)
     else:
