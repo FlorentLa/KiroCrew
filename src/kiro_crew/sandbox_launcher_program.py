@@ -466,6 +466,7 @@ if __name__ == "__main__":
 # ``kiro_crew.sandbox_launcher_parts``. The renderer drops these lines.
 from kiro_crew._facade_compose import compose as _facade_compose  # noqa: E402
 from kiro_crew.sandbox_launcher_parts.exec_lockdown import (  # noqa: E402
+    _git_ssh_identity_opts,
     drop_privileges,
     enter_exec_cwd,
     exec_agent,
