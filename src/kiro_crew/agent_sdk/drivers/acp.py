@@ -273,6 +273,24 @@ def provider_label(provider: object) -> str:
     return _impl(provider)
 
 
+def _provider_backend(provider: object) -> object:
+    """The backend id *provider* talks to, or ``None`` for a shape that carries none.
+
+    Private, and kept out of ``__all__``: ``llm_helpers.provider_backend`` is the
+    public reader (``""`` on a miss); this one exists only for the ``harness``
+    metric attribute, which must tell a miss from kiro-cli's ``""``.
+
+    Thin delegation to :func:`kiro_crew.providers.acp._provider_backend`, the
+    shape check :func:`provider_label` resolves through, so the ``harness``
+    metric attribute (``metrics/harness.py``) reads the same answer the session
+    map persists without importing the providers layer. Function-local import
+    for the same reason as :func:`resolve_pin_spelling`.
+    """
+    from kiro_crew.providers.acp import _provider_backend as _impl
+
+    return _impl(provider)
+
+
 def catalog_row_would_drop(model_id: str, advertised: object) -> bool:
     """Whether the entitlement filter drops catalog row *model_id* against
     *advertised*.
