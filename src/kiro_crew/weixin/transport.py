@@ -68,7 +68,7 @@ WEIXIN_DM_POLICIES = frozenset(("open", "allowlist", "disabled"))
 #: user who ever messaged the bot, so the map is bounded to the most recent peers
 #: to stop it growing for the life of the gateway process. A named constant so the
 #: value is explicit; the sibling ``wecom/transport.py`` peer set (``_warm_chats``)
-#: has the same unbounded-growth shape and is a candidate for the same bound.
+#: is bounded the same way by ``WECOM_WARM_CHATS_MAX``.
 KNOWN_USERS_CAP = 512
 
 #: Longest ``from_user_id`` kept in :attr:`WeixinTransport._known_users`. A longer

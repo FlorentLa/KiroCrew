@@ -1272,7 +1272,16 @@ carries a redacted SEL note that the roster is truncated — a property of the s
 not a claim that the refused id was evicted, since an evicted id and one never seen
 are indistinguishable once dropped. An over-long `from_user_id`
 (> `MAX_RETAINED_USER_ID_LEN`) is still served but not retained, so the per-entry
-byte size is bounded too.
+byte size is bounded too. WeCom's `_warm_chats` is bounded the same way: the
+LEARNED (non-roster) subset is capped at `WECOM_WARM_CHATS_MAX`, least-recent
+first, while roster identities (owner and allow-list) are never evicted and do
+not count toward the cap, so an allow-listed DM that has written never flips to
+"none seen". A non-roster `userid` longer than `WECOM_MAX_RETAINED_USERID_LEN` is
+served but not retained, and that length bound is re-applied to entries demoted
+from the roster by `reconfigure`. While any learned peer has been shed, every
+`configured_targets()` snapshot carries an unavailable `warm_peers_truncated`
+sentinel. WeCom's `resolve_configured_target` authorizes on the roster alone, so
+eviction never changes what it accepts.
 `channel_type` is unaffected for both and stays available.
 
 The exclusion is not hand-kept:
