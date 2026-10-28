@@ -5426,6 +5426,7 @@
         "max_total_memory_mb": null,
         "max_total_processes": null,
         "scope_memory_high_pct": null,
+        "slice_reclaim_trigger_pct": null,
         "xdist_auto_cap": null
       }
     },
@@ -5559,6 +5560,21 @@
       "tags": [],
       "label": "Scope memory soft ceiling (%)",
       "help": "cgroup MemoryHigh for EACH agent runtime scope, as a percent of that scope's own MemoryMax. A runtime that grows past it reclaims its own page cache and is throttled alone, before the shared slice ceiling slows every runtime. Unset or out of range (1-100) uses the default (90); 0 emits no MemoryHigh at all. Linux only.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null,
+      "nullable": true
+    },
+    {
+      "path": "resource_limits.slice_reclaim_trigger_pct",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Slice page-cache reclaim trigger (%)",
+      "help": "The gateway writes the agents SLICE's memory.reclaim once memory.current reaches this percent of the slice memory.high and clean page cache is at least half of it, so cached files alone do not hold the slice at its ceiling and throttle every agent. Unset uses 95, 0 turns it off for this gateway only (the slice is shared by every gateway of the user), 50-99 is accepted and anything else uses 95. Never runs inside a pod. Linux with cgroup v2 only.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": null,
