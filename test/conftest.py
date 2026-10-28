@@ -305,6 +305,7 @@ from conftest_resets import (  # noqa: E402,F401 -- bound for pytest and importe
     _reset_session_switch_locks,
     _restore_autonudge_singleton,
     _restore_default_child_watcher,
+    _session_memory_scope_sample_unshared,
     _shut_down_shared_pools_in_session,
     _small_default_host,
 )

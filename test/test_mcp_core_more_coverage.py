@@ -1405,7 +1405,12 @@ class TestResourceStatusTool:
                     with patch(
                         "kiro_crew.mcp_tools.spawn._live_adaptive_state", return_value=state
                     ):
-                        return _call_tool_inner("resource_status", {})
+                        # The caller-scoped block is its own read, pinned in
+                        # test_session_memory_scope.py; held quiet here.
+                        with patch(
+                            "kiro_crew.mcp_tools.spawn.session_memory_lines", return_value=[]
+                        ):
+                            return _call_tool_inner("resource_status", {})
 
     def test_the_live_cap_is_reported_when_the_gateway_answers(self) -> None:
         """The cap IN FORCE, not the configured ceiling.

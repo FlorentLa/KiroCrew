@@ -1119,6 +1119,29 @@ gateway's own discovery cycle, where a loopback request would dial the gateway
 from inside the gateway. In a tool server the registry is empty, so the model
 sees the labelled ceiling and is pointed at `resource_status` for the live cap.
 
+### `resource_status`: the caller's own memory
+
+`resource_status` also prints how much memory is the CALLER's: its own runtime,
+its sub-agents' shared runtime (`subagent_runtime_row_key`), and the live runs it
+started as one total. `mcp_tools/spawn_parts/session_memory.py` resolves the caller
+through `require_strict_session_key` and reads `GET /api/spawn/session-memory`
+(`dashboard/handlers/session_memory_scope.py`) with that key. The route answers only
+an internal caller whose `X-Session-Key` `member_request_scope` attests, and only
+about that session; a dashboard owner gets 403 and is pointed at
+`/api/sessions/memory`. Run ownership is `_run_belongs_to_caller`, the rule the spawn
+control routes apply; a continued run is found by its `session_key`. The answer
+holds counts, sizes and a `shared` flag only (`rss_mb`, `procs`, `mcp`, `shared`,
+and for runs `count`, `unsampled`, `shared`): no session key, title, agent, task
+text, run id or pid, and no other session's figures or host totals. On a runtime
+shared with other sessions only the caller's size share is sent; the runtime-wide
+process and MCP counts, and the number of co-tenants, are withheld. A run not yet
+measured reads as unmeasured, never 0. The route runs its own
+`SessionMemorySampler` without `get_slot`, so titles are never resolved and the
+Sessions panel's history and CPU baselines are untouched; one sample is reused by
+every caller for `_SAMPLE_REUSE_SECS`, behind a lock. Any failure prints one
+`unavailable` line and the rest of `resource_status` still answers. Pinned by
+`test_session_memory_scope.py`.
+
 ### `set_effective_cap(cap | None) -> int` — the adaptive-controller seam
 
 The resolved user cap is a **ceiling**, not the live value. Two fields:

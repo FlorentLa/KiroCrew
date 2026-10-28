@@ -5424,7 +5424,9 @@ Sends a message to the user proactively, backed by `POST /api/send-message` (`ha
 
 Retired with the standalone Agent Templates page: the per-session context
 window cards and their `GET /api/sessions/context` endpoint were removed.
-Per-session memory and usage remain on `GET /api/sessions/memory`.
+Per-session memory and usage remain on `GET /api/sessions/memory`. An agent reads
+only its own footprint, as numbers, through `resource_status` and
+`GET /api/spawn/session-memory` (see `subagent.md`).
 
 ### Template deletion
 

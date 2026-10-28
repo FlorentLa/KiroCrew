@@ -377,6 +377,18 @@ def _no_managed_venv_override(_floor_monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _session_memory_scope_sample_unshared(_floor_monkeypatch):
+    """Start every test with no reused host sample in ``session_memory_scope``.
+
+    The route keeps its last host sample for a few seconds so a wave of callers
+    shares one ``/proc`` walk; a sample one test took must not answer the next.
+    """
+    module = sys.modules.get("kiro_crew.dashboard.handlers.session_memory_scope")
+    if module is not None:
+        _floor_monkeypatch.setattr(module, "_last_sample", None)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_kiro_window_cache():
     """Give every test an EMPTY ``model_registry._KIRO_WINDOWS``, then restore it.
 
