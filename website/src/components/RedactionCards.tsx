@@ -14,7 +14,8 @@
  * every retained string renders as TEXT, never HTML.
  */
 import React, { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
-import { createPortal, flushSync } from 'react-dom'
+import { flushSync } from 'react-dom'
+import { OverlayPortal, useCloseWhenCrewHidden, useLocalCrewHidden } from './overlayRoot'
 import { noteInPlaceResize } from '../hooks/virtualizer/inPlaceResize'
 import { TOUCH_REPLAY_WINDOW_MS } from './InstantTip'
 import { Check, ChevronRight, Copy, Link2Off, Lock, Shield, TriangleAlert, X } from 'lucide-react'
@@ -345,12 +346,17 @@ export function RedactionProvider({ credentials, blockedLinks, slotKey, replyKey
     if (!replyKey) return
     for (const [domain, hold] of holds) if (openId !== hold.cardId) setAllowHold(replyKey, domain, null)
   }, [openId, replyKey, holds])
+  // The card is inline in the transcript (not portalled), so it stays mounted
+  // and comes back as it was on a Crew switch. Only the Escape key handler
+  // stands down while the local Crew is hidden, so Escape on the remote Crew
+  // cannot silently close a card the user left open.
+  const hidden = useLocalCrewHidden()
   useEffect(() => {
-    if (openId === null) return
+    if (openId === null || hidden) return
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close() }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-  }, [openId, close])
+  }, [openId, close, hidden])
   const value = useMemo(() => {
     const map = new Map(credentials.map(r => [r.ordinal, r]))
     const first = credentials.length ? Math.min(...credentials.map(r => r.ordinal)) : -1
@@ -1021,6 +1027,9 @@ function useMarkerPreview(cardId: string) {
   useEffect(() => { if (openId === cardId) hide() }, [openId, cardId, hide])
   const later = (fn: () => void, ms: number) => { clearTimeout(timer.current); timer.current = setTimeout(fn, ms) }
   useEffect(() => () => clearTimeout(timer.current), [])
+  // Hide the preview when the local Crew is hidden, so the window key
+  // listener is unregistered before the remote Crew receives key events.
+  useCloseWhenCrewHidden(shown, hide)
   // Keep the panel on its marker while the transcript scrolls under it, and
   // close it once the marker scrolls out of view, so it never floats over
   // unrelated content. Escape pressed anywhere closes it. While focus is on
@@ -1099,25 +1108,26 @@ function PreviewPanel({ preview, title, testId, children }: {
   }, [preview.shown, preview.anchor, preview.panelRef, width])
   if (!preview.shown || !preview.anchor) return null
   const { anchor } = preview
-  return createPortal(
-    <div
-      ref={preview.panelRef}
-      id={preview.panelId}
-      role="tooltip"
-      data-testid={testId}
-      {...preview.panelProps}
-      className="fixed z-[130] w-max rounded-lg border border-border bg-bg-elevated p-2.5 text-[12px] leading-[18px] text-card-fg shadow-lg"
-      style={{
-        maxWidth: `min(${PREVIEW_MAX_W}px, calc(100vw - 16px))`,
-        left: Math.max(8, Math.min(anchor.left, window.innerWidth - width - 8)),
-        top: anchor.below ? anchor.top : undefined,
-        bottom: anchor.below ? undefined : window.innerHeight - anchor.top,
-      }}
-    >
-      <div className="mb-0.5 font-semibold [overflow-wrap:anywhere]">{title}</div>
-      <div data-testid="redaction-preview-body" className="[overflow-wrap:anywhere]">{children}</div>
-    </div>,
-    document.body,
+  return (
+    <OverlayPortal>
+      <div
+        ref={preview.panelRef}
+        id={preview.panelId}
+        role="tooltip"
+        data-testid={testId}
+        {...preview.panelProps}
+        className="fixed z-[130] w-max rounded-lg border border-border bg-bg-elevated p-2.5 text-[12px] leading-[18px] text-card-fg shadow-lg"
+        style={{
+          maxWidth: `min(${PREVIEW_MAX_W}px, calc(100vw - 16px))`,
+          left: Math.max(8, Math.min(anchor.left, window.innerWidth - width - 8)),
+          top: anchor.below ? anchor.top : undefined,
+          bottom: anchor.below ? undefined : window.innerHeight - anchor.top,
+        }}
+      >
+        <div className="mb-0.5 font-semibold [overflow-wrap:anywhere]">{title}</div>
+        <div data-testid="redaction-preview-body" className="[overflow-wrap:anywhere]">{children}</div>
+      </div>
+    </OverlayPortal>
   )
 }
 
