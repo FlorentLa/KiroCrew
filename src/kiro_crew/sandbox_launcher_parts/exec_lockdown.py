@@ -369,9 +369,26 @@ def enter_exec_cwd(launch):
     a writable or populated directory could be handed a spec that directory holds.
     Runs after the hardlinked-credential scan, which walks the workspace the launcher
     was started in.
+
+    With no ``exec_cwd`` the launcher still enters the directory it was started in
+    again, by the name it had before any mount, so the command it runs sees that
+    directory through the seals too. When that name does not reach a directory, the
+    command starts in the filesystem root instead of the old directory.
     """
     target = launch.exec_cwd
     if not target:
+        if launch.inherited_cwd:
+            try:
+                os.chdir(launch.inherited_cwd)
+                return
+            except OSError:
+                pass
+        try:
+            os.chdir(os.sep)
+        except OSError as exc:
+            sys.exit(
+                "sandbox: FATAL — cannot leave the inherited directory (%s)" % (exc.strerror or exc)
+            )
         return
     try:
         os.chdir(target)
