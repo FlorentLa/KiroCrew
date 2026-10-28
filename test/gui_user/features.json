@@ -2849,7 +2849,7 @@
           "nova-sky"
         ],
         "feature_flags": [],
-        "notes": "agent_fetch runs an LLM worker that needs outbound network."
+        "notes": "The gateway fetches the page itself, which needs outbound network and a host in knowledge.doc_ingest_hosts."
       },
       "runnable": "excluded",
       "estimated_steps": 4,

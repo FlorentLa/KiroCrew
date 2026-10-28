@@ -14000,7 +14000,15 @@
           "synced": "最新"
         },
         "added_by_agent": "○ エージェントが追加",
-        "updates_when_the_agent_adds_a_document": "エージェントがドキュメントを追加すると更新されます。同期するものはありません"
+        "updates_when_the_agent_adds_a_document": "エージェントがドキュメントを追加すると更新されます。同期するものはありません",
+        "web_page": "Web ページ",
+        "page_url": "ページの URL",
+        "page_url_e_g": "ページの URL（例: https://example.com/article）",
+        "add_page": "Web ページを追加",
+        "web_page_hosts_allowed": "HTTPS で 1 ページを取得します。許可されたサイト: {{hosts}}。",
+        "web_page_no_hosts_allowed": "まだ許可されたサイトがないため、何も取得できません。サイトを許可するには、下に入力してターミナルでコマンドを実行し、このフォームを閉じてもう一度開いてください。",
+        "web_page_hosts_unavailable": "許可されたサイトを読み込めませんでした。このフォームを閉じてもう一度開いてください。",
+        "web_page_site_not_allowed": "{{site}} はまだ許可されたサイトではありません。許可されたサイト: {{hosts}}。許可するには、ターミナルで下のコマンドを実行してから、このフォームを閉じてもう一度開いてください。"
       },
       "settings": {
         "title": "Ingestion Settings",

@@ -14466,7 +14466,15 @@
           "synced": "Aggiornato"
         },
         "added_by_agent": "○ aggiunto dall’agente",
-        "updates_when_the_agent_adds_a_document": "Si aggiorna quando l’agente aggiunge un documento; niente da sincronizzare"
+        "updates_when_the_agent_adds_a_document": "Si aggiorna quando l’agente aggiunge un documento; niente da sincronizzare",
+        "web_page": "Pagina web",
+        "page_url": "URL della pagina",
+        "page_url_e_g": "URL della pagina (es. https://example.com/article)",
+        "add_page": "Aggiungi pagina web",
+        "web_page_hosts_allowed": "Scarica una pagina via HTTPS. Siti consentiti: {{hosts}}.",
+        "web_page_no_hosts_allowed": "Non c'è ancora nessun sito consentito, quindi non si può scaricare nulla. Per consentire un sito, scrivilo qui sotto, esegui il comando in un terminale, poi chiudi e riapri questo modulo.",
+        "web_page_hosts_unavailable": "Impossibile caricare i siti consentiti. Chiudi e riapri questo modulo per riprovare.",
+        "web_page_site_not_allowed": "{{site}} non è ancora un sito consentito. Siti consentiti: {{hosts}}. Per consentirlo, esegui il comando qui sotto in un terminale, poi chiudi e riapri questo modulo."
       },
       "settings": {
         "title": "Ingestion Settings",

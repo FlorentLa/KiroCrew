@@ -2,13 +2,13 @@
 
 ## Overview
 
-The Knowledge Library is Kiro Crew's personal knowledge graph: a local, SQLite-backed corpus that ingests documents (folders, uploads, artifacts, fetched URLs), chunks and entity-extracts them via a bounded LLM worker pool, and serves hybrid retrieval (FTS5 keyword + graph traversal + optional vector) to the LLM through the `local_knowledge_search` MCP tool. All ingestion and search stay on-host; the only external calls are the extraction/URL-fetch worker's ACP LLM turns. Embedding runs in-process against a vendored runtime — the shared `EmbeddingBackend` singleton — so there is no inference endpoint of any kind.
+The Knowledge Library is Kiro Crew's personal knowledge graph: a local, SQLite-backed corpus that ingests documents (folders, uploads, artifacts, fetched URLs), chunks and entity-extracts them via a bounded LLM worker pool, and serves hybrid retrieval (FTS5 keyword + graph traversal + optional vector) to the LLM through the `local_knowledge_search` MCP tool. All ingestion and search stay on-host; the only external calls are the extraction worker's ACP LLM turns and the gateway's own fetch of a web-page source from a listed host (`url_fetch.py`). Embedding runs in-process against a vendored runtime — the shared `EmbeddingBackend` singleton — so there is no inference endpoint of any kind.
 
 ```
 files / uploads / artifacts / URLs
    → FileReader (read + extract text)
    → HeadingAwareChunker (chunk)
-   → EntityExtractor / agent_fetch (LLMPool workers)
+   → EntityExtractor (LLMPool workers); a web-page source is fetched first by url_fetch
    → KnowledgeStore (SQLite: items + items_fts + graph)
    → HybridRetriever (FTS5 + graph + vector, RRF fusion)
    → local_knowledge_search (MCP) / dashboard Knowledge tab
@@ -16,11 +16,10 @@ files / uploads / artifacts / URLs
 
 ### LLM worker-pool policy
 
-Knowledge ingestion and URL-content acquisition use separate long-lived worker
-pools. The extraction pool uses `knowledge.extraction_pool_size` and requests
-reasoning effort `knowledge.extraction_effort`; the URL-fetch pool has one
-worker and sends no explicit effort, so it retains the provider default. The
-extraction effort resolves through the chain in `llm_pool._get_workload_effort`:
+Knowledge ingestion uses one long-lived worker pool, for extraction. It uses
+`knowledge.extraction_pool_size` and requests reasoning effort
+`knowledge.extraction_effort`. No worker fetches URLs: a web-page source is
+fetched by the gateway itself (`url_fetch.py`, below). The extraction effort resolves through the chain in `llm_pool._get_workload_effort`:
 `knowledge.extraction_effort` → fallback (`DEFAULT_EXTRACTION_EFFORT` = `high`
 as the last resort). The chain has no role-policy leg: extraction effort is a
 Knowledge policy, independent of `agent.role_efforts.background` (which
@@ -46,7 +45,7 @@ sessions rather than relying on a worker being reused by only one workload by
 convention. There is no `knowledge_llm_pool` compatibility alias and no
 `use_config_pool_size` flag: a pool binds an explicit
 `config_pool_size_key` (extraction only), so `knowledge.extraction_pool_size`
-cannot resize the fetch or auto_research pools.
+cannot resize the auto_research pools.
 
 ## Role & boundary
 
@@ -119,7 +118,7 @@ The remaining gap is therefore an **A/B task-lift harness** (Tier 2), plus a flo
 | `knowledge/watcher.py` | `KnowledgeWatcher` — polls registered sources for changes; sig-gated self-heal re-embed (single-flight, off-loop DB access) |
 | `knowledge/llm_pool.py` | `LLMPool` / `Worker` / `AcpWorker` — bounded pool of long-lived, sweep-shielded ACP workers |
 | `knowledge/extractor.py` | `EntityExtractor` — LLM entity/relation extraction over the pool |
-| `knowledge/agent_fetch.py` | `fetch_url_content()` — agent-assisted URL fetch over the pool (tools opt-in via `KIROCREW_KNOWLEDGE_FETCH_TOOLS`) |
+| `knowledge/url_fetch.py` | `fetch_page()` — the gateway's own fetch of one web page: `url_fetch_refusal()` (https, listed host) plus `link_unfurl.vet_unfurl_url` (public addresses, pinned connection) on the first URL and every redirect hop |
 | `knowledge/chunker.py` | `HeadingAwareChunker` — text/markdown/code/slide chunking |
 | `knowledge/embedder.py` | `InProcessEmbedder` — embedding in-process via the shared `EmbeddingBackend` (vendored llama-cpp runtime, no server and no HTTP hop); owns `embed_signature` (per-item vector-space identity) |
 | `knowledge/store.py` | `KnowledgeStore` — the import path of the store: the per-thread connection, construction and damaged-file recovery, the ingestion gate, and the class that binds its methods from the `store_parts` owners below |
@@ -204,7 +203,8 @@ path. New budget work goes to `ingestion_budget.py`, new re-embed or job-row wor
 | `FileReader.SUPPORTED` | see below | `readers.py` | Extensions the watcher/reader will ingest |
 | `DEFAULT_POOL_SIZE` | `3` | `llm_pool.py` | Worker count in a pool |
 | `DEFAULT_TIMEOUT` | `60.0` | `llm_pool.py` | Per-message worker timeout (extraction) |
-| `FETCH_TIMEOUT` | `120.0` | `llm_pool.py`, `agent_fetch.py` | URL-fetch worker timeout |
+| `FETCH_TIMEOUT` | `120.0` | `llm_pool.py` | worker timeout |
+| `FETCH_TIMEOUT_SECONDS` / `MAX_PAGE_BYTES` | `30.0` / 5 MiB | `url_fetch.py` | one web-page fetch, all hops included; the hop limit is `link_unfurl.MAX_REDIRECTS` |
 | `AGENT_NAME` | `"kirocrew-knowledge"` | `llm_pool.py` | kiro-cli agent the ACP worker drives |
 | `_VALID_SANDBOX_MODES` | `{auto, standard, strict, cc, off}` | `llm_pool.py` | Accepted `agent.sandbox` values |
 | `HARD_SKIP_DIRS` | `{.git, node_modules, __pycache__, .venv, venv, dist, build, out, target, cdk.out}` | `folder_watcher.py` | Directories never walked |
@@ -339,7 +339,7 @@ ingest.
 **The Auto-added row has nothing to sync.** Kiro Crew fetches nothing for it: its
 documents arrive only when the agent submits text. Its uri `agent://` is a control uri,
 not a URL, so `POST /api/knowledge/sources/{id}/sync` never hands it to the agent
-URL-fetch fallback, whose failure would leave the row in a sticky `error`. The request
+web-page fetch, whose failure would leave the row in a sticky `error`. The request
 answers 409 `source_not_syncable` and the row's status is unchanged. `GET
 /api/knowledge/sources` carries the same rule as a per-row `syncable` flag (false only
 for this row), and the Sources list offers Sync from that flag, so the button and the
@@ -545,9 +545,52 @@ ingested. The chunk figure is derived from the chunker's target size and file by
 (`_estimated_chunks`), never measured: it exists to show order of magnitude before the
 user confirms, and no code path treats it as a bound.
 
+**Web-page sources and the fetch allowlist.** A source with no connector (the
+dashboard's Web Page type is `url`) is fetched by the gateway itself,
+`url_fetch.fetch_page`, and handed to `ingest_file` like an upload: decoded (HTML by
+`link_unfurl.decode_html`: the header's charset, then a `<meta charset>`, then UTF-8; text and
+Markdown by the header's charset, else UTF-8, never sniffed from their prose), scrubbed with `security.redact` (outside
+text, and `ingest_file` scrubs only an agent-added document itself), and staged as
+UTF-8 under the suffix of its content type (`.html`, `.txt`, `.md`; anything else is
+refused). No
+agent is involved and no worker gains a tool. `knowledge.doc_ingest_hosts` gates it,
+read fresh on every use, and two checks run on the first URL and on every redirect
+hop:
+
+- `url_fetch.url_fetch_refusal`, the user's rule: `https://` only, port 443 or none,
+  no userinfo, no backslash, whitespace or control character, an ASCII host, and that
+  host equal to a listed entry (case and a trailing dot aside, no subdomain match).
+- `link_unfurl.vet_unfurl_url`, the network rule: one resolution, and every address
+  must be public (loopback, private, link-local, CGNAT and the metadata endpoint are
+  refused, tunnel encodings unwrapped). The request then goes through
+  `link_unfurl.pinned_connector`, so the socket can reach only the addresses that
+  check approved: a second DNS answer cannot move it (DNS rebinding), and a redirect
+  hop is resolved and checked again.
+
+A redirect is followed only to the same host (`url_redirect_off_host` otherwise), at
+most `MAX_REDIRECTS` times. The whole fetch is bounded by `FETCH_TIMEOUT_SECONDS`, and
+the body by `MAX_PAGE_BYTES` while it is read (never by trusting `Content-Length`);
+a page over the cap is refused, not truncated. The request asks for `identity` and
+does not decompress, so the cap bounds the bytes held; a compressed answer is refused. The rule runs at three points:
+`add_source` refuses the row (403 `url_host_not_allowed`, otherwise 400 with the
+rule's code), `POST /sources/{id}/sync` refuses before any status write, and the
+background task reads the list again before it fetches, so a host removed after the
+request was accepted is not fetched. Every refusal writes `source.add_denied` or
+`source.sync_denied` to the security event log with the rule's code. The list is
+empty by default, so a default config fetches nothing. A load that could not read
+`config.json`, `config.local.json` or the knowledge section whole fails closed:
+`_doc_ingest_hosts` raises `DocIngestHostsUnavailable`, add and sync answer 503
+`doc_ingest_hosts_unavailable`, and the background task ends in `error`, because the
+loader's defaults are not the user's list. `GET /api/knowledge/config` returns the
+list as `url_allowed_hosts` (`null` when it cannot be read); the add form re-reads
+it each time it opens, reports a failed or `null` read as an error, never as an
+empty list, and offers the `kirocrew config set` command row
+while the list is empty or the typed link's site is not on it (prefilled with the listed
+sites plus that one, the Add button held until it is listed).
+
 ## 3. LLMPool workers (`llm_pool.py`)
 
-Entity extraction (`EntityExtractor`) and internal-URL fetch (`agent_fetch.fetch_url_content`) acquire workers from **workload-isolated** `LLMPool` instances — provider-agnostic, bounded pools of **long-lived** ACP workers (the extraction pool sized by `knowledge.extraction_pool_size`, default `DEFAULT_POOL_SIZE` = 3; the fetch pool has one worker). A `Worker` ABC has two concrete paths:
+Entity extraction (`EntityExtractor`) acquires workers from **workload-isolated** `LLMPool` instances — provider-agnostic, bounded pools of **long-lived** ACP workers (the extraction pool sized by `knowledge.extraction_pool_size`, default `DEFAULT_POOL_SIZE` = 3). A `Worker` ABC has two concrete paths:
 
 - **Default (kiro-cli)** — `AcpWorker` drives the `kirocrew-knowledge` agent over ACP (`AGENT_NAME`). That agent is installed by `agent_materialization/service_agents.py:_install_knowledge_agent`. Its model resolves `knowledge.extraction_model` → `agent.model` → `"auto"` (`kiro_crew.agent.knowledge_agent_model`; the installer writes it into the spec, which kiro-cli reads, and `AcpWorker._spawn_client` hands the same pin as `model=` to every other harness, which reads no spec of Crew's), and it declares no MCP servers and no tools (`mcpServers: {}`, `tools: []`, `includeMcpJson: false`). That spec is meant as a total ban. The agents directory is shared, and a tool that rewrites every spec in it (a launcher adding its own MCP server to `tools`, `allowedTools` and a `permissions` block) would otherwise leave the pool refusing every batch until the next rebuild re-derives the spec. So `AcpWorker._spawn_client` first calls `service_agents.repair_knowledge_agent_spec` off the event loop, on every backend, before each spawn. It compares the file, parsed and type-strict, against the governed template, and rewrites it through the same governed tail when the two differ or the file cannot be read as a spec, logging a WARNING that names the differing top-level keys and never their values. A write this data home may not make (`SharedAgentHomeRefused`) or one that fails leaves the file as it is, and the confirmation below still decides. The harness is `agent.acp_backend`, read per worker by `_get_acp_backend()` through `resolve_selected_backend` (H3) and then narrowed to a backend that answers two `SessionCapabilities` questions True: `honors_zero_tool_ban` (kiro-cli/KAS natively; opencode/goose/deepseek/pi via `AcpClient._deny_zero_tools`, which refuses every permission request — MCP or the harness's own native Bash/Read/Write — on an `AcpClient` session of an enforced-routing backend whose `SessionMcpProjection.zero_tools` is set from the same spec parse as the MCP array, by the backend's mirror or, for pi, which has none, beside its member mounts; claude's routing is declared but not enforced by this core, so an inherited `~/.claude` pre-approval can skip the permission request and the refusal never runs; codex is served by `AcpRuntime`, which carries no such refusal at all) and `acp_client_spawnable` (kiro, claude, opencode, goose, pi, deepseek — not kas/codex, which need `AcpRuntime` and have no arm in `AcpClient._spawn`). Today that intersection is `{kiro, opencode, goose, deepseek, pi}`. The resolved backend is passed to `AcpClient` as `acp_backend=`; an unselectable, malformed, or not-yet-qualifying value degrades to Kiro, and `_get_acp_backend` logs a warning naming the configured backend and which capability failed, once per backend per process. Once the session is ready, `AcpWorker.start()` confirms the ban instead of assuming it. A backend not routed through `Routing.AGENT_SPEC` must have the session's consumed projection (its mirror's, or pi's mirror-less parse) confirm `zero_tools` (`AcpClient.spec_zero_tools`), and if it does not — a missing, malformed, or shadowed spec — the worker restarts on Kiro before any prompt is sent. A worker that ends on a `Routing.AGENT_SPEC` backend (Kiro, originally or after that restart) has no mirror to confirm through, and kiro resolves `--agent` against `<cwd>/.kiro/agents` before the global directory while the pool's cwd is `config_dir()/workspace`, so a project-level `kirocrew-knowledge.json` carrying tools would shadow the installed spec. It therefore confirms the ban with `AcpClient.effective_spec_declares_zero_tools`. With a prepared projection the `NativeSkillProjection` hands the harness a view through `--agent` before the spawn, under the alias it published to the user-level agents directory, and the confirmation requires `"tools": []` in both: the captured view, and the published alias file, read after start because that file is what kiro-cli loads (a checkout cannot claim an alias name, `acp/managed_agent_shadow.py`). The authored spec is not read on this branch, so an edit to it after the view was prepared cannot change the answer. With no prepared projection (the `agent.native_skill_projection: false` / `KIROCREW_NATIVE_SKILL_PROJECTION=0` rollback, or an alias that could not be taken) kiro-cli loads the named spec itself, so `AcpWorker._spawn_client` reads the authored spec (`AcpClient.authored_spec_declares_zero_tools`, project checkout first) before each Kiro client's spawn and the confirmation reads it again after start; both reads must declare `"tools": []`. On either branch the read after start narrows a change to the file kiro-cli loads but cannot close one made and restored inside the spawn window. The confirmation runs off the event loop because both branches read a file. `AcpWorker.start()` raises `RuntimeError` without sending a prompt when the ban is not confirmed; no safer backend remains after Kiro. Effort follows the backend's capability rather than its identity (`effort_via_config_option`, `effort_via_slash_command`); a backend answering neither logs that the provider default applies and sends nothing. An effort option offering `off` alone (goose on a model with no extended thinking) sends nothing either, and neither does an opencode model with no variants, which advertises no `effort` option at all. `AcpWorker.send_message` shuts its client down on any failed send and re-raises, so the next `acquire` respawns it: a timed-out turn is still running in the child, and a reused client would answer "Prompt already in progress".
 - **`agent.provider="claude_code"` (legacy seam)** — `CCWorker` drives a long-lived `claude` CLI subprocess over stream-json I/O (haiku model, `bypassPermissions`); URL-fetch tools are opt-in via `KIROCREW_KNOWLEDGE_FETCH_TOOLS`. Its stdout stream is opened with a 10 MiB line limit (`STDOUT_LINE_LIMIT`, the ACP transports' ceiling, pinned equal by a test) rather than asyncio's 64 KiB, and stderr goes to `DEVNULL`, so the limit sizes the one pipe that is read and an unread stderr can neither hold memory nor stall the CLI; the reader drops a line over the limit, or one that is not a JSON object, and keeps reading. `_collect_response` skips values of the wrong type, takes the CLI's non-empty string `result` (the final answer) as the reply and joins the assistant text only when the result carries none, so the narration of an earlier tool-use turn never reaches the caller, and fails the message on `is_error: true`. The worker outlives a message only when that message's result event was consumed; anything else (a timeout, a dead reader, a cancelled caller, including one cancelled while the prompt write is still draining, which the same timeout bounds) retires the process so a later prompt cannot read this one's leftovers. A respawn that fails retires the old process as well, since its reader is already gone, and `is_alive()` reports a worker whose reader ended as dead. Kiro Crew's provider enum is `["acp"]`, so this branch is dormant in practice.

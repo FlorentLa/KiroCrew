@@ -812,7 +812,6 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "dashboard/messaging_api/run_views.py",
         "dashboard/messaging_api/slack_workspace.py",
         "dashboard/messaging_api/spawn.py",
-        "knowledge/agent_fetch.py",
         "knowledge/agent_source.py",
         "knowledge/artifact_ingest.py",
         "knowledge/ingestion.py",

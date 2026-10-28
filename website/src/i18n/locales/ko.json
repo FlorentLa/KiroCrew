@@ -14000,7 +14000,15 @@
           "synced": "최신 상태"
         },
         "added_by_agent": "○ 에이전트가 추가함",
-        "updates_when_the_agent_adds_a_document": "에이전트가 문서를 추가하면 업데이트됩니다. 동기화할 항목이 없습니다"
+        "updates_when_the_agent_adds_a_document": "에이전트가 문서를 추가하면 업데이트됩니다. 동기화할 항목이 없습니다",
+        "web_page": "웹 페이지",
+        "page_url": "페이지 URL",
+        "page_url_e_g": "페이지 URL(예: https://example.com/article)",
+        "add_page": "웹 페이지 추가",
+        "web_page_hosts_allowed": "HTTPS로 페이지 하나를 가져옵니다. 허용된 사이트: {{hosts}}.",
+        "web_page_no_hosts_allowed": "아직 허용된 사이트가 없어 아무것도 가져올 수 없습니다. 사이트를 허용하려면 아래에 입력하고 터미널에서 명령을 실행한 뒤 이 양식을 닫았다가 다시 여세요.",
+        "web_page_hosts_unavailable": "허용된 사이트를 불러오지 못했습니다. 이 양식을 닫았다가 다시 열어 주세요.",
+        "web_page_site_not_allowed": "{{site}}은(는) 아직 허용된 사이트가 아닙니다. 허용된 사이트: {{hosts}}. 허용하려면 터미널에서 아래 명령을 실행한 뒤 이 양식을 닫았다가 다시 여세요."
       },
       "settings": {
         "title": "Ingestion Settings",

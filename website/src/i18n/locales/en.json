@@ -7785,6 +7785,7 @@
         "prev": "← Prev"
       },
       "sourcesList": {
+        "add_page": "Add Web Page",
         "add_source": "+ Add Source",
         "add_source_2": "Add Source",
         "auto": "● auto",
@@ -7812,6 +7813,8 @@
         "namespace_2": "Namespace",
         "never_synced": "never synced",
         "no_sources_registered": "No sources registered",
+        "page_url": "Page URL",
+        "page_url_e_g": "Page URL (e.g., https://example.com/article)",
         "pause": "Pause",
         "pause_scan": "Pause scan",
         "remove_source": "Remove source",
@@ -7831,7 +7834,12 @@
         "upload_files": "Upload files",
         "upload_local_files_or_watch_a_local_folder_to_in": "Upload local files or watch a local folder to ingest documents",
         "use_sync_button_to_update": "Use Sync button to update",
-        "watches_folder_recursively_supported_files_auto": "Watches folder recursively. Supported files auto-ingested. Max 5,000 files per source."
+        "watches_folder_recursively_supported_files_auto": "Watches folder recursively. Supported files auto-ingested. Max 5,000 files per source.",
+        "web_page": "Web Page",
+        "web_page_hosts_allowed": "Fetches one page over HTTPS. Allowed sites: {{hosts}}.",
+        "web_page_hosts_unavailable": "Couldn't load the allowed sites. Close and reopen this form to try again.",
+        "web_page_no_hosts_allowed": "No sites are allowed yet, so nothing can be fetched. To allow a site, type it below, run the command in a terminal, then close and reopen this form.",
+        "web_page_site_not_allowed": "{{site}} isn't an allowed site yet. Allowed sites: {{hosts}}. To allow it, run the command below in a terminal, then close and reopen this form."
       }
     },
     "localStorageDebug": {

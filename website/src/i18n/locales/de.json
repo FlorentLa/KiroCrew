@@ -14233,7 +14233,15 @@
           "synced": "Aktuell"
         },
         "added_by_agent": "○ vom Agenten hinzugefügt",
-        "updates_when_the_agent_adds_a_document": "Wird aktualisiert, wenn der Agent ein Dokument hinzufügt; nichts zu synchronisieren"
+        "updates_when_the_agent_adds_a_document": "Wird aktualisiert, wenn der Agent ein Dokument hinzufügt; nichts zu synchronisieren",
+        "web_page": "Webseite",
+        "page_url": "Seiten-URL",
+        "page_url_e_g": "Seiten-URL (z. B. https://example.com/article)",
+        "add_page": "Webseite hinzufügen",
+        "web_page_hosts_allowed": "Ruft eine Seite über HTTPS ab. Erlaubte Websites: {{hosts}}.",
+        "web_page_no_hosts_allowed": "Noch ist keine Website erlaubt, daher kann nichts abgerufen werden. Um eine Website zu erlauben, trag sie unten ein, führ den Befehl in einem Terminal aus und schließ dieses Formular, dann öffne es erneut.",
+        "web_page_hosts_unavailable": "Die erlaubten Websites konnten nicht geladen werden. Schließ dieses Formular und öffne es erneut.",
+        "web_page_site_not_allowed": "{{site}} ist noch keine erlaubte Website. Erlaubte Websites: {{hosts}}. Um sie zu erlauben, führ den Befehl unten in einem Terminal aus, schließ dann dieses Formular und öffne es erneut."
       },
       "settings": {
         "title": "Ingestion Settings",
