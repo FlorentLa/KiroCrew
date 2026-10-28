@@ -1661,7 +1661,8 @@ to this kind would store content no reader can parse.
   as a crewmate's Dashboard frame. A link in the page opens through the host:
   `buildSrcdoc({ linkBridge: true })` turns a `_blank` or bare web link click,
   and `window.open`, into a `kirocrew-dashboard:open` message, and
-  `useFrameLinkBridge` opens an absolute `http(s)` URL only on a real click in
+  `useFrameLinkBridge` opens an `http(s)` URL, or a dashboard path resolved
+  against its origin, only on a real click in
   that frame, once per click, with no dialog. The shim decides a click after
   the page's own handlers, so a click the page cancels posts nothing. The host
   opens at once only when it can tie the click to the asking frame

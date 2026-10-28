@@ -8,7 +8,7 @@ import { Badge, Btn } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
 import { useTheme } from '../../hooks/useTheme'
 import { useSandboxDoc } from '../../hooks/useSandboxDoc'
-import { useFrameOpenLink } from '../../hooks/useFrameOpenLink'
+import { useFrameLinkBridge } from '../../hooks/useFrameLinkBridge'
 import { buildSrcdoc, readThemeVars } from '../../lib/widgetSrcdoc'
 import { startDashboardLoadTiming, type DashboardLoadTiming } from '../../lib/dashboardTiming'
 import { i18nT } from '../../i18n/t'
@@ -257,8 +257,9 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
   const [refetchPending, setRefetchPending] = useState(false)
   const onActRef = useRef(onAct)
   onActRef.current = onAct
-  // A pull request the page links to: this frame only, GitHub PR URLs only.
-  useFrameOpenLink([frameRef])
+  // A link the page asks for: the agent-page link bridge, from this frame only. A
+  // click it cannot tie to the frame gets the host's "Open <host>" button.
+  const linkChip = useFrameLinkBridge([frameRef])
   const { theme, colorTheme, themeVersion } = useTheme()
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const themeVars = useMemo(() => readThemeVars(), [theme, colorTheme, themeVersion])
@@ -1387,6 +1388,7 @@ export default function CrewDynamicDashboard({ target, displayName, avatar, onAc
           data-testid="crew-dashboard-probe"
         />
       )}
+      {linkChip}
     </div>
   )
 }
