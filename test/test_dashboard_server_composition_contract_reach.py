@@ -658,13 +658,14 @@ def test_the_whole_census_holds_the_known_rebinds_and_an_owner_s_definitions() -
 
 #: The full middleware chain of each entrypoint, outermost first, by the name of each
 #: layer and the factory that built it. The order is a security contract: latency is
-#: outermost, the deny-audit boundary is outer to every barrier that can refuse, the
-#: SEL request audit is inner to them, the per-slot ownership checkpoint is inner to
-#: token auth and the audit record, and the workflow and crewmate-prune gates and the
-#: change-card hook (innermost, after auth has classified the caller) are appended
-#: after the explicit list.
+#: outermost, the client-sent relay-header strip is next, the deny-audit boundary is
+#: outer to every barrier that can refuse, the SEL request audit is inner to them, the
+#: per-slot ownership checkpoint is inner to token auth and the audit record, and the
+#: workflow and crewmate-prune gates and the change-card hook (innermost, after auth
+#: has classified the caller) are appended after the explicit list.
 _DASHBOARD_CHAIN = (
     ("route_latency_middleware", "make_route_latency_middleware.<locals>."),
+    ("relay_header_strip_middleware", "relay_header_strip_middleware"),
     ("deny_audit_middleware", "_make_deny_audit_middleware.<locals>."),
     ("host_canonical_redirect", "build_host_canonical_redirect.<locals>."),
     ("host_validation_middleware", "_make_host_validation_middleware.<locals>."),
@@ -681,6 +682,7 @@ _DASHBOARD_CHAIN = (
 )
 _API_CHAIN = (
     ("route_latency_middleware", "make_route_latency_middleware.<locals>."),
+    ("relay_header_strip_middleware", "relay_header_strip_middleware"),
     ("deny_audit_middleware", "_make_deny_audit_middleware.<locals>."),
     ("host_validation_middleware", "_make_host_validation_middleware.<locals>."),
     ("reject_compressed_body_middleware", "reject_compressed_body_middleware"),
