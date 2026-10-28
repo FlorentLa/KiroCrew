@@ -7,7 +7,7 @@ and the process resolves the ceiling in cache-only mode: no fetch, no sign-in, a
 refusal when the cache is missing, damaged or stale. The vault and the sign-in stay
 hidden. An oss build is unchanged.
 
-The https transport is a fake from the shared ``transport`` fixture, so nothing here
+The enterprise transport is a fake from the shared ``transport`` fixture, so nothing here
 opens a socket.
 """
 
@@ -47,6 +47,22 @@ def _outside_any_sandbox(_floor_monkeypatch):
     pd.reset_process_state()
 
 
+#: What the gateway records an enterprise copy against: the source plus the profile.
+_EE_CACHE_SOURCE = f"{pd.ENTERPRISE_POLICY_URL}?profile=one-profile"
+
+
+@pytest.fixture(autouse=True)
+def _one_signed_in_profile(_floor_monkeypatch):
+    """Every document and the vault name one profile, so the profile half of the source
+    identity matches. The fake transport here stands in for the control plane; the
+    profile binding itself is tested in ``test_enterprise_policy_fetch.py``."""
+    from kiro_crew.platform import enterprise_policy_fetch as epf
+
+    _floor_monkeypatch.setattr(epf, "document_scope", lambda body: "one-profile")
+    _floor_monkeypatch.setattr(epf, "signed_in_scope", lambda: "one-profile")
+    _floor_monkeypatch.setattr(epf, "pinned_scope", lambda: "one-profile")
+
+
 @pytest.fixture(name="enterprise")
 def enterprise_fixture(monkeypatch):
     monkeypatch.setattr("kiro_crew.edition.EDITION", "enterprise")
@@ -60,7 +76,9 @@ def _as_child(monkeypatch) -> None:
 
 def _gateway_boot(transport, marker: str = "central") -> None:
     """Boot as the gateway against a fake control plane, which writes the cache."""
-    transport(_static_fetcher(pd.FetchedPolicy(body=_body(marker))), scheme="https")
+    transport(
+        _static_fetcher(pd.FetchedPolicy(body=_body(marker))), scheme=pd.ENTERPRISE_POLICY_SCHEME
+    )
     ceiling = governance.load_security_policy()
     assert ceiling is not None and ceiling.identity_issuer == marker
 
@@ -73,7 +91,7 @@ def _child_transport(transport) -> list:
         seen.append(request)
         raise TimeoutError("a sandboxed child must not fetch")
 
-    transport(fetcher, scheme="https")
+    transport(fetcher, scheme=pd.ENTERPRISE_POLICY_SCHEME)
     return seen
 
 
@@ -180,7 +198,7 @@ class TestTheChildDeniesWithoutAUsableCache:
         self._expect_refusal(transport, "found no cached ceiling")
 
     def test_an_unusable_document_refuses(self, enterprise, transport, monkeypatch):
-        pd.write_cache(b'{"version": 999}', source=pd.ENTERPRISE_POLICY_URL)
+        pd.write_cache(b'{"version": 999}', source=_EE_CACHE_SOURCE)
         _as_child(monkeypatch)
         self._expect_refusal(transport, "unusable in cache-only mode")
 
@@ -193,7 +211,7 @@ class TestTheChildDeniesWithoutAUsableCache:
         self, enterprise, transport, monkeypatch
     ):
         doc = _body("old", distribution={"max_cache_age_secs": 3600})
-        pd.write_cache(doc, source=pd.ENTERPRISE_POLICY_URL, now=time.time() - 3601)
+        pd.write_cache(doc, source=_EE_CACHE_SOURCE, now=time.time() - 3601)
         _as_child(monkeypatch)
         self._expect_refusal(transport, "past the 3600s")
 
@@ -206,7 +224,7 @@ class TestOssIsUnchanged:
     def test_a_sandboxed_oss_process_neither_reads_nor_requires_the_cache(
         self, transport, monkeypatch
     ):
-        pd.write_cache(_body("planted"), source=pd.ENTERPRISE_POLICY_URL)
+        pd.write_cache(_body("planted"), source=_EE_CACHE_SOURCE)
         _as_child(monkeypatch)
         seen = _child_transport(transport)
 
@@ -268,11 +286,11 @@ class TestTheSandboxShowsTheCacheReadOnly:
         assert sandbox.enterprise_policy_cache_view() == ()
 
     def test_current_metadata_shows_the_cache(self, enterprise):
-        pd.write_cache(_body("current"), source=pd.ENTERPRISE_POLICY_URL)
+        pd.write_cache(_body("current"), source=_EE_CACHE_SOURCE)
         assert sandbox.enterprise_policy_cache_view() == (_cache_target(),)
 
     def test_a_304_rewrites_legacy_metadata_without_its_source(self, enterprise):
-        pd.write_cache(_body("current"), source=pd.ENTERPRISE_POLICY_URL)
+        pd.write_cache(_body("current"), source=_EE_CACHE_SOURCE)
         legacy = json.loads((pd.cache_dir() / "policy.meta.json").read_bytes())
         legacy["source"] = pd.ENTERPRISE_POLICY_URL
         (pd.cache_dir() / "policy.meta.json").write_text(json.dumps(legacy), encoding="utf-8")

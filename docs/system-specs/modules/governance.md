@@ -474,12 +474,58 @@ When `kiro_crew.edition.is_enterprise()` is true, neither channel above applies:
   document says, so a cold cache and a fetch that cannot complete abort boot. A
   last-known-good cache from the same source within its staleness bound is still served.
 - A cache-only child refuses a cache recorded against any other source.
-- `KIROCREW_POLICY_HEADERS` (the request credential) is still read: it cannot change
-  the address.
+- `KIROCREW_POLICY_HEADERS` is still read but not sent: the enterprise transport
+  carries the sign-in's own credential.
 
-The constant is a placeholder on a reserved `.invalid` domain until the real endpoint
-is chosen, so an enterprise build fails closed at boot until then. A test address needs
-its own build.
+The constant is `kirocps://enterprise-management`, served by
+`platform/enterprise_policy_fetch.py` (registered for the `kirocps` scheme; it refuses
+in an oss build). One fetch is the Kiro control plane's
+`GetEffectiveEnterpriseManagementResourceWithToken`, AWS JSON 1.0:
+
+- **Address.** `control_plane_url(profile_region(arn))` from
+  `auth/login/control_plane.py`, the region table the IdC login already uses. The URL's
+  host part is not an address, and nothing in the environment or config names one.
+- **Identity.** The Kiro sign-in in Crew's vault (`kirocrew kas login`), refreshed by
+  `KasAuthProvider` with the `KIRO_API_KEY` bypass off. `Authorization: Bearer`, plus
+  `TokenType: EXTERNAL_IDP` for an External IdP sign-in. The body names the profile
+  ARN and the client surface `CREW`.
+- **Trust.** TLS with default verification, redirects refused (`_open`), the pinned
+  host, and the reply's `manifest.hash` (SHA-256 of the body) when it carries one.
+  There is no signature layer.
+- **Answer.** `ENABLED` carries Trust V2 YAML, which
+  `platform/enterprise_policy_translate.py` turns into a Crew document (today
+  `messaging_channel` to `channels.members`), re-read every 300 s. Only a deny
+  `exclude` grants anything; a lone deny `match` leaves the capability unnamed, so the
+  baseline keeps it off. `DISABLED` answers
+  a document that names no scope, so the baseline holds every control. `UNCHANGED`
+  keeps the cache. `NOT_ELIGIBLE`, an HTTP error, an unreachable service, a malformed
+  answer, a hash mismatch and an untranslatable rule each raise. With no usable cache,
+  boot then exits through `enterprise_boot.refuse_policy_boot` with the reason.
+- **One profile's cache.** Every profile shares the one source, so the document records
+  a digest of the profile it was read for in `identity.issuer`, and the cache's source
+  identity is the source plus that digest (`_source_identity`). A copy is recorded
+  against the profile it was READ for, and every read compares it with the profile in
+  the vault NOW, so the existing repoint rule refuses another profile's copy on every
+  path: the fresh-cache shortcut, the outage fallback, the concurrent-writer handoff, a
+  refresh and the posture. Every other source's identity is the source itself.
+- **Profile pinned at startup.** An enterprise process pins the profile signed in when
+  it first resolves the policy (`enterprise_policy_fetch.pinned_scope`) and reads the
+  cache as that profile for life. It hands the pin to its cache-only children in
+  `KIROCREW_POLICY_PROFILE_PIN` (internal, not a setting); a child adopts only a cache
+  with that digest, and a child with no pin adopts nothing. Every install and refresh
+  compares the live vault profile, and the document's, with the pin; each fetch checks
+  it before reading the credential, so a sign-out counts as a change. The pin lives in
+  the process, so a re-exec'd gateway pins its own sign-in. A mismatch is
+  refused with "the signed-in Kiro account changed since Kiro Crew started; restart
+  Kiro Crew", audited as a `failed_closed` incident; a running gateway then stops
+  itself (SIGTERM), and a boot exits. The owner ruled that a sign-in change while Crew
+  runs needs no other handling, so the window between a switch and the next check is
+  an accepted residual.
+- **Signing in first.** `kirocrew kas login`, `whoami`, `logout` and `route` (the
+  read-only lookup a remote sign-in runs first) run when the policy load fails, so the
+  sign-in the fetch needs can be created. Every other command still exits.
+
+A test address needs its own build.
 
 **No credentials in the document, and no provenance flag either.** `distribution`
 has no `headers` field on purpose: a document published to the whole fleet must not

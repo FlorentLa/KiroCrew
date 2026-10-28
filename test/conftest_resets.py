@@ -239,6 +239,25 @@ def _reset_degraded_config_observations():
 
 
 @pytest.fixture(autouse=True)
+def _forget_enterprise_profile_pin():
+    """Forget the enterprise profile pin, which a process keeps for its life by design.
+
+    Read through ``sys.modules`` so a test that never loads the module does not import
+    it (the boot tier's own tests pin which modules a host with no source imports).
+    """
+    import sys
+
+    def forget() -> None:
+        module = sys.modules.get("kiro_crew.platform.enterprise_policy_fetch")
+        if module is not None:
+            module._pinned = ""
+
+    forget()
+    yield
+    forget()
+
+
+@pytest.fixture(autouse=True)
 def _forget_sandbox_launch_mark():
     """Forget that an entry point saw the sandbox marker.
 
