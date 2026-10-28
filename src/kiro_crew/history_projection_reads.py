@@ -30,7 +30,6 @@ from kiro_crew.history_projection_contract import (
     _TRANSCRIPT_PAGE_INDEX_MAX_CHECKPOINTS,
     _TRANSCRIPT_PAGE_INDEX_STRIDE,
     _TRANSCRIPT_PAGE_READ_ATTEMPTS,
-    DISPLAY_ONLY_ROLES,
     METADATA_LINE_CORRUPT,
     METADATA_LINE_READABLE,
     METADATA_LINE_TRANSIENT,
@@ -129,7 +128,13 @@ class TranscriptReadProjection:
         *,
         exclude_last_n: int = 0,
     ) -> list[dict]:
-        """Return recent source-bearing entries for cross-session citation."""
+        """Return recent source-bearing entries for cross-session citation.
+
+        Only what was said is cited: the user's and the assistant's rows. A
+        channel turn also records its tool steps with the turn's provenance, and
+        a step's title in one of these few slots would push the question it
+        answered out of the next session's context.
+        """
         messages = self._log._read_messages(key)
         if exclude_last_n > 0:
             messages = messages[:-exclude_last_n]
@@ -138,7 +143,7 @@ class TranscriptReadProjection:
             item
             for item in messages
             if item.get("source_thread")
-            and item.get("role") not in DISPLAY_ONLY_ROLES
+            and item.get("role") in ("user", "assistant")
             and not is_warm_task_brief_message(item)
         ]
         for message in cited[-max_messages:]:

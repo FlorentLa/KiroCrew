@@ -234,6 +234,8 @@ from kiro_crew.dashboard.chat_turn.tool_rows import (
     _on_tool_call,
     _on_tool_call_update,
     _tcid_identity_key,
+    _tool_call_ws_payload,
+    _tool_meta,
 )
 from kiro_crew.dashboard.chat_turn.turn_admission import _turn_admit
 from kiro_crew.dashboard.chat_turn.turn_dispatch_gates import (
