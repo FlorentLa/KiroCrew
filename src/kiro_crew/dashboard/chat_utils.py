@@ -723,6 +723,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         releases_past_subagent_hold,
     )
     from kiro_crew.dashboard.chat_utils_slack_options import (  # noqa: F401
+        _forget_slack_options_message,
         _persisted_thread_owner,
         expire_slack_options,
         forget_slack_options,
@@ -904,6 +905,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         encode_options_token,
         expire_options,
         mark_options_terminal,
+        options_answer_settled,
         options_edit_lock,
     )
     from kiro_crew.validation import (  # noqa: F401
