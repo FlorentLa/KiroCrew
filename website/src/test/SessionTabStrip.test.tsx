@@ -10,7 +10,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, renderHook, act } from '@testing-library/react'
 import { Provider } from 'react-redux'
-import { createTestStore } from './helpers'
+import { createTestStore, expectWheelToScrollRow } from './helpers'
 import type { RootState } from '../store'
 import SessionTabStrip from '../components/SessionTabStrip'
 import { useSessionTabs } from '../hooks/useSessionTabs'
@@ -151,6 +151,13 @@ describe('SessionTabStrip rendering', () => {
     renderStrip({ tabs: ['chat-1', 'chat-2'], slots, unread: ['chat-2'] })
     expect(screen.getByTestId('session-tab-chat-1').getAttribute('aria-label')).toBe('Design review — waiting on you')
     expect(screen.getByTestId('session-tab-chat-2').getAttribute('aria-label')).toBe('Release notes — unread')
+  })
+})
+
+describe('SessionTabStrip wheel', () => {
+  it('scrolls sideways on a vertical wheel only while the tabs are clipped', () => {
+    renderStrip({ tabs: ['chat-1', 'chat-2', 'chat-3'] })
+    expectWheelToScrollRow(screen.getByTestId('session-tab-strip'))
   })
 })
 

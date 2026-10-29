@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { X } from 'lucide-react'
 import { useAppSelector } from '../store'
 import { useScrollEdges } from '../hooks/useScrollEdges'
+import { useWheelToHorizontal } from '../hooks/useWheelToHorizontal'
 import {
   TAB_GAP,
   TAB_MAX_WIDTH,
@@ -72,6 +73,11 @@ export default function SessionTabStrip({ tabs, activeKey, cue, connected = true
   const slots = useAppSelector(s => s.dashboard.slots)
   const unreadSlots = useAppSelector(s => s.dashboard.unreadSlots)
   const [attachEdges, edges, remeasure] = useScrollEdges<HTMLDivElement>()
+  const attachWheel = useWheelToHorizontal<HTMLDivElement>()
+  const attachScroller = useCallback((node: HTMLDivElement | null) => {
+    attachEdges(node)
+    attachWheel(node)
+  }, [attachEdges, attachWheel])
   const tabRefs = useRef<Record<string, HTMLDivElement | null>>({})
 
   /**
@@ -215,7 +221,7 @@ export default function SessionTabStrip({ tabs, activeKey, cue, connected = true
     // hairline continuous across the full width.
     <div className="relative shrink-0 min-w-0" style={{ background: 'var(--bg)' }}>
       <div
-        ref={attachEdges}
+        ref={attachScroller}
         role="tablist"
         aria-label={i18nT('components.sessionTabStrip.open_sessions')}
         aria-orientation="horizontal"
