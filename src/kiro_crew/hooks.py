@@ -101,6 +101,7 @@ from kiro_crew.hook_runtime.gate_tiers import (  # noqa: F401
     _rule_exfil,
     _rule_sensitive_bash,
     _rule_sensitive_path,
+    _spec_builtin_names,
     _tier_app_own_server,
     _tier_deny_rules,
     _tier_governance,
@@ -109,10 +110,12 @@ from kiro_crew.hook_runtime.gate_tiers import (  # noqa: F401
     _tier_param_paths,
     _tier_read_only,
     _tier_search_target,
+    _tier_spec_builtin_grant,
     _tier_targets,
     _tier_unverifiable_shell,
     _tier_write_protected,
     gate_tier_problems,
+    grant_spec_builtin,
     shell_rules,
 )
 from kiro_crew.hook_runtime.governance_gate import (  # noqa: F401
@@ -192,6 +195,7 @@ from kiro_crew.hook_runtime.tool_identity import (  # noqa: F401
     _builtin_app_for_agent,
     _context_matches,
     _glob_pattern_leaves_root,
+    _granted_names,
     _has_global_inline_flags,
     _host_builtin_alias,
     _is_declared_builtin_mcp_server,
@@ -499,6 +503,12 @@ class GateTier(NamedTuple):
     rules: tuple[GateRule, ...] = ()
 
 
+#: An extra condition on ``grant_spec_builtin`` (``hook_runtime/gate_tiers.py``):
+#: handed the judgement's facts and the names the call answers to, it may only
+#: NARROW the grant.
+SpecBuiltinAllow = Callable[[GateFacts, tuple[str, ...]], bool]
+
+
 _BUNDLED_AUTO_APPROVE_TOOLS: list[str] = []
 
 
@@ -745,6 +755,7 @@ class HookManager:
         mcp_identity_trusted: bool = False,
         mcp_identity_unreadable: bool = False,
         kas_builtin_ids: bool = False,
+        spec_granted_builtins: frozenset[str] = frozenset(),
         harness_builtin_tool: str = "",
         deepseek_tool_name: str = "",
         spawn_target: str = "",
@@ -780,6 +791,7 @@ class HookManager:
                 identity_trusted=mcp_identity_trusted,
                 identity_unreadable=mcp_identity_unreadable,
                 kas_builtin_ids=kas_builtin_ids,
+                spec_granted_builtins=frozenset(spec_granted_builtins),
                 harness_builtin_tool=harness_builtin_tool,
                 deepseek_tool_name=deepseek_tool_name,
                 spawn_target=spawn_target,
@@ -1778,6 +1790,7 @@ GATE_TIERS: tuple[GateTier, ...] = (
     GateTier("governance", "deny_policy", _tier_governance),
     GateTier("app-own-server", "grant", _tier_app_own_server),
     GateTier("operator-grants", "grant", _tier_operator_grants),
+    GateTier("spec-builtin-grant", "grant", _tier_spec_builtin_grant),
     GateTier("read-only", "classify", _tier_read_only),
 )
 
