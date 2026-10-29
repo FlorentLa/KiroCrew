@@ -4,6 +4,7 @@ import { Command, Loader2 } from 'lucide-react'
 
 import { useAppDispatch, useAppSelector, useAppStore } from '../../store'
 import { selectSlotsWithLiveLastTs } from '../../store/slotLastTs'
+import { selectPersonSlots } from '../../store/dashboardSlice'
 import { findReport } from '../../utils/errorReport'
 import { errMessage } from '../../utils/thunkError'
 import ErrorNotice from '../../components/ErrorNotice'
@@ -31,6 +32,7 @@ import { usePointerMotion } from '../../hooks/usePointerMotion'
 import { ARTIFACTS_ROW_LIMIT, COPY_KEY, DEBOUNCE_MS, ENTER_KEY, SKELETON_WIDTHS, actionLabel, headerOf, rootRowCopyable, type Scope } from './commandBarOverlayModel'
 import { useCommandBarOverlayEngines } from './useCommandBarOverlayEngines'
 import { useCommandBarOverlayRootRows } from './CommandBarOverlayRootRows'
+import { crewWaitingApprovals } from '../../pages/chat/command-center/model'
 import { useCommandBarOverlaySlots } from './useCommandBarOverlaySlots'
 import { useCommandBarOverlayActivation } from './useCommandBarOverlayActivation'
 import { commandBarOverlaySlotRenderer } from './CommandBarOverlaySlot'
@@ -175,6 +177,14 @@ export default function CommandBarOverlay({
   // owe the user something without issuing a request: the facts are already here,
   // and the alternative surfaces (sidebar, recents) are reading the same three.
   const liveSlots = useAppSelector(selectSlotsWithLiveLastTs)
+  // The person's own sessions: a Crew Mode chat's workers are listed in its side
+  // panel, never in the Needs You or Recent sessions rows (the full set stays for
+  // the engines, which key navigation and the mates' running state on it).
+  const personSlots = useAppSelector(selectPersonSlots)
+  // What those hidden workers owe the person, carried by their root: a worker's
+  // tool approval is counted on its conductor over the FULL slot set, so Needs
+  // You still names it (the fleet page counts the same way, `crewWaitingApprovals`).
+  const crewWaiting = useMemo(() => crewWaitingApprovals(liveSlots), [liveSlots])
   const unreadSlots = useAppSelector(s => s.dashboard.unreadSlots)
   const slotStatusDetail = useAppSelector(s => s.chat.slotStatusDetail ?? {})
   const simplifiedToolNames = useSimplifiedToolNames()
@@ -285,7 +295,7 @@ export default function CommandBarOverlay({
   commandByIdRef.current = commandById
 
   const ranked = useCommandBarOverlayRootRows({
-    liveSlots, unreadSlots, slotStatusDetail, simplifiedToolNames, dispatch, navigate, store, cycleTheme,
+    liveSlots: personSlots, crewWaiting, unreadSlots, slotStatusDetail, simplifiedToolNames, dispatch, navigate, store, cycleTheme,
     commandById, apps, settingsGovernance, resolved, scope, query, usage, attentionExpanded,
     setAttentionExpanded,
   })

@@ -1501,3 +1501,63 @@ describe('CommandBarOverlay root ordering under a query', () => {
     expect(renderedHeaders()).toContain('Commands')
   })
 })
+
+describe('Crew Mode workers stay out of the Command Bar (edge review R1 X3)', () => {
+  it('lists neither a waiting nor a recent worker, only the root and plain chats', () => {
+    // A worker is its conductor's to show: the person's lists, this one included,
+    // leave it out even while it waits on a question or was visited last.
+    storeState.dashboard = {
+      slots: [
+        { key: 'root', title: 'Ship the review', crew_mode_root: true, messages: 3 },
+        { key: 'w-ask', title: 'Approval: list empty workspace', crew_root: 'root', needs_input: true, messages: 2 },
+        { key: 'w-done', title: 'Done: answer cat', crew_root: 'root', messages: 4, last_activity_ts: 9_000 },
+        { key: 'plain', title: 'Fleet notes', pending_approval: true, messages: 2 },
+      ],
+      unreadSlots: ['w-done'],
+    }
+    mount()
+    const text = screen.getAllByRole('option').map(r => r.textContent ?? '').join('\n')
+    expect(text).toContain('Fleet notes')
+    expect(text).toContain('Ship the review')
+    expect(text).not.toContain('Approval: list empty workspace')
+    expect(text).not.toContain('Done: answer cat')
+  })
+
+  it("lifts a root into Needs You with the Approve pill when one of its hidden workers waits on a tool approval", () => {
+    // The worker is not a row, so what it owes the person rides on its root: the
+    // same count the fleet page uses (`crewWaitingApprovals`). Red without the
+    // root-row lift: an idle root has no pill of its own.
+    storeState.dashboard = {
+      slots: [
+        { key: 'root', title: 'Ship the review', crew_mode_root: true, messages: 3 },
+        { key: 'w-tool', title: 'Worker on a tool', crew_root: 'root', pending_approval: true, messages: 2 },
+        { key: 'w-tool-2', title: 'Second worker', crew_root: 'root', pending_approval: true, messages: 2 },
+        { key: 'quiet-root', title: 'Quiet crew', crew_mode_root: true, messages: 1 },
+        { key: 'w-idle', title: 'Idle worker', crew_root: 'quiet-root', messages: 1 },
+      ],
+      unreadSlots: [],
+    }
+    mount()
+    const options = screen.getAllByRole('option')
+    const lifted = options.find(o => o.getAttribute('data-row-id') === 'attention:root' || o.id === 'attention:root' || (o.textContent ?? '').includes('Ship the review'))
+    expect(lifted?.textContent).toContain('Approve')
+    expect(lifted?.textContent).toContain('Crew members waiting for a tool decision: 2')
+    const quiet = options.find(o => (o.textContent ?? '').includes('Quiet crew'))
+    expect(quiet?.textContent ?? '').not.toContain('Approve')
+    expect(options.map(o => o.textContent ?? '').join('\n')).not.toContain('Worker on a tool')
+  })
+
+  it('keeps a closed root\'s worker in Needs You with its own Approve pill', () => {
+    // The root was closed, so no row carries the count and no Crew panel lists the
+    // worker: the worker is a row again, and its approval still reaches the person.
+    storeState.dashboard = {
+      slots: [
+        { key: 'w-orphan', title: 'Worker of a closed crew', crew_root: 'closed-root', pending_approval: true, messages: 2 },
+      ],
+      unreadSlots: [],
+    }
+    mount()
+    const row = screen.getAllByRole('option').find(o => (o.textContent ?? '').includes('Worker of a closed crew'))
+    expect(row?.textContent).toContain('Approve')
+  })
+})

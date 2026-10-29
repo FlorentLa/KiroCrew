@@ -81,6 +81,7 @@ type Slot = {
   messages?: number
   agent?: string
   last_activity_ts?: string
+  crew_root?: string
 }
 
 const leaf = (id: string, slot?: string): GridNode =>
@@ -908,5 +909,19 @@ describe('SessionGridView — picker controls', () => {
     fireEvent.mouseDown(onlyPicker())
 
     await waitFor(() => expect(screen.getByTestId('pane-a').getAttribute('data-focused')).toBe('no'))
+  })
+})
+
+describe('SessionGridView — Crew Mode workers (edge review R2 F4)', () => {
+  it("never offers a Crew Mode worker in a pane's picker, even one waiting on approval", async () => {
+    seedApi([
+      { key: 'a', title: 'Alpha' },
+      { key: 'root', title: 'Conductor' },
+      { key: 'w', title: 'Worker', crew_root: 'root', pending_approval: true },
+    ])
+    renderGrid('a')
+    await waitFor(() => expect(rowsOf(onlyPicker())).toHaveLength(1))
+    expect(rowsOf(onlyPicker())[0].textContent).toContain('Conductor')
+    expect(within(onlyPicker()).queryByText('Worker')).toBeNull()
   })
 })
