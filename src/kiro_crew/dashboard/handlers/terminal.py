@@ -47,10 +47,13 @@ from kiro_crew.dashboard.handlers.terminal_complete import (
 from kiro_crew.dashboard.handlers.terminal_lifecycle import (
     _TERMINAL_WS_CLOSE_SHELL_EXITED,
     _close_terminal_fd,
+    _end_evicted_shell,
     _handle_pty_reader_end,
     _kill_session,
+    _restore_evicted_shell,
     _sess_alive,
     _sess_pid,
+    _take_shell_to_evict,
 )
 from kiro_crew.dashboard.handlers.terminal_placement import (
     _CHAT_NOT_LOADED,
@@ -636,7 +639,10 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         )
         return refusal_ws
 
-    # Reserve slot synchronously before any await to prevent race condition
+    # Reserve slot synchronously before any await to prevent race condition.
+    # At the cap, the longest-detached shell gives up its slot in the same step;
+    # it ends only once this open goes ahead, and returns to its slot otherwise.
+    evicted = None if existing else _take_shell_to_evict(registry, max_sessions, time.monotonic())
     if not existing and len(registry) >= max_sessions:
         _sel().log_api_access(
             caller=caller,
@@ -672,6 +678,13 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             except (OSError, ValueError, asyncio.TimeoutError, _PathProbeBusy):
                 registry.pop(session_id, None)
                 placeholder = False
+                # The placeholder held the displaced shell's slot, so the shell
+                # goes back in this same step: during the refusal's awaits below
+                # another opener sees the cap full rather than a free slot.
+                if evicted is not None:
+                    displaced, evicted = evicted, None
+                    if not _restore_evicted_shell(registry, displaced):
+                        await _end_evicted_shell(request.app, displaced, max_sessions)
                 _sel().log_api_access(
                     caller=caller,
                     operation="terminal.ws.open",
@@ -692,6 +705,11 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
                 )
                 return ws
         await ws.prepare(request)
+        if evicted is not None:
+            # The directory resolved and the socket is up, so the open goes
+            # ahead: only now does the shell it displaces end.
+            ending, evicted = evicted, None
+            await _end_evicted_shell(request.app, ending, max_sessions)
 
         if existing:
             # Reconnect to existing PTY.
@@ -967,6 +985,10 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         # release retires that ownership before another handler can reserve it.
         if placeholder:
             registry.pop(session_id, None)
+        # An open refused, failed or cancelled before going ahead leaves the
+        # displaced shell untouched: it goes back unless its id was opened afresh.
+        if evicted is not None and not _restore_evicted_shell(registry, evicted):
+            await _end_evicted_shell(request.app, evicted, max_sessions)
 
     # The placement check above ran before this shell was published, and a bind
     # in between skipped the then-unpublished reservation: read it again now
@@ -1514,11 +1536,17 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.dashboard.handlers.terminal_lifecycle import (  # noqa: F401
         _CHILD_REAP_TIMEOUT_S,
         _CONPTY_STATUS_POLL_S,
+        _ORPHAN_SWEEP_INTERVAL_S,
+        _ORPHAN_TIMEOUT_MIN_S,
         _ORPHAN_TIMEOUT_S,
         _TERMINAL_FD_CLOSE_TIMEOUT_S,
         _child_exit_status,
+        _format_idle,
         _notify_shell_failed,
+        _orphan_timeout_s,
+        _record_orphan_reap,
         _shell_failure_note,
+        _sweep_terminals,
         reap_orphaned_terminals,
     )
     from kiro_crew.dashboard.handlers.terminal_placement import (  # noqa: F401
@@ -1532,6 +1560,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.dashboard.handlers.terminal_session import (  # noqa: F401
         _ConptyBackend,
         _enabled_cache,
+        _read_terminal_config,
     )
     from kiro_crew.dashboard.handlers.terminal_transport import (  # noqa: F401
         _OWNER_CONTROL_SEND_TIMEOUT_S,
@@ -1548,6 +1577,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
 
 if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.config.loader import config_path, read_config_text  # noqa: F401
+    from kiro_crew.executors import maintenance_executor  # noqa: F401
     from kiro_crew.hooks import validate_file_path  # noqa: F401
     from kiro_crew.notifications.bus import NotificationPayload  # noqa: F401
     from kiro_crew.sandbox import without_python_env  # noqa: F401

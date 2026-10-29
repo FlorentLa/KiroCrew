@@ -8928,10 +8928,24 @@
       "sensitive": false,
       "tags": [],
       "label": "Max terminal sessions",
-      "help": "Ceiling on concurrent terminal sessions across every chat, server-wide. Each chat's activity bar caps its own terminals below this; a session beyond the ceiling is refused.",
+      "help": "Ceiling on concurrent terminal sessions across every chat, server-wide. Each chat's activity bar caps its own terminals below this. At the ceiling, opening a terminal ends the shell that has had no browser attached the longest (at least a minute) and posts a notice; with none, the open is refused.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 12
+    },
+    {
+      "path": "dashboard.terminal.orphan_timeout_s",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Detached terminal timeout (seconds)",
+      "help": "How long a terminal's shell keeps running with no browser attached, for example while your laptop sleeps, before it and everything running in it are ended. Default 43200 (12 hours); values below 60 count as 60. Run jobs that must outlive this inside tmux.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 43200
     },
     {
       "path": "dashboard.terminal.cwd",
