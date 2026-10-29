@@ -197,6 +197,12 @@ async def _run_inner_impl(
                 raise ValueError("memory_unavailable: continuation changed memory owner")
             execution = original_execution.with_mode(captured_execution.memory_mode)
         bind_session_execution(session_key, execution)
+        # A crewmate's own worker (``spawn_run(crew=...)`` of a crewmate that owns
+        # its file) takes its crewmate's backend route and kit, as a hand-off's
+        # worker does; any other run drops the key from that route.
+        from kiro_crew.mate_worker import note_worker_session
+
+        note_worker_session(session_key, execution)
 
     from kiro_crew.workflows.registry import _await_owned
 
@@ -297,7 +303,27 @@ async def _run_inner_impl(
             resources=f"subagent_id={info.id},inherited_agent={agent}",
         )
     effective_cwd = info.cwd or str(getattr(self._manager._sessions, "_pool_cwd", "") or "")
-    if agent and (kind == "member" or (info.conversation_key and not info.agent)):
+    from kiro_crew.mate_worker import is_own_worker_execution
+
+    own_worker = not info.agent and is_own_worker_execution(execution)
+    if own_worker:
+        # The worker's spec lives in the crewmate folder, which the agent roster
+        # does not list, so it is not looked up by name; what it needs is a
+        # backend that carries its per-session kit (the hand-off's own check).
+        from kiro_crew.acp_backends import resolve_selected_backend
+        from kiro_crew.config.loader import KiroCrewConfig as _Config
+        from kiro_crew.mate_worker import crewmate_worker_backend, worker_kit_backend_refusal
+
+        _agent_cfg = (await asyncio.to_thread(_Config.load)).agent
+        worker_backend = (
+            resolve_selected_backend(info.backend)
+            if info.backend is not None
+            else crewmate_worker_backend(_agent_cfg)
+        )
+        backend_reason = worker_kit_backend_refusal(worker_backend)
+        if backend_reason is not None:
+            raise RuntimeError(f"capability_harness_unsupported: {backend_reason}")
+    elif agent and (kind == "member" or (info.conversation_key and not info.agent)):
         agent, error, code = await asyncio.to_thread(_validate_agent, agent, effective_cwd)
         if error:
             info.error_code = code
@@ -640,10 +666,23 @@ async def _run_inner_impl(
     if info.crew:
         from kiro_crew.members import record_activity
 
+        activity_member = execution.selection_name
+        if own_worker:
+            # A worker record names the worker template, not the crewmate; the
+            # crewmate is the one its member id names (the alias it has now).
+            from kiro_crew.config.loader import KiroCrewConfig as _Config
+            from kiro_crew.execution_context import member_config_for_id
+
+            _cfg = await asyncio.to_thread(_Config.load)
+            try:
+                activity_member, _ = member_config_for_id(_cfg, execution.member_id or "")
+            except ValueError:
+                activity_member = info.crew
+
         # A respawn of this run re-enters with the same key; the dedupe keeps one entry.
         await asyncio.to_thread(
             record_activity,
-            execution.selection_name,
+            activity_member,
             session_key,
             execution.memory_mode,
             project=info.cwd or "",

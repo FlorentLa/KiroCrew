@@ -4463,6 +4463,22 @@ cross-member ACL. Continuations retain the original run's member/store even if
 a different member now requests the continuation. The gateway still requires
 ordinary authenticated session identity before accepting a parent session.
 
+A crewmate whose binding owns its file chats on `kirocrew-mate-conductor`, whose
+spec lives in the crewmate folder and is no agent a sub-agent loads by name. A
+`spawn_run(crew=<member>)` (or `target_member`) that names no `agent` runs on
+that crewmate's WORKER instead: `mate_worker.spawn_worker_execution` turns the
+resolved `member` selection on the conductor into the worker's record shape (a
+`template` selection on `kirocrew-mate-worker`; member, store, memory mode and
+app kept), the shape a hand-off and a scheduled turn give it. Answered from the
+record alone, so it reads no file on the loop. The run is never looked up by
+name (`_validate_agent` is unchanged, so neither the conductor nor the worker
+can be spawned as `agent=`); the run turn publishes the session as the
+crewmate's worker (`note_worker_session`), so its backend selection and kit
+follow the crewmate, and refuses a worker whose backend cannot carry its kit
+(`worker_kit_backend_refusal` over `crewmate_worker_backend`, or the spawn's own
+`backend`) with `capability_harness_unsupported`. A crewmate on a shared
+template, and a crew spawn that names its `agent`, are unchanged.
+
 A named-but-unknown agent is **refused**, never silently answered by the default
 agent, with the machine-readable code `agent_not_found`. That refusal is a
 privilege boundary: the default agent frequently runs at broader approval, so a

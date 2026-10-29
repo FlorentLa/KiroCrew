@@ -728,6 +728,28 @@ def cron_worker_execution(execution: Any, config: Any = None) -> Any:
     return execution.with_template(MATE_WORKER_AGENT, MATE_WORKER_AGENT)
 
 
+def spawn_worker_execution(execution: Any) -> Any:
+    """The worker execution a sub-agent selected as a crewmate runs, else ``None``.
+
+    A ``spawn_run(crew=...)`` (or ``target_member``) with no ``agent`` resolves
+    the crewmate to a ``member`` selection on the agent its chat runs on. For a
+    crewmate that owns its file that is the conductor, which hands work off
+    rather than doing it. The run is work, so it runs on that crewmate's worker
+    instead, member, store, mode and app kept: the record shape a hand-off and a
+    scheduled turn give the worker (:func:`cron_worker_execution`). Answered
+    from the record alone, so it reads no file and is safe on the event loop.
+    ``None`` for any other record.
+    """
+    if (
+        execution is None
+        or getattr(execution, "selection_kind", "") != "member"
+        or not getattr(execution, "member_id", None)
+        or getattr(execution, "template_id", "") != MATE_CONDUCTOR_AGENT
+    ):
+        return None
+    return execution.with_template(MATE_WORKER_AGENT, MATE_WORKER_AGENT)
+
+
 def note_worker_session(session_key: str, execution: Any) -> bool:
     """Publish *session_key* as a crewmate's worker when its record says so.
 
