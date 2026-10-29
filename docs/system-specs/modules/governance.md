@@ -1310,7 +1310,11 @@ therefore also withholds the grant while that capability restricts anything at t
 asked (off, or any scope; an enabled gate with no scopes permits every use). Every writer asks
 this one predicate, so the grant is withheld on every backend and channel alike: kiro-cli's
 own spec, the KAS wire projection, and the `permissions` block written to disk. With no such
-policy nothing changes.
+policy nothing changes. On KAS that includes a spec's `toolsSettings.subagent.trustedAgents`,
+which travels as a name-scoped `subagent` allow (#25320): it goes through the same merge as
+an authored allow, so the ceiling is asked about every ref of the sub-agent tool and one
+refusal drops the rule. Its sibling `availableAgents` travels as a `deny` with the listed
+names in `exclude`, which only narrows and so travels whatever the ceiling says.
 
 One grant is made INSIDE the gate rather than by a writer: the KAS `spec-builtin-grant`
 row (security.md § KAS spec built-in grant), which approves a built-in the spec granted
