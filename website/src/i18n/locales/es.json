@@ -12158,8 +12158,9 @@
       },
       "transientNotice": {
         "retrying": "Conexión inestable — reintentando…",
-        "resuming": "Conexión inestable — reanudando…",
+        "resuming": "Conexión inestable — terminando esta respuesta…",
         "restored": "Conexión restablecida",
+        "interrupted": "Conexión interrumpida",
         "give_up": "Conexión inestable — inténtalo de nuevo."
       },
       "turnBlock": {

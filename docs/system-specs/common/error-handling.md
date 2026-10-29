@@ -348,7 +348,16 @@ re-prompting the same live session past `TRANSIENT_RETRIES` until
 retry, on the same backoff curve capped at `CONNECTION_RETRY_MAX_DELAY` (30 s),
 and shows one standing "Connection unstable — retrying…" notice for the extra
 attempts rather than one per attempt. Stop, a landed turn and an exhausted
-window end it exactly as they end the fixed ladder. Provider answers keep the
+window end it exactly as they end the fixed ladder. The dashboard settles that
+standing notice once the window closes (`resolveTransientNotice` in
+`website/src/pages/chat/transientNotice.ts`): it reads "Connection restored"
+when an answer follows it, and the muted past-tense "Connection interrupted"
+when the give-up row or any other error comes first, so it never stays
+"retrying…" above the red "please try again." row. A new user turn decides
+neither: a message typed during the backoff does not end the replay, so the
+notice stays pending. Another re-queued recovery row (`kind: transient_retry`,
+such as a dead process's "Connection lost — retrying…") is read as recovery
+still running, so the scan continues past it. Provider answers keep the
 fixed count: a provider that answers with errors is not helped by a longer wait.
 
 ### Provider failures a harness writes as text
