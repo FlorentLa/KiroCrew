@@ -556,10 +556,12 @@ async def install_from_registry(
     # Kiro Crew is running on an incompatible platform, return client install
     # instructions instead of attempting a server-side install.
     manifest_platform = (manifest or {}).get("platform", {})
-    required_os = manifest_platform.get("os", ["macos", "linux"])
-    install_mode = manifest_platform.get("installMode", "server")
-
     from kiro_crew.apps.manifest import PlatformConfig
+
+    # The parsed `os`, not the raw JSON: `null` means unset and any other
+    # non-list supports no platform, and neither can be iterated raw.
+    required_os = (admission_manifest.platform if admission_manifest else PlatformConfig()).os
+    install_mode = manifest_platform.get("installMode", "server")
 
     if install_mode == "client" and not PlatformConfig(os=required_os).supports_platform(
         sys.platform
