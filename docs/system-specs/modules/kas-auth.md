@@ -329,8 +329,10 @@ access token.
   either. A held port then fails the bind and the loop takes the next allowlisted port.
   `test/test_reuseaddr_platform_branch.py` fails any production `SO_REUSEADDR` set
   outside a platform branch.
-- `KIRO_API_KEY` remains a supported headless path (matches KAS `EnvAuthProvider`), and
-  its ApiKey identity must fail-fast on usage/credit APIs (existing lesson).
+- `KIRO_API_KEY` remains a supported headless path (matches KAS `EnvAuthProvider`). Its
+  ApiKey identity has no SSO/OIDC bearer, so the `GetUsageLimits` API is skipped for it
+  (that call can only answer 403); credit usage comes from the `/usage` scrape instead,
+  which kiro-cli answers locally for the signed-in key.
 
 ## Sign-in from a shell, and on a remote crew
 

@@ -30,7 +30,6 @@ if TYPE_CHECKING:
         _MAX_BONUS_DAYS_LEFT,
         _MAX_BONUS_GRANTS,
         _MAX_BONUS_NAME_CHARS,
-        _WHOAMI_UNPROVEN,
         USAGE_SCRAPE_ENGINE,
         _safe_float,
         _safe_int,
@@ -239,6 +238,7 @@ from kiro_crew.dashboard.handlers.sessions_parts.usage_scrape import (
     _REASON_ACCOUNT_UNPROVEN,
     _WHOAMI_DIFFERENT,
     _WHOAMI_SAME,
+    _WHOAMI_UNPROVEN,
     _account_type_only,
     _fetch_whoami,
     _fetch_whoami_or_none,
@@ -1113,23 +1113,27 @@ async def _fetch_usage_bg(*, vault_owned: bool = False) -> str | None:
         # credential from a signed-out profile supplying the numbers. Fetched
         # once here and reused by both the API and text branches below.
         identity = await _fetch_whoami(kiro_bin)
-        # Fail fast on API-key auth. kiro-cli's whoami reports the AuthMethod
-        # enum variant ``ApiKey``; the compare normalizes case and strips
-        # separators so an upstream respelling (``API_KEY``, ``Api-Key``)
-        # still fails fast instead of silently regressing to the slow path —
-        # such accounts hold no SSO/OIDC bearer token, so ``fetch_usage_limits``
-        # would spend its full timeout walking credential stores that cannot
-        # contain one, and the text scrape is no better a source. The
-        # ``reason`` rides the existing unavailable-marker shape so the
-        # frontend can say WHY, with a label specific to this auth type.
-        account_type = identity.get("account_type")
-        if (
-            isinstance(account_type, str)
-            and re.sub(r"[^a-z0-9]", "", account_type.lower()) == "apikey"
-        ):
-            _publish_usage({"available": False, "reason": "api_key_auth"})
-            logger.info("Kiro usage: not available under API key auth; skipping fetch")
-            return None
+
+        # API-key auth: skip the GetUsageLimits API, go straight to the scrape.
+        # kiro-cli's whoami reports the AuthMethod enum variant ``ApiKey``; the
+        # compare normalizes case and strips separators so an upstream respelling
+        # (``API_KEY``, ``Api-Key``) is still recognized. Such accounts hold no
+        # SSO/OIDC bearer token, so ``fetch_usage_limits`` can only 403 after
+        # spending its timeout walking credential stores that cannot contain one
+        # -- but the `/usage` scrape DOES work for them: kiro-cli answers it
+        # locally from its own authenticated client, so the credit table prints
+        # under API-key auth exactly as it does for SSO. So rather than publish
+        # an unavailable marker, skip only the wasted API call and let execution
+        # fall through to the scrape below, which supplies the real number.
+        def _is_api_key(snapshot: dict[str, object]) -> bool:
+            account_type = snapshot.get("account_type")
+            return isinstance(account_type, str) and (
+                re.sub(r"[^a-z0-9]", "", account_type.lower()) == "apikey"
+            )
+
+        skip_usage_api = _is_api_key(identity)
+        if skip_usage_api:
+            logger.info("Kiro usage: API-key auth; skipping the API path, using the /usage scrape")
         # The ExternalIdP type and nothing that names the user: no reading could
         # be tied to this user, so nothing the API returns is published and no
         # number is read from the `/usage` scrape (see _account_type_only). The
@@ -1173,10 +1177,17 @@ async def _fetch_usage_bg(*, vault_owned: bool = False) -> str | None:
         # handshake, so they are isolated from the maintenance/cron pools. Fails
         # closed (returns None) so we fall through to the text scrape rather than
         # showing a fabricated number.
-        api_result = await asyncio.get_running_loop().run_in_executor(
-            subprocess_executor(),
-            functools.partial(kiro_usage_api.fetch_usage_limits, expected_arn=expected_arn),
-        )
+        if skip_usage_api:
+            # API-key auth has no bearer token the API can use, so the call can
+            # only 403. Synthesize a neutral result (``AUTH_OTHER`` -> no reason)
+            # so a later no-reading does not misadvise "sign in again" on an
+            # account that is signed in fine, and go straight to the scrape.
+            api_result = kiro_usage_api.UsageResult(None, kiro_usage_api.AUTH_OTHER)
+        else:
+            api_result = await asyncio.get_running_loop().run_in_executor(
+                subprocess_executor(),
+                functools.partial(kiro_usage_api.fetch_usage_limits, expected_arn=expected_arn),
+            )
         # ``usage`` is the number; ``auth_state`` is why it is missing when it is,
         # and is only ever consulted to pick the unavailable message below.
         api_usage = api_result.usage
@@ -1293,14 +1304,28 @@ async def _fetch_usage_bg(*, vault_owned: bool = False) -> str | None:
             # neither is the scrape being broken).
             _record_scrape_outcome(True)
             agreement = _whoami_agreement(before, after)
-            if agreement != _WHOAMI_SAME:
+            # An API-key sign-in carries no identity (no email / start URL /
+            # profile ARN), so its whoami pair is always `unproven`. That alone
+            # is not a reason to drop its reading: the scrape is kiro-cli's own
+            # `/usage` for the one signed-in key. But `unproven` is also what
+            # any other identity-less sign-in yields (ExternalIdP, a lapsed
+            # type-only sign-in, signed out), and the top-of-refresh whoami says
+            # nothing about who was signed in around the scrape. So `unproven`
+            # publishes only when the whoami on BOTH sides of the scrape is
+            # itself an API-key sign-in; anything else discards, as on the
+            # non-API-key path.
+            unproven_api_key = (
+                agreement == _WHOAMI_UNPROVEN and _is_api_key(before) and _is_api_key(after)
+            )
+            discard = agreement != _WHOAMI_SAME and not unproven_api_key
+            if discard:
                 # `different`: the child ran across a switch, so its numbers
                 # belong to whoever was signed in at that instant -- unknowable,
-                # so unpublishable. `unproven`: no identity either side, so a
-                # switch between the two would be invisible; there is no source
-                # left to fall back to, so this refresh ends with no reading.
-                # Either way the cache is judged against the account signed in
-                # NOW, so nothing of a previous one is kept.
+                # so unpublishable. `unproven` (non-API-key): no identity either
+                # side, so a switch between the two would be invisible; there is
+                # no source left to fall back to, so this refresh ends with no
+                # reading. Either way the cache is judged against the account
+                # signed in NOW, so nothing of a previous one is kept.
                 logger.info(
                     "Kiro usage: the signed-in account could not be proven across "
                     "the /usage scrape (%s); discarding its reading",

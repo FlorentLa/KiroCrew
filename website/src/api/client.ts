@@ -1310,10 +1310,9 @@ export interface KiroBonusCreditGrantPayload {
 export interface KiroUsagePayload {
   available?: boolean
   /**
-   * Why usage is unavailable when `available` is false (`api_key_auth`,
-   * `signin_required`, or `account_unproven` when the account is named but its
-   * reading could not be tied to it); absent when the gateway simply holds no
-   * reading.
+   * Why usage is unavailable when `available` is false (`signin_required`, or
+   * `account_unproven` when the account is named but its reading could not be
+   * tied to it); absent when the gateway simply holds no reading.
    */
   reason?: string
   credits_used?: number
