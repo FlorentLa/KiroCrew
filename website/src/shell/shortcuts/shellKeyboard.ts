@@ -12,7 +12,7 @@ import { useAskingNavigate } from '../../components/NavigationLeaveGuard'
 import { pendingSlotSwitch, pendingSlotSwitchTarget, performSlotSwitch } from '../../lib/slotSwitch'
 import { performAgentSlotSwitch } from '../../lib/agentSwitch'
 import { focusComposerElement, queryComposerOrExpand } from '../../pages/chat/composerFocus'
-import { agentSwitchFailureMessage, modelSwitchDeferredMessage } from '../../utils/agentSwitchFeedback'
+import { agentSwitchErrorNotice, agentSwitchFailureNotice, modelSwitchDeferredMessage } from '../../utils/agentSwitchFeedback'
 import { api } from '../../api/client'
 import { newTerminalByChord, toggleTerminalByChord } from '../../lib/terminalChordFocus'
 import { focusPopout as focusTerminalPopout } from '../../utils/terminalPopout'
@@ -95,7 +95,10 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
   const provider = useProvider()
   const agentSwitchNotice = useAppSelector(s => s.chat.agentSwitchNotice)
   useEffect(() => {
-    if (!agentSwitchNotice) return
+    // A notice that offers a new chat stays until the user dismisses it or uses
+    // the offer: expiring it would unmount the banner while its create runs and
+    // hide a failed create.
+    if (!agentSwitchNotice || agentSwitchNotice.newChatAgent) return
     const timer = window.setTimeout(() => dispatch(setAgentSwitchNotice(null)), 6000)
     return () => window.clearTimeout(timer)
   }, [agentSwitchNotice, dispatch])
@@ -117,7 +120,7 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
       // to the rebroadcast).
       await performAgentSlotSwitch(slot, agent, store.dispatch)
     } catch (error) {
-      dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(error)))
+      dispatch(setAgentSwitchNotice(agentSwitchFailureNotice(error, agent)))
     }
   }, [dispatch])
   useKeyboardShortcuts({ onToggleShortcutsModal: toggleShortcutsModal, onNewChat: () => {
@@ -171,7 +174,7 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
           },
           (value) => store.dispatch(updateSlot({ key: activeSlot, reasoning_effort: value })))
       } catch (e) {
-        store.dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e)))
+        store.dispatch(setAgentSwitchNotice(agentSwitchErrorNotice(e)))
         // eslint-disable-next-line no-console -- failure diagnostic; the notice above already told the user
         console.error('onCycleReasoningEffort failed', e)
       }
@@ -195,7 +198,7 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
           },
           (value) => store.dispatch(updateSlot({ key: activeSlot, reasoning_effort: value })))
       } catch (e) {
-        store.dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e)))
+        store.dispatch(setAgentSwitchNotice(agentSwitchErrorNotice(e)))
         // eslint-disable-next-line no-console -- failure diagnostic; the notice above already told the user
         console.error('onCyclePrevReasoningEffort failed', e)
       }
@@ -247,7 +250,7 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
           },
           (value) => store.dispatch(updateSlot({ key: activeSlot, model: value })))
       } catch (e) {
-        store.dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e)))
+        store.dispatch(setAgentSwitchNotice(agentSwitchErrorNotice(e)))
         // eslint-disable-next-line no-console -- failure diagnostic; the notice above already told the user
         console.error('onCycleModel failed', e)
       }
@@ -274,7 +277,7 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
           },
           (value) => store.dispatch(updateSlot({ key: activeSlot, model: value })))
       } catch (e) {
-        store.dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e)))
+        store.dispatch(setAgentSwitchNotice(agentSwitchErrorNotice(e)))
         // eslint-disable-next-line no-console -- failure diagnostic; the notice above already told the user
         console.error('onCyclePrevModel failed', e)
       }
