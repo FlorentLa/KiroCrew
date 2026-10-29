@@ -1479,9 +1479,24 @@ from the prologue on purpose: the gateway boot path admits no new work before
 readiness (see `AUTOSDE.yaml`, `no-new-work-on-gateway-boot-path`), and a
 legacy store's lock and SQLite work would otherwise delay the moment the
 dashboard is usable. Both calls are idempotent:
-an install with no `memory_version: 2` record lacking `owner_member_id` takes no
-lock and opens no file, and a repaired install finds nothing on the next start.
+an install with no `memory_version: 2` record lacking `owner_member_id` and no
+stripped member declaration (below) takes no lock, and opens a file only to read,
+read-only, the `memory.db` of a V1 named store bound to exactly one member with no
+`member_id`; a repaired install finds nothing on the next start.
 A config whose memory section degraded is left alone.
+
+A stripped member declaration is the shape an older CLI still on `PATH`
+leaves when its save rebuilds `config.json` from a schema that predates member
+fields: the store's record is back to V1 with no `owner_member_id`, and its
+bound member has no `member_id`, while `memory.db` still carries a
+`member_database` row naming this store. Every resolver refuses that store (V1
+cannot open a member database; the record does not declare V2). It is a candidate
+only when the record is a non-default V1 declaration, exactly one member with an
+empty `member_id` is bound to it, and the database is a regular single-name file
+whose `member_database` row names this store; an ordinary V1 named store has no
+such row and is never a candidate. It passes the same checks as below, resumes
+with the identity its database records, leaves the database untouched, and
+publishes `memory_version: 2` with the identity pair under the config lock.
 
 Under the store namespace lock, for each V2 record with an empty
 `owner_member_id`, the upgrade proceeds only when every one of these holds, and

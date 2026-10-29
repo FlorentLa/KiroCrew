@@ -582,7 +582,11 @@ prologue after `boot_platform` for every CLI subcommand except `gateway`,
 memory preparation worker (never on the boot path), so both
 surfaces publish the missing `member_id` / `owner_member_id` pair before any
 member is resolved. It writes through `update_config_locked`, skips a config
-whose memory section degraded, and never raises. Criteria, refusals and the
+whose memory section degraded, and never raises. The same repair restores a
+member store whose declaration an older build's save stripped back to V1
+(`memory_version`, `owner_member_id`, `owner_member` and the member's `member_id`
+gone) when its `memory.db` still records a `member_database` identity for that
+store and exactly one identity-less member is bound to it. Criteria, refusals and the
 database half are owned by
 [memory-skills-hooks](memory-skills-hooks.md#pre-identity-member-stores-are-upgraded-at-start).
 
